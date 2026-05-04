@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# saturday-stack — start (or attach) a 3-pane tmux session running the full
+# Saturday stack: watcher, mayor (audio-sock mode), audio sidecar.
+#
+# Idempotent: re-running attaches the existing session if alive. Each pane
+# stays open after its process exits so you can read the failure output —
+# `tmux respawn-pane` to restart in place, or `tmux kill-session -t
+# saturday-stack` to nuke the whole thing and start fresh.
+#
+# Usage:
+#   saturday-stack
+#
+# Env vars (optional):
+#   SATURDAY_DIR  default $HOME/Documents/saturday — repo root, must contain
+#                 saturday-audio/.venv
+#   SOCK          default /tmp/saturday-audio.sock — mayor↔audio Unix socket
+#   AUDIO_VENV    default $SATURDAY_DIR/saturday-audio/.venv
+
+set -euo pipefail
+
+SESSION="saturday-stack"
+SOCK="${SOCK:-/tmp/saturday-audio.sock}"
+SATURDAY_DIR="${SATURDAY_DIR:-$HOME/Documents/saturday}"
+MAYOR_DIR="$SATURDAY_DIR/saturday-mayor"
+AUDIO_DIR="$SATURDAY_DIR/saturday-audio"
+AUDIO_VENV="${AUDIO_VENV:-$AUDIO_DIR/.venv}"
+
+# V0.2.6: watcher runs headless (no pane). Logs and pidfile follow XDG.
+XDG_STATE_HOME_RESOLVED="${XDG_STATE_HOME:-$HOME/.local/state}"
+WATCHER_LOG="$XDG_STATE_HOME_RESOLVED/saturday/watcher.log"
+WATCHER_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-watcher.pid"
+
+# Subcommands: `stop` / `down` kills the session (tearing down all panes via
+# SIGHUP, which mayor/watcher/audio's signal handlers clean up cleanly).
+case "${1:-}" in
+    stop|down|kill)
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux kill-session -t "$SESSION"
+            echo "saturday-stack: session killed."
+        else
+            echo "saturday-stack: no session running."
+        fi
+        # Kill headless watcher (V0.2.6 — watcher no longer in a pane).
+        if [ -f "$WATCHER_PIDFILE" ]; then
+            WPID=$(cat "$WATCHER_PIDFILE" 2>/dev/null)
+            if [ -n "$WPID" ] && kill -0 "$WPID" 2>/dev/null; then
+                kill "$WPID" 2>/dev/null && echo "saturday-stack: watcher (pid $WPID) killed."
+            fi
+            rm -f "$WATCHER_PIDFILE"
+        fi
+        exit 0
+        ;;
+    status)
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux list-panes -t "$SESSION" -F '#{pane_index} #{pane_pid} #{pane_current_command}'
+        else
+            echo "saturday-stack: not running."
+            exit 1
+        fi
+        exit 0
+        ;;
+esac
+
+if [ -n "${TMUX:-}" ]; then
+    echo "saturday-stack: already inside tmux. Open a fresh terminal." >&2
+    exit 1
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "saturday-stack: tmux not installed (apt install tmux)." >&2
+    exit 1
+fi
+
+# If session exists, just reattach.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+fi
+
+# Sanity-check the audio sidecar layout before constructing the session.
+# Resolve XDG config home (override-friendly).
+XDG_CONFIG_HOME_RESOLVED="${XDG_CONFIG_HOME:-$HOME/.config}"
+SATURDAY_CONFIG="$XDG_CONFIG_HOME_RESOLVED/saturday/config"
+
+# One-time migration: if XDG config doesn't exist yet but a legacy
+# saturday-mayor/.env does, copy it across. Idempotent — only runs when
+# the destination is missing.
+if [ ! -f "$SATURDAY_CONFIG" ] && [ -f "$MAYOR_DIR/.env" ]; then
+    mkdir -p "$(dirname "$SATURDAY_CONFIG")"
+    cp "$MAYOR_DIR/.env" "$SATURDAY_CONFIG"
+    echo "saturday-stack: migrated $MAYOR_DIR/.env → $SATURDAY_CONFIG"
+fi
+
+if [ ! -f "$SATURDAY_CONFIG" ]; then
+    echo "saturday-stack: no Saturday config found." >&2
+    echo "  Create $SATURDAY_CONFIG with your Anthropic key:" >&2
+    echo "    mkdir -p $(dirname "$SATURDAY_CONFIG")" >&2
+    echo "    echo 'ANTHROPIC_API_KEY=sk-...' > $SATURDAY_CONFIG" >&2
+    exit 1
+fi
+if [ ! -d "$AUDIO_DIR" ]; then
+    echo "saturday-stack: audio dir missing: $AUDIO_DIR" >&2
+    echo "  set SATURDAY_DIR if the repo is elsewhere." >&2
+    exit 1
+fi
+if [ ! -f "$AUDIO_VENV/bin/activate" ]; then
+    echo "saturday-stack: audio venv missing: $AUDIO_VENV/bin/activate" >&2
+    echo "  cd $AUDIO_DIR && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+    exit 1
+fi
+for bin in saturday-watcher saturday-mayor saturday-thinking; do
+    if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
+        echo "saturday-stack: $bin not found on PATH or in ~/go/bin" >&2
+        exit 1
+    fi
+done
+
+# V0.2.6 layout: mayor takes the big left column ("most interesting and
+# relevant log"); right column splits into thinking (top, FUI cognitive-state
+# render) and audio (bottom, FUI spinner + transcripts). Watcher runs
+# headless — its log noise wasn't pulling its weight in a pane.
+#
+#   ┌─────────────────┬──────────────┐
+#   │                 │   thinking   │
+#   │     mayor       │   (TUI)      │
+#   │   (logs/errs)   ├──────────────┤
+#   │   biggest L     │    audio     │
+#   │                 │    (FUI)     │
+#   └─────────────────┴──────────────┘
+#
+# Pane 0 = mayor (left). split-window -h adds the right column starting as
+# thinking; split-window -v then puts audio below thinking. main-vertical
+# layout sizes the left pane wider via main-pane-width.
+
+# Headless watcher first — mayor needs the watcher socket up to route.
+mkdir -p "$(dirname "$WATCHER_LOG")"
+~/go/bin/saturday-watcher >> "$WATCHER_LOG" 2>&1 &
+echo $! > "$WATCHER_PIDFILE"
+echo "saturday-stack: watcher running headless (pid $(cat "$WATCHER_PIDFILE")), log → $WATCHER_LOG"
+
+tmux new-session -d -s "$SESSION" -n "stack" \
+    "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK'"
+
+# Keep panes around after their process exits so failures are inspectable.
+tmux set-option -t "$SESSION" remain-on-exit on
+
+# Persistent help line at the bottom — new tmux users won't know how to leave
+# the session otherwise. status-right is shown in every window of the session.
+# Highlighted in yellow so it doesn't blend into the default status bar.
+tmux set-option -t "$SESSION" status-right-length 90
+tmux set-option -t "$SESSION" status-right \
+    '#[fg=black,bg=yellow,bold] stop all: saturday-stack stop │ detach (keep running): Ctrl-b then d #[default]'
+
+# Right column, top: thinking pane.
+tmux split-window -t "${SESSION}:0" -h \
+    "echo '[thinking]'; exec ~/go/bin/saturday-thinking"
+
+# Right column, bottom: audio sidecar.
+tmux split-window -t "${SESSION}:0" -v \
+    "echo '[audio]'; cd '$AUDIO_DIR' && source '$AUDIO_VENV/bin/activate' && exec python main.py"
+
+# main-vertical: pane 0 (mayor) becomes the main (left) pane, sized larger
+# than the right column. main-pane-width controls left/right split.
+tmux set-window-option -t "${SESSION}:0" main-pane-width 60%
+tmux select-layout -t "${SESSION}:0" main-vertical
+tmux select-pane -t "${SESSION}:0.2"  # focus audio pane (SPACEBAR mute + spinner)
+
+# Attach only if invoked from a terminal. When run headless (e.g. from a
+# script or a non-TTY environment), leave the session detached for the
+# user to attach manually with `tmux attach -t saturday-stack`.
+if [ -t 0 ] && [ -t 1 ]; then
+    exec tmux attach-session -t "$SESSION"
+else
+    echo "saturday-stack: started detached. attach with: tmux attach -t $SESSION"
+fi

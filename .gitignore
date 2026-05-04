@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.cache/
+results.csv
+.env
+.venv/
+.defn/
+
+# Compiled Go binaries (each module produces one matching its dirname).
+saturday-mayor/saturday-mayor
+saturday-hook/saturday-hook
+saturday-thinking/saturday-thinking
+watcher/watcher
+eval/router/router
+
+# Tooling debug artifacts.
+.plancheck-debug.json
+
+# Local-private corpus pulled from real Claude Code transcripts.
+# Ship `corpus.example.json` instead — synthetic samples, no PII.
+eval/corpus.json
+

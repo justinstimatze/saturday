@@ -1,0 +1,321 @@
+[
+  {
+    "utterance": "rerun the failing one",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "Ran 12 tests; tests/parser_test.go::TestRoundtrip failed (got nil, want non-nil at idx 7).",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"go test ./parser/...\"}"},
+      "last_tool_result_tail": "FAIL: TestRoundtrip (0.02s)\n  parser_test.go:142: idx 7: got nil, want non-nil\nFAIL\nexit status 1",
+      "modified_files": ["/home/user/Projects/alpha/parser/parse.go"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "how's it going",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Run 3 of 5 underway. ~12 minutes remaining based on prior runs.",
+      "last_tool_use": {"name": "BashOutput", "input_summary": "{\"bash_id\":\"bench-x7q\"}"},
+      "last_tool_result_tail": "[run 3/5] processing chunk 14/16 ... ETA ~9m"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "fix that",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"go vet ./...\"}"},
+      "last_tool_result_tail": "./handlers/auth.go:47:9: nil pointer dereference (govet)\nexit status 1",
+      "modified_files": ["/home/user/Projects/gamma/handlers/auth.go"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "explain this error",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"npm run build\"}"},
+      "last_tool_result_tail": "TS2345: Argument of type 'string' is not assignable to parameter of type 'BufferEncoding'."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "say more about that",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_assistant_text": "Two paths: (a) materialize the join client-side and accept the latency, or (b) push the join into the query plan with a CTE. Tradeoff is roughly memory vs query complexity."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "tag it",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "All five feedback items addressed; ready to release as v0.3.1.",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"git log --oneline -5\"}"},
+      "last_tool_result_tail": "abc1234 fix nil deref in handlers/auth.go\ndef5678 add roundtrip test fixtures"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "save that as a fixture",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Output of the noise-suppression pass on sample 12: SNR=18.3 dB, reduced from baseline 6.1 dB.",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"python eval.py sample_12.wav\"}"},
+      "last_tool_result_tail": "{\"sample\":12,\"snr_db\":18.3,\"baseline_db\":6.1,\"latency_ms\":42}"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "open a PR",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"git push origin feature/auth-fix\"}"},
+      "last_tool_result_tail": "Branch 'feature/auth-fix' set up to track 'origin/feature/auth-fix'.\n3 files changed, 47 insertions(+), 12 deletions(-)"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "add tests for that",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_assistant_text": "Added `normalizeQuery(q string) string` to query/normalize.go — strips whitespace, lowercases, collapses repeated operators.",
+      "modified_files": ["/home/user/Projects/delta/query/normalize.go"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "deploy it",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "Build green, tests passing. Available targets: staging, prod-eu, prod-us. Deployed to staging 2 days ago."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "do that for the other one too",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Migrated config/devices.yml schema. config/sensors.yml uses the same shape; should I migrate it as well or leave it?",
+      "modified_files": ["/home/user/Projects/beta/config/devices.yml"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "use the smaller one",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_assistant_text": "Three model options for the classifier: distilbert-base (66M), bert-mini (11M), and a custom 4M-param ConvNet. The smaller two are faster but bert-mini's accuracy is closest to baseline."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "rollback",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"git log --oneline -8\"}"},
+      "last_tool_result_tail": "a1b2c3d wip: refactor matcher\nf4e5d6c add edge-case tests\n9876abc fix nil panic in dispatch\n12345de migrate config/devices.yml schema"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "lookup the docs",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "We've touched three external libs in the last hour: ristretto (cache), pgx (postgres driver), and zerolog (logging)."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "add error handling",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Working through the dispatch path — there are roughly 40 functions across handlers/, middleware/, and queue/ that don't currently propagate errors."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "huh interesting",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_assistant_text": "Cold-start latency on the worker is dominated by Go's GC pacing, not the model load — ~80% of the 240ms is GC."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "I don't hate the new color",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_assistant_text": "Updated the accent token to #C8102E in themes/base.css and re-rendered the demo page.",
+      "modified_files": ["/home/user/Projects/delta/themes/base.css"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "we'll skip that for now",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "Should I also wire up the metrics export for the experimental cache layer, or leave that for a follow-up?"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "Bus 003 Device 042: ID 0b95:1790 ASIX Electronics Corp. AX88179",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "If the USB ethernet shows up under lsusb, paste the line and I'll work out which kernel module loads it."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "thinking out loud, this might just be a CPU bottleneck",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_assistant_text": "Latency P95 is 320ms; goroutine count is stable at ~50; no GC spikes correlate with the slow turns."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "yeah this is roughly what I had in mind",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_assistant_text": "Restructured the readme around three sections: install, run, customize. Examples sit beside their flags rather than under a separate 'examples' header."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "reading a Banks novel between sessions",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "Build is green; tests pass; nothing pending."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "I suspect we can just have a search algorithm tune it",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Five hyperparameters to tune (learning rate, batch size, hidden dim, dropout, weight decay). Grid search would be 7^5 = 16k configurations."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "what do you mean it's missing, it's at internal/parser/parse.go",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_assistant_text": "I don't see a parse.go in this repo — the parser package only has lexer.go and ast.go."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "make it tighter",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_assistant_text": "The animation transitions are 400ms ease-in-out, with a 100ms delay between staggered children.",
+      "modified_files": ["/home/user/Projects/delta/components/Card.tsx"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "do another adversarial review of the whole thing",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha",
+      "last_assistant_text": "Adversarial review pass 1 surfaced 4 issues, all fixed. The result is committed at abc1234."
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "the towers are about twice as far apart",
+    "state": {
+      "project": "beta",
+      "cwd": "/home/user/Projects/beta",
+      "last_assistant_text": "Current scene: 4 towers, base 4×4, height 16, spacing 4 units between faces, on a 32×32 platform.",
+      "modified_files": ["/home/user/Projects/beta/scene/towers.ts"]
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "1, 3, 4",
+    "state": {
+      "project": "gamma",
+      "cwd": "/home/user/Projects/gamma",
+      "last_assistant_text": "Five candidate refactors:\n1. extract dispatch loop into its own goroutine\n2. cache config.Load on first call\n3. drop the unused middleware\n4. inline the trivial getters\n5. move the build tags to a separate file\n\nWhich would you like first?"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "ugh",
+    "state": {
+      "project": "delta",
+      "cwd": "/home/user/Projects/delta",
+      "last_tool_use": {"name": "Bash", "input_summary": "{\"command\":\"npm test\"}"},
+      "last_tool_result_tail": "Tests:       7 failed, 142 passed, 149 total\nTime:        18.421s"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  },
+  {
+    "utterance": "hey what'd we ship last week",
+    "state": {
+      "project": "alpha",
+      "cwd": "/home/user/Projects/alpha"
+    },
+    "source_jsonl": "fixture",
+    "event_idx": 0
+  }
+]
