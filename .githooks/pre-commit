@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Saturday pre-commit hook. Mirrors .github/workflows/ci.yml so a clean
+# local commit ≈ a green CI run. Bypass with `git commit --no-verify`
+# (or set SATURDAY_SKIP_PRECOMMIT=1) when iterating.
+#
+# Installed via `make hooks` — sets core.hooksPath to .githooks/.
+
+set -euo pipefail
+
+if [[ "${SATURDAY_SKIP_PRECOMMIT:-0}" == "1" ]]; then
+  echo "pre-commit: SATURDAY_SKIP_PRECOMMIT=1 → skipping"
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+modules=(eval eval/router llmcore saturday-hook saturday-mayor saturday-thinking sync watcher)
+
+step() { printf '\033[1m▸ %s\033[0m\n' "$*"; }
+fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+step "gofmt"
+drift=$(gofmt -l .)
+if [[ -n "$drift" ]]; then
+  printf '%s\n' "$drift"
+  fail "gofmt drift — run \`gofmt -w\` on the files above"
+fi
+
+step "go vet (per module)"
+for d in "${modules[@]}"; do
+  (cd "$d" && go vet ./...) || fail "vet failed in $d"
+done
+
+step "go test -race (per module)"
+for d in "${modules[@]}"; do
+  (cd "$d" && go test -race ./...) || fail "test failed in $d"
+done
+
+step "make build"
+make build >/dev/null || fail "build failed"
+
+printf '\033[1;32m✓ pre-commit clean\033[0m\n'

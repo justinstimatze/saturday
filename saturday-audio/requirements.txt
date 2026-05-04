@@ -1,0 +1,7 @@
+faster-whisper>=1.0.0
+silero-vad>=5.0
+sounddevice>=0.4.6
+numpy>=1.24
+torch>=2.0
+kokoro-onnx>=0.4
+huggingface-hub>=0.20

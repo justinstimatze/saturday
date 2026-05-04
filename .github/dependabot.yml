@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /eval
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /eval/router
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /llmcore
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /saturday-hook
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /saturday-mayor
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /saturday-thinking
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /sync
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /watcher
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

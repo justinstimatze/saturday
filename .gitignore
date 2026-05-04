@@ -1,0 +1,48 @@
+# Python build / venv artifacts (saturday-audio sidecar).
+__pycache__/
+*.pyc
+.venv/
+
+# Local config / caches.
+.env
+.cache/
+results.csv
+
+# Tooling runtime state.
+.defn/
+.plancheck-debug.json
+
+# Compiled Go binaries — `go build` inside each module emits a binary
+# matching its dirname; `make build` (workspace) emits saturday-prefixed
+# binaries into /bin/. Bash launchers in /bin/ (saturday-stack,
+# saturday-claude) are tracked, so we ignore by specific filename
+# instead of the whole dir.
+/eval/eval
+/eval/router/router
+/saturday-hook/saturday-hook
+/saturday-mayor/saturday-mayor
+/saturday-thinking/saturday-thinking
+/sync/sync
+/watcher/watcher
+/bin/saturday-hook
+/bin/saturday-mayor
+/bin/saturday-sync
+/bin/saturday-thinking
+/bin/saturday-watcher
+
+# Local-private corpus pulled from real Claude Code transcripts. Ship
+# `eval/corpus.example.json` (synthetic, no PII) instead.
+/eval/corpus.json
+
+# Scratch / scratch dirs — kept out of public tree.
+/notes/
+/tmp/
+*.log
+
+# Editor / OS cruft.
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/

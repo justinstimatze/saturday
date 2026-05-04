@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# saturday-claude — start (or attach) a tmux session running claude in the
+# current directory's project, with all arguments forwarded to claude itself.
+#
+# Project = current directory (PWD). Tmux session name = "cc-<basename PWD>".
+# Re-running from the same directory attaches the existing session if alive.
+#
+# Usage:
+#   saturday-claude                       # fresh interactive claude in tmux
+#   saturday-claude --resume <sid>        # resume a specific session, in tmux
+#   saturday-claude --model opus          # any flag claude accepts
+#
+# Why: Saturday's voice loop sends keystrokes via `tmux send-keys` into the
+# live pane running claude. For mayor to find your session, claude has to
+# be inside a tmux pane. Running `saturday-claude` instead of `claude` is
+# the friction-free way to make that happen — old sessions and direct
+# `claude` invocations keep working, but Saturday can only inject into
+# sessions started this way (or otherwise inside tmux).
+#
+# Refusal: if you're already inside tmux, this script declines and tells
+# you to just run `claude` directly — no nested tmux sessions.
+
+set -euo pipefail
+
+if [ -n "${TMUX:-}" ]; then
+    echo "saturday-claude: already inside tmux. Just run: claude $*" >&2
+    exit 1
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "saturday-claude: tmux not installed. apt install tmux (or equivalent)." >&2
+    exit 1
+fi
+
+proj="$(pwd)"
+sname="cc-$(basename "$proj")"
+
+# Build a shell-safe command string for tmux. printf %q quotes each arg so
+# things like spaces, glob chars, and quotes survive intact.
+cmd="command claude"
+for arg in "$@"; do
+    cmd+=" $(printf '%q' "$arg")"
+done
+
+# -A: attach if session named $sname already exists, else create new.
+# -s: session name (so reattach is deterministic per project).
+# -c: starting directory for any new windows in the session.
+exec tmux new-session -A -s "$sname" -c "$proj" "$cmd"

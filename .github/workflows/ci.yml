@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            saturday-mayor/go.sum
+            saturday-thinking/go.sum
+
+      # The `make ci` target runs gofmt + vet + test -race + build in the
+      # same per-module loop as the .githooks/pre-commit hook, so the
+      # commit-time and CI-time gates are byte-identical.
+      - name: make ci
+        run: make ci

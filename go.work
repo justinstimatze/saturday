@@ -1,0 +1,12 @@
+go 1.26
+
+use (
+	./eval
+	./eval/router
+	./llmcore
+	./saturday-hook
+	./saturday-mayor
+	./saturday-thinking
+	./sync
+	./watcher
+)

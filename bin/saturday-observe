@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# saturday-observe — empirical probe for Phase 3 tool-chain completion detection.
+#
+# Tails active CC session JSONLs (discovered via the watcher's /state socket),
+# parses every new event, and prints a classified per-block stream with
+# inter-event timing deltas. When the latest event in a session is an
+# assistant-text block AND nothing new arrives for STABILITY_S seconds, prints
+# a >>> CANDIDATE COMPLETION <<< marker. When a user-text turn (non-tool_result)
+# arrives, prints --- USER TURN --- (effectively cancels any pending candidate).
+#
+# Run this in a side terminal while doing real CC work in another window. Watch
+# the output to calibrate STABILITY_S, observe trivial cases, and spot edge
+# patterns (e.g. long Bash gaps mid-chain that look like completions but
+# aren't) before writing the production detector in mayor.
+#
+# Usage:
+#   saturday-observe                       # tail every active session
+#   saturday-observe --jsonl /path/to.jsonl   # specific file (skips watcher)
+#   saturday-observe --stability 5         # tweak the candidate-window
+#   saturday-observe --quiet               # only emit candidates + user turns
+
+import argparse
+import http.client
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+WATCHER_SOCK = "/tmp/saturday-watcher.sock"
+POLL_INTERVAL_S = 0.25
+DEFAULT_STABILITY_S = 5.0
+
+
+# ANSI colors for at-a-glance pattern recognition.
+class C:
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+    GREEN = "\033[92m"     # assistant text
+    CYAN = "\033[96m"      # tool_use
+    MAGENTA = "\033[95m"   # thinking
+    YELLOW = "\033[93m"    # user text
+    BLUE = "\033[94m"      # tool_result
+    BOLD_GREEN = "\033[1;92m"
+    BOLD_RED = "\033[1;91m"
+
+
+def fetch_jsonl_paths():
+    """Query watcher's /state, return list of (project, jsonl_path) tuples."""
+    conn = http.client.HTTPConnection("localhost")
+    conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.sock.connect(WATCHER_SOCK)
+    conn.request("GET", "/state")
+    resp = conn.getresponse()
+    data = resp.read()
+    sessions = json.loads(data)
+    out = []
+    for s in sessions:
+        path = s.get("jsonl_path", "")
+        proj = s.get("state", {}).get("project", "?")
+        if path:
+            out.append((proj, path))
+    return out
+
+
+def classify_block(block):
+    """Return a short tag for one content block."""
+    bt = block.get("type", "?")
+    if bt == "text":
+        snippet = block.get("text", "")[:50].replace("\n", "⏎")
+        return f"{C.GREEN}text{C.RESET}({snippet!r})"
+    if bt == "tool_use":
+        name = block.get("name", "?")
+        return f"{C.CYAN}tool_use:{name}{C.RESET}"
+    if bt == "thinking":
+        return f"{C.MAGENTA}thinking{C.RESET}"
+    if bt == "tool_result":
+        return f"{C.BLUE}tool_result{C.RESET}"
+    return bt
+
+
+def parse_event(line):
+    """Return (etype, role, blocks_summary, latest_block_type, ts) or None."""
+    try:
+        e = json.loads(line)
+    except Exception:
+        return None
+    etype = e.get("type", "")
+    if etype not in ("user", "assistant"):
+        return None
+    msg = e.get("message", {})
+    if not isinstance(msg, dict):
+        return None
+    role = msg.get("role", "")
+    content = msg.get("content", [])
+    if isinstance(content, str):
+        # User text-string turn — the most common "user-typed-something" shape.
+        snippet = content[:60].replace("\n", "⏎")
+        return (etype, role, [f"{C.YELLOW}text-string{C.RESET}({snippet!r})"], "text", e.get("timestamp", ""))
+    if not isinstance(content, list):
+        return None
+    blocks_summary = [classify_block(b) for b in content]
+    block_types = [b.get("type", "") for b in content if isinstance(b, dict)]
+    latest_block_type = block_types[-1] if block_types else ""
+    return (etype, role, blocks_summary, latest_block_type, e.get("timestamp", ""))
+
+
+class JSONLTail:
+    def __init__(self, path, project):
+        self.path = Path(path)
+        self.project = project
+        self.offset = 0
+        if self.path.exists():
+            self.offset = self.path.stat().st_size
+        self.last_event_walltime = 0.0     # unix epoch when we processed the last event
+        self.latest_assistant_block_type = None
+        self.candidate_emitted = False
+
+    def poll(self, now, quiet, stability_s):
+        """Read any new bytes since last poll; print classified events."""
+        try:
+            st = self.path.stat()
+        except FileNotFoundError:
+            return
+        if st.st_size <= self.offset:
+            # No growth — but if we have a pending assistant text and stability
+            # window has elapsed, fire a candidate.
+            if (self.latest_assistant_block_type == "text"
+                    and not self.candidate_emitted
+                    and self.last_event_walltime > 0
+                    and (now - self.last_event_walltime) >= stability_s):
+                stamp = time.strftime("%H:%M:%S", time.localtime(now))
+                print(f"{stamp} {C.BOLD_GREEN}>>> CANDIDATE COMPLETION ({self.project}) "
+                      f"stable for {now - self.last_event_walltime:.1f}s <<<{C.RESET}",
+                      flush=True)
+                self.candidate_emitted = True
+            return
+        # Read new bytes.
+        with self.path.open("rb") as f:
+            f.seek(self.offset)
+            new = f.read(st.st_size - self.offset)
+        self.offset = st.st_size
+        for raw in new.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                line = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            parsed = parse_event(line)
+            if parsed is None:
+                continue
+            etype, role, blocks_summary, latest_block_type, ts = parsed
+            stamp = time.strftime("%H:%M:%S", time.localtime(now))
+            delta = ""
+            if self.last_event_walltime > 0:
+                delta = f" {C.DIM}+{now - self.last_event_walltime:.1f}s{C.RESET}"
+            self.last_event_walltime = now
+            self.candidate_emitted = False
+            line_summary = "|".join(blocks_summary)
+            # Track latest assistant block for candidate detection.
+            if etype == "assistant":
+                self.latest_assistant_block_type = latest_block_type
+            elif etype == "user":
+                # A user turn that's text (not tool_result) means the user
+                # interacted — for completion-detection that's a "cancel".
+                # tool_result is just CC's tool-completion shape; not a real
+                # user interaction.
+                is_text_only = all(
+                    "tool_result" not in s for s in blocks_summary
+                )
+                if is_text_only:
+                    print(f"{stamp} {C.BOLD_RED}--- USER TURN ({self.project}): "
+                          f"{line_summary} ---{C.RESET}", flush=True)
+                    self.latest_assistant_block_type = None
+                    continue
+                # tool_result resets candidate (chain is still going)
+                self.latest_assistant_block_type = "tool_result"
+            if not quiet:
+                print(f"{stamp}{delta} {C.DIM}{self.project} {etype}{C.RESET} {line_summary}",
+                      flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jsonl", action="append", default=None,
+                    help="explicit JSONL path (skip watcher discovery; repeatable)")
+    ap.add_argument("--stability", type=float, default=DEFAULT_STABILITY_S,
+                    help=f"seconds of silence before flagging candidate completion (default {DEFAULT_STABILITY_S})")
+    ap.add_argument("--quiet", action="store_true",
+                    help="only print CANDIDATE / USER TURN markers, suppress per-event log")
+    ap.add_argument("--rediscover", type=float, default=10.0,
+                    help="re-query watcher every N seconds for new sessions (default 10)")
+    args = ap.parse_args()
+
+    tails = {}  # path -> JSONLTail
+
+    def discover():
+        if args.jsonl:
+            for p in args.jsonl:
+                if p not in tails:
+                    tails[p] = JSONLTail(p, project=Path(p).stem[:8])
+                    print(f"{C.DIM}# tracking {p}{C.RESET}", flush=True)
+            return
+        try:
+            for proj, path in fetch_jsonl_paths():
+                if path not in tails:
+                    tails[path] = JSONLTail(path, project=proj)
+                    print(f"{C.DIM}# tracking [{proj}] {path}{C.RESET}", flush=True)
+        except Exception as e:
+            print(f"{C.DIM}# watcher fetch failed: {e}{C.RESET}", flush=True)
+
+    discover()
+    print(f"{C.DIM}# stability={args.stability}s — Ctrl-C to stop{C.RESET}", flush=True)
+
+    last_discover = time.time()
+    try:
+        while True:
+            now = time.time()
+            if (now - last_discover) >= args.rediscover and not args.jsonl:
+                discover()
+                last_discover = now
+            for tail in list(tails.values()):
+                tail.poll(now, args.quiet, args.stability)
+            time.sleep(POLL_INTERVAL_S)
+    except KeyboardInterrupt:
+        print(f"\n{C.DIM}# stopped{C.RESET}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

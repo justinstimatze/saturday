@@ -1,0 +1,48 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  disable:
+    - errcheck
+  enable:
+    # Defaults
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Style
+    - misspell
+
+    # Bugs
+    - bodyclose
+    - durationcheck
+    - nilerr
+
+    # Complexity
+    - cyclop
+    - gocognit
+    - nestif
+
+    # Security
+    - gosec
+
+  settings:
+    cyclop:
+      max-complexity: 40
+    gocognit:
+      min-complexity: 80
+    nestif:
+      min-complexity: 16
+    gosec:
+      excludes:
+        - G104  # unhandled errors (covered by errcheck which we handle manually)
+        - G115  # integer overflow uint->int
+        - G304  # file inclusion via variable (expected: we read JSONL transcript files)
+        - G306  # WriteFile permissions > 0600 (cache files need 0644)
+        - G401  # weak crypto (sha256 truncated for cache keys, not cryptographic)
+        - G404  # weak rand (sample shuffling is not security-sensitive)
