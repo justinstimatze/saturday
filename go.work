@@ -6,6 +6,7 @@ use (
 	./llmcore
 	./saturday-hook
 	./saturday-mayor
+	./saturday-stage
 	./saturday-thinking
 	./sync
 	./watcher

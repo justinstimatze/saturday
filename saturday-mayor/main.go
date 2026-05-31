@@ -94,6 +94,15 @@ type Mayor struct {
 	audioMu   sync.Mutex
 	audioConn net.Conn
 
+	// saturday-stage window-choreography sidecar. Mayor dials stage as a
+	// client and writes focus/restore commands from the inject lifecycle
+	// (focus in commitInject's tmux branch, restore in removePending). stageMu
+	// serializes writes; stageConn is nil when stage isn't running (commands
+	// no-op). runStageClient reconnects with backoff since stage may start
+	// after mayor.
+	stageMu   sync.Mutex
+	stageConn net.Conn
+
 	// Phase 3 — proactive completion reports. After a successful tmux or
 	// direct-write inject, the target session lands in pendingInjects keyed
 	// by sessionID. A polling goroutine watches each tracked JSONL: when the
@@ -192,6 +201,62 @@ func (m *Mayor) audioWrite(evt map[string]any) error {
 	b = append(b, '\n')
 	_, err := m.audioConn.Write(b)
 	return err
+}
+
+// stageWrite serializes JSON command writes to the saturday-stage sidecar
+// under stageMu. No-op (nil) if stage isn't connected, so the inject path
+// never blocks or errors on stage being absent. On write failure the conn is
+// dropped; runStageClient reconnects.
+func (m *Mayor) stageWrite(evt map[string]any) {
+	m.stageMu.Lock()
+	defer m.stageMu.Unlock()
+	if m.stageConn == nil {
+		return
+	}
+	b, _ := json.Marshal(evt)
+	b = append(b, '\n')
+	if _, err := m.stageConn.Write(b); err != nil {
+		m.stageConn.Close()
+		m.stageConn = nil
+	}
+}
+
+// runStageClient dials the stage sidecar and keeps the connection live,
+// reconnecting with capped backoff (stage may start after mayor, or restart
+// under it). It reads and discards anything stage sends (the window_activity
+// stream) purely to detect disconnects; mayor is a command producer here.
+func (m *Mayor) runStageClient(sockPath string) {
+	backoff := time.Second
+	for {
+		conn, err := net.Dial("unix", sockPath)
+		if err != nil {
+			time.Sleep(backoff)
+			if backoff < 16*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		m.stageMu.Lock()
+		m.stageConn = conn
+		m.stageMu.Unlock()
+		fmt.Fprintf(os.Stderr, "\033[2m  stage sidecar connected (%s)\033[0m\n", sockPath)
+
+		// Drain until EOF/error to detect disconnect.
+		buf := make([]byte, 4096)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				break
+			}
+		}
+		m.stageMu.Lock()
+		if m.stageConn == conn {
+			m.stageConn = nil
+		}
+		m.stageMu.Unlock()
+		conn.Close()
+		fmt.Fprintln(os.Stderr, "\033[2m  stage sidecar disconnected\033[0m")
+	}
 }
 
 // emitState fires a one-shot {"type":"state","activity":...} event over the
@@ -903,6 +968,17 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 		fmt.Fprintln(os.Stderr, "  ↳ injected via tmux send-keys (live pane handles)")
 		m.trackInject(target, text, narrate)
 		m.startBlink(m.getPending(target.State.SessionID), paneID)
+		// Window choreography: surface + highlight the addressed pane. Only
+		// reached after the inject committed (post confThreshold), so this is
+		// confident by construction — stage relocates; on a shaky route the
+		// utterance was dropped before we ever got here.
+		m.stageWrite(map[string]any{
+			"type":       "focus",
+			"session_id": target.State.SessionID,
+			"project":    target.State.Project,
+			"pane_id":    paneID,
+			"cwd":        target.State.Cwd,
+		})
 		return nil
 	}
 	fmt.Fprintln(os.Stderr, "  ↳ no tmux pane found for target cwd; using JSONL fallback path")
@@ -1351,8 +1427,15 @@ func (m *Mayor) trackInject(target SessionEntry, text, narrate string) {
 // sessionID that's not present.
 func (m *Mayor) removePending(sessionID string) {
 	m.pendingMu.Lock()
+	proj := ""
+	if p := m.pendingInjects[sessionID]; p != nil {
+		proj = p.project
+	}
 	delete(m.pendingInjects, sessionID)
 	m.pendingMu.Unlock()
+	// De-emphasize the addressed window on any teardown (completion, TTL
+	// expiry, interruption). No-op in stage for sessions it never highlighted.
+	m.stageWrite(map[string]any{"type": "restore", "session_id": sessionID, "project": proj})
 	go m.publishState()
 }
 
@@ -1754,6 +1837,7 @@ func main() {
 	hookSock := flag.String("hook-sock", "/tmp/saturday-mayor-hooks.sock", "V0.2.7: Unix socket receiving CC UserPromptSubmit/Stop events from the saturday-hook helper. One JSON line per accept. Empty disables.")
 	arcInterval := flag.Duration("arc-interval", 5*time.Minute, "V0.2.7: cadence of slow-loop session-arc summarizer refresh per active session. 0 disables.")
 	askConf := flag.Float64("ask-conf", 0.7, "V0.3: classifier conf threshold to route an utterance to ask-mode (Saturday answers from arcs) instead of inject-mode (relayed to a CC session). Wake-word prefix bypasses this. Higher = stricter (fewer false-positive ask, more retypes).")
+	stageSock := flag.String("stage-sock", "", "if set, dial this Unix socket and send focus/restore commands to the saturday-stage window-choreography sidecar on the inject lifecycle. Empty = disabled (no window choreography).")
 	flag.Parse()
 
 	llm.LoadDotEnv(*envPath)
@@ -1805,6 +1889,10 @@ func main() {
 
 	if m.arcInterval > 0 {
 		go m.runArcRefresher()
+	}
+
+	if *stageSock != "" {
+		go m.runStageClient(*stageSock)
 	}
 
 	if *audioSock != "" {

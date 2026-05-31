@@ -30,6 +30,12 @@ XDG_STATE_HOME_RESOLVED="${XDG_STATE_HOME:-$HOME/.local/state}"
 WATCHER_LOG="$XDG_STATE_HOME_RESOLVED/saturday/watcher.log"
 WATCHER_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-watcher.pid"
 
+# saturday-stage window-choreography sidecar — runs headless like the watcher
+# (quiet, log noise doesn't merit a pane). mayor dials STAGE_SOCK.
+STAGE_SOCK="${STAGE_SOCK:-/tmp/saturday-stage.sock}"
+STAGE_LOG="$XDG_STATE_HOME_RESOLVED/saturday/stage.log"
+STAGE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-stage.pid"
+
 # Subcommands: `stop` / `down` kills the session (tearing down all panes via
 # SIGHUP, which mayor/watcher/audio's signal handlers clean up cleanly).
 case "${1:-}" in
@@ -47,6 +53,14 @@ case "${1:-}" in
                 kill "$WPID" 2>/dev/null && echo "saturday-stack: watcher (pid $WPID) killed."
             fi
             rm -f "$WATCHER_PIDFILE"
+        fi
+        # Kill headless stage sidecar.
+        if [ -f "$STAGE_PIDFILE" ]; then
+            GPID=$(cat "$STAGE_PIDFILE" 2>/dev/null)
+            if [ -n "$GPID" ] && kill -0 "$GPID" 2>/dev/null; then
+                kill "$GPID" 2>/dev/null && echo "saturday-stack: stage (pid $GPID) killed."
+            fi
+            rm -f "$STAGE_PIDFILE"
         fi
         exit 0
         ;;
@@ -107,7 +121,7 @@ if [ ! -f "$AUDIO_VENV/bin/activate" ]; then
     echo "  cd $AUDIO_DIR && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
     exit 1
 fi
-for bin in saturday-watcher saturday-mayor saturday-thinking; do
+for bin in saturday-watcher saturday-mayor saturday-thinking saturday-stage; do
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
         echo "saturday-stack: $bin not found on PATH or in ~/go/bin" >&2
         exit 1
@@ -137,8 +151,16 @@ mkdir -p "$(dirname "$WATCHER_LOG")"
 echo $! > "$WATCHER_PIDFILE"
 echo "saturday-stack: watcher running headless (pid $(cat "$WATCHER_PIDFILE")), log → $WATCHER_LOG"
 
+# Stage sidecar next — headless, before mayor so the socket exists when mayor
+# dials (mayor reconnects with backoff regardless). tmux backend (Layer A);
+# CC-sessions-only activity allowlist by default.
+mkdir -p "$(dirname "$STAGE_LOG")"
+~/go/bin/saturday-stage --sock "$STAGE_SOCK" >> "$STAGE_LOG" 2>&1 &
+echo $! > "$STAGE_PIDFILE"
+echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log → $STAGE_LOG"
+
 tmux new-session -d -s "$SESSION" -n "stack" \
-    "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK'"
+    "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK' --stage-sock '$STAGE_SOCK'"
 
 # Keep panes around after their process exits so failures are inspectable.
 tmux set-option -t "$SESSION" remain-on-exit on
