@@ -31,7 +31,8 @@ activity stream.
 
 ```jsonc
 // commands in  (mayor → stage)
-{"type":"focus",     "session_id":"<uuid>", "project":"lucida", "pane_id":"%5", "cwd":"/path"}
+{"type":"focus",     "session_id":"<uuid>", "project":"lucida", "pane_id":"%5", "cwd":"/path",
+                     "zoom":false, "tile":false}   // zoom/tile are Posture A modifiers
 {"type":"restore",   "session_id":"<uuid>", "project":"lucida"}
 {"type":"highlight", "session_id":"<uuid>", "project":"lucida", "pane_id":"%5", "level":"active|done|dim"}
 
@@ -44,6 +45,28 @@ cleared the confidence gate, so it's confident by construction) and `restore`
 from `removePending` (covers completion, TTL expiry, and interruption). Highlight
 state is keyed by `session_id`, so `restore` needs only the id and is a clean
 no-op for sessions stage never touched (direct-write / headless injects).
+
+## Posture A — cockpit window (adopted)
+
+tmux maximize/tile work on **panes within one window**, so to use them for many
+CC sessions, run the sessions as panes in a single "cockpit" window (rather than
+a `cc-<proj>` session-per-terminal). `bin/saturday-cockpit` builds it:
+
+```bash
+saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
+```
+
+Then a `focus` command carries Posture A modifiers:
+
+- `"zoom":true` → `resize-pane -Z`: maximize the addressed pane, hide the rest.
+- `"tile":true` → even-horizontal row, addressed pane gets `--tile-emphasis`× the
+  width of each sibling (salience-proportional, no pane reordering).
+
+`restore` reverts faithfully by re-applying the window's pre-touch layout string
+(`window_layout` round-trips through `select-layout`) and unzooming. Mayor opts
+in per run: `--stage-zoom` (maximize on inject) or `--stage-tile` (salience
+widths). Cross-*terminal* maximize/tile — when sessions are separate terminals,
+not cockpit panes — is Layer B (Hyprland), not tmux.
 
 ## Privacy
 

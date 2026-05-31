@@ -102,6 +102,8 @@ type Mayor struct {
 	// after mayor.
 	stageMu   sync.Mutex
 	stageConn net.Conn
+	stageZoom bool // Posture A: zoom the addressed pane on focus
+	stageTile bool // Posture A: salience-tile the addressed pane on focus
 
 	// Phase 3 — proactive completion reports. After a successful tmux or
 	// direct-write inject, the target session lands in pendingInjects keyed
@@ -978,6 +980,8 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 			"project":    target.State.Project,
 			"pane_id":    paneID,
 			"cwd":        target.State.Cwd,
+			"zoom":       m.stageZoom,
+			"tile":       m.stageTile,
 		})
 		return nil
 	}
@@ -1838,6 +1842,8 @@ func main() {
 	arcInterval := flag.Duration("arc-interval", 5*time.Minute, "V0.2.7: cadence of slow-loop session-arc summarizer refresh per active session. 0 disables.")
 	askConf := flag.Float64("ask-conf", 0.7, "V0.3: classifier conf threshold to route an utterance to ask-mode (Saturday answers from arcs) instead of inject-mode (relayed to a CC session). Wake-word prefix bypasses this. Higher = stricter (fewer false-positive ask, more retypes).")
 	stageSock := flag.String("stage-sock", "", "if set, dial this Unix socket and send focus/restore commands to the saturday-stage window-choreography sidecar on the inject lifecycle. Empty = disabled (no window choreography).")
+	stageZoom := flag.Bool("stage-zoom", false, "Posture A (cockpit): on inject, ask stage to zoom (maximize) the addressed pane; restore unzooms. Takes precedence over --stage-tile.")
+	stageTile := flag.Bool("stage-tile", false, "Posture A (cockpit): on inject, ask stage to give the addressed pane a proportionally larger share of an even-horizontal row (salience tiling); restore re-evens.")
 	flag.Parse()
 
 	llm.LoadDotEnv(*envPath)
@@ -1866,15 +1872,17 @@ func main() {
 		confThreshold:      *confThreshold,
 		askConf:            *askConf,
 		injectDirectTokens: *injectDirectTokens,
-		stabilityWindow: *stabilityWindow,
-		completionTTL:   *completionTTL,
-		minGrowthBytes:  *minGrowthBytes,
-		minElapsed:      *minElapsed,
-		startedAt:       time.Now(),
-		state:           "idle",
-		noBlink:         *noBlink,
-		arcSummaries:    map[string]string{},
-		arcInterval:     *arcInterval,
+		stabilityWindow:    *stabilityWindow,
+		completionTTL:      *completionTTL,
+		minGrowthBytes:     *minGrowthBytes,
+		minElapsed:         *minElapsed,
+		startedAt:          time.Now(),
+		state:              "idle",
+		noBlink:            *noBlink,
+		arcSummaries:       map[string]string{},
+		arcInterval:        *arcInterval,
+		stageZoom:          *stageZoom,
+		stageTile:          *stageTile,
 	}
 
 	fmt.Fprintf(os.Stderr, "saturday-mayor — sock=%s dry-run=%v\n", *sock, *dryRun)

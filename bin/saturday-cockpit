@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# saturday-cockpit — Posture A topology: one tmux window holding every Claude
+# Code session as a pane, so saturday-stage can maximize (zoom) the addressed
+# session or tile the panes by salience — all native tmux, no Wayland.
+#
+# This is the alternative to per-project `saturday-claude` sessions (one tmux
+# session per dir, each in its own terminal). The cockpit trades cross-monitor
+# spread for native within-window choreography: zoom-to-focus and
+# salience-proportional tiling that stage drives on the inject lifecycle.
+#
+# Usage:
+#   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
+#   saturday-cockpit stop          # kill the cockpit window/session
+#   saturday-cockpit status        # list panes (pane_id, pid, cwd)
+#
+# Env:
+#   CLAUDE_CMD   command run in each pane (default: claude). Each pane cd's into
+#                its dir and execs this — plain `claude` so the watcher/mayor
+#                discover it by walking /proc per cwd (no nested tmux wrapper).
+#   COCKPIT      tmux session name (default: cc-cockpit — matches stage's ^cc-
+#                activity allowlist).
+#   COCKPIT_TILE even-horizontal | even-vertical | tiled (default even-horizontal)
+#
+# Pair with stage zoom/tile on mayor:
+#   saturday-mayor ... --stage-sock /tmp/saturday-stage.sock --stage-zoom
+#   (or --stage-tile for graded salience widths instead of full zoom)
+
+set -euo pipefail
+
+SESSION="${COCKPIT:-cc-cockpit}"
+CLAUDE_CMD="${CLAUDE_CMD:-claude}"
+LAYOUT="${COCKPIT_TILE:-even-horizontal}"
+
+case "${1:-}" in
+    stop|down|kill)
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux kill-session -t "$SESSION"
+            echo "saturday-cockpit: session killed."
+        else
+            echo "saturday-cockpit: no session running."
+        fi
+        exit 0
+        ;;
+    status)
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux list-panes -t "$SESSION" -F '#{pane_id} #{pane_pid} #{pane_current_path}'
+        else
+            echo "saturday-cockpit: not running."
+            exit 1
+        fi
+        exit 0
+        ;;
+esac
+
+if [ -n "${TMUX:-}" ]; then
+    echo "saturday-cockpit: already inside tmux. Open a fresh terminal." >&2
+    exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "saturday-cockpit: tmux not installed (apt install tmux)." >&2
+    exit 1
+fi
+
+# Reattach an existing cockpit rather than rebuild it.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+fi
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: saturday-cockpit <dir> [<dir> ...]   (one Claude Code pane per dir)" >&2
+    echo "       saturday-cockpit stop|status" >&2
+    exit 2
+fi
+
+# Validate dirs up front so we don't build a half-cockpit.
+for d in "$@"; do
+    if [ ! -d "$d" ]; then
+        echo "saturday-cockpit: not a directory: $d" >&2
+        exit 1
+    fi
+done
+
+# First pane = first dir.
+first="$1"; shift
+tmux new-session -d -s "$SESSION" -n "cockpit" \
+    "cd '$first' && exec $CLAUDE_CMD"
+
+# Remaining dirs → one split each. Re-balance after every split so tmux always
+# has room for the next pane.
+for d in "$@"; do
+    tmux split-window -t "$SESSION" "cd '$d' && exec $CLAUDE_CMD"
+    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+done
+
+# Keep dead panes readable; show per-pane titles (basenames) along the top
+# border so the cockpit is legible and stage's title marker has a home.
+tmux set-option -t "$SESSION" remain-on-exit on
+tmux set-window-option -t "$SESSION" pane-border-status top
+tmux set-window-option -t "$SESSION" pane-border-format ' #{pane_index}:#{b:pane_current_path} '
+tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+
+echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
+echo "  stage drives zoom/tile on inject when mayor runs with --stage-zoom / --stage-tile."
+
+if [ -t 1 ]; then
+    exec tmux attach-session -t "$SESSION"
+else
+    echo "  (no TTY — attach with: tmux attach -t $SESSION)"
+fi

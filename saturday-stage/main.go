@@ -58,6 +58,13 @@ type Command struct {
 	Cwd       string  `json:"cwd"`
 	Level     string  `json:"level"` // highlight only: active | done | dim
 	Conf      float64 `json:"conf"`
+	// Posture A (cockpit) modifiers on a focus command. Zoom maximizes the
+	// addressed pane (resize-pane -Z); Tile gives it a proportionally larger
+	// share of an even-horizontal row (salience emphasis) without reordering
+	// panes. Zoom wins if both set. Both are reverted on restore from the
+	// window's saved layout.
+	Zoom bool `json:"zoom"`
+	Tile bool `json:"tile"`
 }
 
 // Event is the monitor stream. Privacy: only emitted for panes whose tmux
@@ -122,22 +129,27 @@ type savedStyle struct {
 }
 
 type tmuxSource struct {
-	noRelocate bool
+	noRelocate   bool
+	tileEmphasis float64
 
 	mu sync.Mutex
 	// touched maps CC session_id → the tmux window we restyled, plus the
-	// window's original styles, so restore reverts exactly what focus changed
-	// even if the active pane moved in the meantime.
+	// window's original styles AND its pre-modification layout string, so
+	// restore reverts exactly what focus changed (border, zoom, tiling) even
+	// if the active pane moved in the meantime. window_layout round-trips
+	// through select-layout, so it's the faithful restore for zoom/tile.
 	touched map[string]touchedWindow
 }
 
 type touchedWindow struct {
-	window string
-	saved  savedStyle
+	window      string
+	saved       savedStyle
+	savedLayout string
+	zoomed      bool // stage zoomed this pane → unzoom on restore
 }
 
-func newTmuxSource(noRelocate bool) *tmuxSource {
-	return &tmuxSource{noRelocate: noRelocate, touched: map[string]touchedWindow{}}
+func newTmuxSource(noRelocate bool, tileEmphasis float64) *tmuxSource {
+	return &tmuxSource{noRelocate: noRelocate, tileEmphasis: tileEmphasis, touched: map[string]touchedWindow{}}
 }
 
 func (t *tmuxSource) Name() string { return "tmux" }
@@ -174,7 +186,85 @@ func (t *tmuxSource) Focus(c Command) error {
 	}
 	hc := c
 	hc.Level = "active"
-	return t.Highlight(hc)
+	if err := t.Highlight(hc); err != nil { // also captures saved layout on first touch
+		return err
+	}
+	// Posture A emphasis. Zoom is the binary extreme (maximize, hide others);
+	// Tile is the graded version (bigger share of an even row). Mutually
+	// exclusive — zoom wins.
+	switch {
+	case c.Zoom:
+		return t.zoomPane(c.SessionID, c.PaneID)
+	case c.Tile:
+		return t.proportionalTile(c.PaneID)
+	}
+	return nil
+}
+
+// zoomPane maximizes the addressed pane (resize-pane -Z), recording that stage
+// zoomed it so restore can toggle back. No-op if the window is already zoomed
+// (avoids un-zooming a user's manual zoom).
+func (t *tmuxSource) zoomPane(sessionID, paneID string) error {
+	win, err := windowOf(paneID)
+	if err != nil {
+		return err
+	}
+	if z, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_zoomed_flag}"); z == "1" {
+		return nil
+	}
+	if err := tmuxRun("resize-pane", "-Z", "-t", paneID); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	if tw, ok := t.touched[sessionID]; ok {
+		tw.zoomed = true
+		t.touched[sessionID] = tw
+	}
+	t.mu.Unlock()
+	return nil
+}
+
+// proportionalTile lays the pane's window out as a single even-horizontal row
+// and gives the addressed pane a larger share (tileEmphasis : 1 vs each
+// sibling), so widths track salience without reordering panes. Two-tier for
+// now (addressed vs rest); a full per-session weight vector can drive this
+// later when mayor pushes one.
+func (t *tmuxSource) proportionalTile(paneID string) error {
+	win, err := windowOf(paneID)
+	if err != nil {
+		return err
+	}
+	out, err := tmuxOut("list-panes", "-t", win, "-F", "#{pane_id}")
+	if err != nil {
+		return err
+	}
+	panes := strings.Fields(out)
+	if len(panes) < 2 {
+		return nil // nothing to tile against
+	}
+	_ = tmuxRun("select-layout", "-t", win, "even-horizontal")
+	wStr, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_width}")
+	var cols int
+	fmt.Sscanf(wStr, "%d", &cols)
+	if cols <= 0 {
+		return nil
+	}
+	total := t.tileEmphasis + float64(len(panes)-1) // emphasis for target, 1 each for the rest
+	target := int(t.tileEmphasis / total * float64(cols))
+	// Resize every pane but the last (tmux balances the remainder into it),
+	// giving the addressed pane the emphasis share and the rest an even split.
+	rest := (cols - target) / (len(panes) - 1)
+	for i, p := range panes {
+		if i == len(panes)-1 {
+			break
+		}
+		w := rest
+		if p == paneID {
+			w = target
+		}
+		_ = tmuxRun("resize-pane", "-t", p, "-x", fmt.Sprintf("%d", w))
+	}
+	return nil
 }
 
 // Highlight tints the window's active-pane border and titles the pane, saving
@@ -191,7 +281,12 @@ func (t *tmuxSource) Highlight(c Command) error {
 	if _, ok := t.touched[c.SessionID]; !ok {
 		bs, _ := tmuxOut("show-options", "-wqv", "-t", win, "pane-border-status")
 		abs, _ := tmuxOut("show-options", "-wqv", "-t", win, "pane-active-border-style")
-		t.touched[c.SessionID] = touchedWindow{window: win, saved: savedStyle{borderStatus: bs, activeBorderStyle: abs}}
+		layout, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_layout}")
+		t.touched[c.SessionID] = touchedWindow{
+			window:      win,
+			saved:       savedStyle{borderStatus: bs, activeBorderStyle: abs},
+			savedLayout: layout,
+		}
 	}
 	t.mu.Unlock()
 
@@ -215,6 +310,17 @@ func (t *tmuxSource) Restore(c Command) error {
 	t.mu.Unlock()
 	if !ok {
 		return nil
+	}
+	// Undo geometry first: unzoom if we zoomed, then re-apply the pre-touch
+	// layout (round-trips through select-layout, faithfully reverting zoom and
+	// proportional tiling alike).
+	if tw.zoomed {
+		if z, _ := tmuxOut("display-message", "-p", "-t", tw.window, "#{window_zoomed_flag}"); z == "1" {
+			_ = tmuxRun("resize-pane", "-Z", "-t", tw.window)
+		}
+	}
+	if tw.savedLayout != "" {
+		_ = tmuxRun("select-layout", "-t", tw.window, tw.savedLayout)
 	}
 	if tw.saved.borderStatus == "" {
 		_ = tmuxRun("set-option", "-w", "-t", tw.window, "-u", "pane-border-status")
@@ -406,12 +512,13 @@ func main() {
 	allowRe := flag.String("allow", "^cc-", "regex over tmux session names — only matching sessions are observed in the activity stream. Default ^cc- = CC sessions only (privacy-safe by construction). Empty = observe all.")
 	poll := flag.Duration("poll", time.Second, "tmux activity poll interval")
 	noRelocate := flag.Bool("no-relocate", false, "highlight only — never select-window/select-pane (no focus motion, just border tint)")
+	tileEmphasis := flag.Float64("tile-emphasis", 3.0, "Posture A: on a tile focus, the addressed pane's width share relative to each sibling (3 = ~3× wider). 1 = even.")
 	flag.Parse()
 
 	var src WindowSource
 	switch *backend {
 	case "tmux":
-		src = newTmuxSource(*noRelocate)
+		src = newTmuxSource(*noRelocate, *tileEmphasis)
 	case "hyprland":
 		src = &hyprlandSource{}
 	default:
