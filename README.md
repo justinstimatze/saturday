@@ -13,18 +13,102 @@ picks which of your active sessions you meant, expands the utterance
 into a project-grounded prompt, and types it into the live `tmux` pane
 running `claude` — without you having to switch windows.
 
+```mermaid
+flowchart LR
+    mic([mic])
+    audio[saturday-audio<br/>VAD · Whisper · Kokoro]
+    mayor[saturday-mayor<br/>router · expander]
+    claude[claude in tmux pane]
+    jsonl[(~/.claude/projects/<br/>JSONL transcripts)]
+    watcher[saturday-watcher<br/>polls at 200ms]
+
+    mic --> audio
+    audio -->|utterance JSON| mayor
+    mayor -->|tmux send-keys| claude
+    claude -->|writes| jsonl
+    jsonl -->|polled| watcher
+    watcher -->|state via unix socket| mayor
 ```
-   mic ──▶ saturday-audio ──▶ saturday-mayor ──▶ claude (in tmux pane)
-   (VAD +    (sidecar:        (orchestrator:        ▲
-   Whisper)  STT + TTS)       router + expander)    │
-                                    │               │
-                                    ▼               │
-                              saturday-watcher ─────┘
-                              (polls ~/.claude/projects/
-                               JSONL files at 200ms,
-                               serves cognitive state
-                               over a Unix socket)
+
+## What a session feels like
+
+A synthetic transcript of one expand-mode exchange. You speak; mayor
+narrates routing decisions to its stderr; the target pane (a separate
+`claude` running your tests) receives the inject; the completion report
+comes back as TTS without you ever looking at it.
+
+First, the stack comes up. The audio pane has focus (rightmost in the
+tmux session) since `SPACEBAR`-mute lives there:
+
 ```
+$ saturday-stack
+─── saturday-watcher ───
+[ready] sock=/tmp/saturday-watcher.sock, 4 active sessions, polling every 200ms
+
+─── saturday-mayor ───
+[hook-sock] listening on /tmp/saturday-mayor-hooks.sock
+[state-sock] listening on /tmp/saturday-mayor-state.sock
+listening on /tmp/saturday-audio.sock
+
+─── saturday-audio ───
+[live]
+```
+
+You speak (mic still warm — open by default):
+
+> *"would you kindly check the failing test in lucida"*
+
+The `would you kindly` prefix opts this one utterance into expand mode
+(router + expander rewrite, plus a TTS narration). The mayor pane scrolls:
+
+```
+← utt (expand, narrate=auto) would you kindly check the failing test in lucida
+→ route: lucida (conf=0.93) — name match + recent vitest run in last_assistant_text
+→ Saturday → lucida (conf=0.88): "Re-run the lucida test suite and identify the single failing case. Report the test name, its file, and the first 5 lines of its assertion output."
+  ↳ found tmux pane %12 for cwd=/home/dev/code/lucida; using tmux send-keys
+  ↳ injected via tmux send-keys (live pane handles)
+```
+
+The stock ack plays through the speakers within ~50 ms:
+
+> *(TTS, voice af_heart)*  *"On it."*
+
+What lucida's `claude` actually receives is the expansion plus a small
+appended system rule that asks for phonetic labels on any enumerated
+output — so if the model lists three failures, they come back tagged
+*alpha / bravo / cherry*, and a follow-up like *"fix the bravo one"*
+routes unambiguously next turn:
+
+```
+Re-run the lucida test suite and identify the single failing case.
+Report the test name, its file, and the first 5 lines of its assertion
+output.
+
+[saturday: when listing more than one item, label each with a phonetically-distinct
+callsign — alpha bravo cherry delta echo foxtrot golf hotel — and reuse the same
+callsign for the same item across this session. Skip for single-item or pure-prose
+answers.]
+```
+
+~6 s pass while lucida's `claude` runs `pnpm test` and writes back to
+its JSONL. Mayor's polling goroutine catches the size-stable JSONL with
+a `text` (not `tool_use`/`thinking`) latest block, pulls
+`state.last_assistant_text` from the watcher, and asks Haiku for a
+≤15-word past-tense summary:
+
+```
+✓ completion report (lucida): "lucida tests done — 17 passed, 1 failed in utterance.test.ts"
+```
+
+> *(TTS, voice af_heart)*  *"lucida tests done — 17 passed, 1 failed
+> in utterance dot test dot ts"*
+
+You never had to look at the lucida pane.
+
+The lines above are mayor's real stderr format (color codes elided); the
+project name and the test output are illustrative. The single appended
+system rule is what mayor actually concatenates onto every expand-mode
+inject — see `saturday-mayor/main.go::withCallsignRule`.
 
 ## Status
 
@@ -104,88 +188,8 @@ By default the loop is **verbatim** — your transcribed words become the
 inject directly, with no LLM expansion. Prefix `"would you kindly"`
 (the configurable hotphrase) to opt into expand-mode, where the router
 picks the target session and the expander rewrites the utterance into a
-project-grounded prompt.
-
-## What a session feels like
-
-Synthetic transcript of one expand-mode exchange. The audio pane is muted
-in the corner; you speak, mayor narrates routing decisions to its
-stderr, the target pane (a separate `claude` session running tests)
-receives the inject, the completion report comes back as TTS without
-you having to look at the terminal.
-
-First, the stack comes up. The audio pane is on the right with focus,
-since `SPACEBAR`-mute lives there:
-
-```
-$ saturday-stack
-─── saturday-watcher ───
-[ready] sock=/tmp/saturday-watcher.sock, 4 active sessions, polling every 200ms
-
-─── saturday-mayor ───
-[hook-sock] listening on /tmp/saturday-mayor-hooks.sock
-[state-sock] listening on /tmp/saturday-mayor-state.sock
-listening on /tmp/saturday-audio.sock
-
-─── saturday-audio ───
-[live]
-```
-
-You speak (mic still warm — open by default):
-
-> *"would you kindly check the failing test in lucida"*
-
-The `would you kindly` prefix opts this one utterance into expand mode
-(router + expander rewrite, plus a TTS narration). The mayor pane scrolls:
-
-```
-← utt (expand, narrate=auto) would you kindly check the failing test in lucida
-→ route: lucida (conf=0.93) — name match + recent vitest run in last_assistant_text
-→ Saturday → lucida (conf=0.88): "Re-run the lucida test suite and identify the single failing case. Report the test name, its file, and the first 5 lines of its assertion output."
-  ↳ found tmux pane %12 for cwd=/home/dev/code/lucida; using tmux send-keys
-  ↳ injected via tmux send-keys (live pane handles)
-```
-
-The stock ack plays through the speakers within ~50 ms:
-
-> *(TTS, voice af_heart)*  *"On it."*
-
-What lucida's `claude` actually receives is the expansion plus a small
-appended system rule that asks for phonetic labels on any enumerated
-output — so if the model lists three failures, they come back tagged
-*alpha / bravo / cherry*, and a follow-up like *"fix the bravo one"*
-routes unambiguously next turn:
-
-```
-Re-run the lucida test suite and identify the single failing case.
-Report the test name, its file, and the first 5 lines of its assertion
-output.
-
-[saturday: when listing more than one item, label each with a phonetically-distinct
-callsign — alpha bravo cherry delta echo foxtrot golf hotel — and reuse the same
-callsign for the same item across this session. Skip for single-item or pure-prose
-answers.]
-```
-
-~6 s pass while lucida's `claude` runs `pnpm test` and writes back to
-its JSONL. Mayor's polling goroutine catches the size-stable JSONL with
-a `text` (not `tool_use`/`thinking`) latest block, pulls
-`state.last_assistant_text` from the watcher, and asks Haiku for a
-≤15-word past-tense summary:
-
-```
-✓ completion report (lucida): "lucida tests done — 17 passed, 1 failed in utterance.test.ts"
-```
-
-> *(TTS, voice af_heart)*  *"lucida tests done — 17 passed, 1 failed
-> in utterance dot test dot ts"*
-
-You never had to look at the lucida pane.
-
-The lines above are mayor's real stderr format (color codes elided); the
-project name and the test output are illustrative. The single appended
-system rule is what mayor actually concatenates onto every expand-mode
-inject — see `saturday-mayor/main.go::withCallsignRule`.
+project-grounded prompt. (See [What a session feels like](#what-a-session-feels-like)
+above for the full transcript shape.)
 
 ## How it works
 
