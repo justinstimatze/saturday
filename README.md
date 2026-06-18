@@ -14,7 +14,7 @@ into a project-grounded prompt, and types it into the live `tmux` pane
 running `claude` — without you having to switch windows.
 
 ```mermaid
-flowchart LR
+flowchart TB
     mic([mic])
     audio[saturday-audio<br/>VAD · Whisper · Kokoro]
     mayor[saturday-mayor<br/>router · expander]
