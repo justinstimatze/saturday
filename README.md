@@ -4,9 +4,10 @@
 > packaged product. It runs on **Linux + Wayland + tmux** only, expects
 > familiarity with [Claude Code](https://docs.claude.com/en/docs/claude-code)
 > internals (JSONL files, hooks, autocompact), and will keep your
-> microphone open by default. Every utterance becomes a billed Anthropic
-> API call. Read the [privacy and cost notes](#privacy-and-cost) before
-> running it. Expect breakage; expect the architecture to keep changing.
+> microphone open by default. Utterances can bill against your Anthropic
+> account (depends on mode + active-session count — see
+> [privacy and cost](#privacy-and-cost)). Read those notes before running
+> it. Expect breakage; expect the architecture to keep changing.
 
 Saturday is a voice layer for Claude Code. You speak; it transcribes,
 picks which of your active sessions you meant, expands the utterance
@@ -119,7 +120,8 @@ inject — see `saturday-mayor/main.go::withCallsignRule`.
 | Inject substrate     | `tmux send-keys` is primary. Headless `claude --resume --print` is fallback. |
 | STT                  | `faster-whisper small.en`, int8, on CPU.                                   |
 | TTS                  | Kokoro-ONNX, default voice `af_heart`.                                     |
-| Models               | Anthropic API. `claude-sonnet-4-6` (expander), `claude-haiku-4-5` (router/summarizer). |
+| Models               | Anthropic API. `claude-sonnet-4-6` (expander), `claude-haiku-4-5` (router/summarizer). Server-side prompt cache active on the shared system-prompt seam. |
+| Local swap           | `llmcore/` is the only surface: the HTTP transport in `llm.go` plus six model-ID constants in the per-role files. An OpenAI-compatible local backend (Ollama / vLLM / llama.cpp-server) should drop in; not yet tested. |
 | Tests                | Pure-helper coverage only — feedback loop, wake-word, project-name decoding. The orchestration logic is untested. |
 
 What does not currently work, even on the supported stack:
@@ -230,10 +232,22 @@ inject substrate and [`ROADMAP.md`](ROADMAP.md) for the version arc.
   `~/.claude/saturday/transcripts/YYYY-MM-DD.log` for debugging. The
   files never leave the machine, but they accumulate forever unless
   you rotate them.
-- **Every utterance is a billed API call.** A routine ~5-word
-  utterance fires one Haiku router call plus one Haiku or Sonnet
-  expander call (~$0.001-$0.01 depending on session-state size,
-  cache-warm). Open-mic + chatty days add up.
+- **Cost per utterance depends on mode and target count.** Default is
+  verbatim: the transcript is typed into the target pane with no LLM in
+  the hot loop. Per utterance:
+  - verbatim + 1 active session → **0 API calls** (mic → tmux typing, done)
+  - verbatim + N sessions → 1 Haiku router
+  - expand-mode (opt in with `would you kindly …`) + 1 session → 1 Sonnet expander
+  - expand-mode + N sessions → 1 Haiku router + 1 Sonnet expander
+  - after any tracked inject → 1 Haiku summarizer for the completion report
+
+  Independently, an arc summarizer fires 1 Haiku call every 5 min per
+  active session, but only when the session's state has changed since
+  the last arc (unchanged → content-hash disk-cache hit, $0).
+  `cache_control` markers on the shared system-prompt seam drop the
+  stable-prefix portion of every call to ~10% (server-side prefix
+  cache). Practical: muted with ~5-10 active sessions ≈ cents/hour;
+  chatty expand-heavy sessions ≈ 10s of cents/hour.
 - **Multi-user host warning.** Mayor and watcher listen on
   `/tmp/saturday-*.sock` with `0666` perms so the cross-user inject
   path can work. **Do not run this on a shared host.** Any local
