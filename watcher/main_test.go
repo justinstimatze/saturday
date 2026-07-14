@@ -34,6 +34,10 @@ func TestDecodeProjectName(t *testing.T) {
 		{"-home-alice-misc-thing", "-home-alice-", "misc-thing"},                   // no known anchor → return trailing
 		{"-home-other-Documents-foo", "-home-alice-", "-home-other-Documents-foo"}, // wrong prefix → returned verbatim
 		{"-home-alice-Documents-", "-home-alice-", ""},
+		{"-home-alice", "-home-alice-", "~"},                     // session started in $HOME itself
+		{"-home-alice-Documents", "-home-alice-", "~/Documents"}, // session started in the workspace parent (not a project)
+		{"-home-alice-code", "-home-alice-", "~/code"},
+		{"-home-alice-src", "-home-alice-", "~/src"},
 	}
 	for _, c := range cases {
 		got := decodeProjectName(c.encoded, c.homePrefix)

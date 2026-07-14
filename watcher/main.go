@@ -169,6 +169,14 @@ func decodeProjectName(encodedDir, homePrefix string) string {
 		}
 		homePrefix = "-" + strings.ReplaceAll(strings.TrimPrefix(home, "/"), "/", "-") + "-"
 	}
+	// A claude session started at $HOME encodes as `-home-<user>` (no
+	// trailing dash) — the with-trailing-dash homePrefix won't match, and
+	// the raw dir name would leak into UI labels. Same shape for the
+	// bare-`~/Documents` parent case one level down.
+	homeNoDash := strings.TrimSuffix(homePrefix, "-")
+	if encodedDir == homeNoDash {
+		return "~"
+	}
 	if !strings.HasPrefix(encodedDir, homePrefix) {
 		return encodedDir
 	}
@@ -177,6 +185,13 @@ func decodeProjectName(encodedDir, homePrefix string) string {
 		if strings.HasPrefix(trailing, anchor) {
 			return trailing[len(anchor):]
 		}
+	}
+	// An exact-match parent (Documents / code / src with no project
+	// suffix) is the workspace root itself, not a project — label it
+	// distinguishably instead of returning the bare word.
+	switch trailing {
+	case "Documents", "code", "src":
+		return "~/" + trailing
 	}
 	return trailing
 }

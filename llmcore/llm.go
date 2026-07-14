@@ -44,10 +44,31 @@ const (
 type APIRequest struct {
 	Model      string         `json:"model"`
 	MaxTokens  int            `json:"max_tokens"`
-	System     string         `json:"system"`
+	System     []SystemBlock  `json:"system"`
 	Messages   []APIMessage   `json:"messages"`
 	Tools      []Tool         `json:"tools,omitempty"`
 	ToolChoice map[string]any `json:"tool_choice,omitempty"`
+}
+
+// SystemBlock is one entry in the API's typed system array. The array
+// form (as opposed to a bare string) is what lets us attach cache_control
+// to the system prompt for server-side prefix caching.
+type SystemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+}
+
+// CacheControl marks a cache breakpoint. Everything in the request up to
+// and INCLUDING the block that carries this marker is server-side cached
+// for the TTL window; on the next call with the same prefix, that portion
+// bills at ~10% of the normal input rate. Request-order for cache prefix
+// is tools → system → messages, so a marker on the system block caches
+// tools + system together — which is our whole stable prefix (each of
+// arc/router/expander/summarizer/classifier/asker uses one fixed system
+// + one fixed tool schema; only the user message varies).
+type CacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 type APIMessage struct {
@@ -157,9 +178,13 @@ func CachedCall(apiKey, model, system, userText string, tool Tool, cacheDir, cid
 	req := APIRequest{
 		Model:     model,
 		MaxTokens: 1024,
-		System:    system,
-		Messages:  []APIMessage{{Role: "user", Content: userText}},
-		Tools:     []Tool{tool},
+		System: []SystemBlock{{
+			Type:         "text",
+			Text:         system,
+			CacheControl: &CacheControl{Type: "ephemeral"},
+		}},
+		Messages: []APIMessage{{Role: "user", Content: userText}},
+		Tools:    []Tool{tool},
 		ToolChoice: map[string]any{
 			"type": "tool",
 			"name": tool.Name,
