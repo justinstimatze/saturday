@@ -23,6 +23,7 @@ Mayor must be running with --audio-sock pointing at the same socket. If
 mayor isn't up yet, the sidecar retries every 2s until it is or you quit.
 """
 import argparse
+import atexit
 import datetime as dt
 import hashlib
 import http.client
@@ -31,6 +32,7 @@ import os
 import queue
 import random
 import re
+import signal
 import socket
 import sys
 import termios
@@ -56,6 +58,11 @@ DEFAULT_MODEL = "small.en"
 DEFAULT_TTS_VOICE = "bm_george"
 DEFAULT_HOTPHRASE = "would you kindly"
 DEFAULT_LOG_DIR = Path.home() / ".claude" / "saturday" / "transcripts"
+# Written on startup, removed on clean exit. Consumed by saturday-stack's
+# client-detached tmux hook and by mayor's client-count watchdog, both of
+# which send SIGUSR1 to force-mute the sidecar when no tmux client is
+# attached to the stack (protects against open-mic while unattended).
+DEFAULT_PIDFILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "saturday-audio.pid"
 
 # FUI-style status renderer state. The spinner thread owns a single line at
 # the bottom of the pane, refreshing at ~6Hz. All other writers go through
@@ -262,11 +269,15 @@ def conn_manager(state, audio_sock_path):
             sock = connect_to_mayor(audio_sock_path, state.quit)
             if sock is None:
                 return  # quit signaled
-            sock.settimeout(0.1)
             slog("[sock] connected to mayor")
             buf = b""
 
-        # send: pending takes priority, else pop one from outbox
+        # send: pending takes priority, else pop one from outbox. Use a
+        # generous timeout (5s) — sendall on a mayor that's momentarily
+        # busy (e.g. dispatching to its state socket in the same tick) is
+        # NOT a broken connection. The previous 0.1s send-timeout was
+        # inherited from the recv poll below and produced spurious
+        # "send failed: timed out — reconnecting" spam.
         if pending is None:
             try:
                 pending = state.outbox_q.get_nowait()
@@ -274,6 +285,7 @@ def conn_manager(state, audio_sock_path):
                 pending = None
         if pending is not None:
             try:
+                sock.settimeout(5.0)
                 sock.sendall(pending)
                 pending = None
             except (BrokenPipeError, OSError) as e:
@@ -287,6 +299,7 @@ def conn_manager(state, audio_sock_path):
 
         # recv: poll non-blocking via short timeout
         try:
+            sock.settimeout(0.1)
             data = sock.recv(4096)
             if not data:
                 slog("[sock] mayor closed connection — reconnecting")
@@ -1109,6 +1122,8 @@ def main():
                    help=f"NOT a wake-word — the mic is always live. This is a per-utterance pipeline-mode switch. Default: '{DEFAULT_HOTPHRASE}'. Without the prefix, utterances pass through to mayor in VERBATIM mode (router picks session, raw STT text becomes the inject — no expander LLM call, no narration). WITH the prefix, the prefix is stripped and the rest goes through the full router+expander pipeline (LLM rewrites + spoken narration). Set empty to send everything in expand mode (no verbatim path).")
     p.add_argument("--logprob-gate", type=float, default=-0.6,
                    help="if first-pass STT avg_logprob is below this, run a second pass without vocab bias and pick the better result. Vocab-biased Whisper collapses noisy audio onto high-prior terms (e.g. 'show me what files in lucida' → 'lucida'); the gate catches that. -0.6 ≈ 'low confidence'; lower = stricter (fewer rerolls); 0 = always reroll; -10 effectively disables.")
+    p.add_argument("--pidfile", type=Path, default=DEFAULT_PIDFILE,
+                   help=f"where to write our pid on startup (default {DEFAULT_PIDFILE}). Consumers (saturday-stack's tmux client-detached hook, mayor's client-count watchdog) use this pid to send SIGUSR1 as a force-mute when no tmux client is attached — protects against open-mic while unattended. SIGUSR1 sets mute unconditionally (no unmute pair) — the operator must re-arm with SPACEBAR after a mute event.")
     args = p.parse_args()
 
     if args.mode == "ptt":
@@ -1122,6 +1137,34 @@ def main():
     print(f"keys: {show_key(args.mute_key)}=toggle mute, {show_key(args.quit_key)}=quit", file=sys.stderr)
 
     state = State()
+
+    # SIGUSR1 is the "force-mute" channel used by saturday-stack's
+    # client-detached hook and by mayor's client-count watchdog. It sets
+    # muted unconditionally (no toggle, no unmute pair) — that asymmetry is
+    # deliberate: a stealth tmux reattach or hook double-fire must never
+    # accidentally re-arm the mic. Operator uses SPACEBAR to unmute.
+    def _sigusr1_mute(signum, frame):
+        if not state.muted.is_set():
+            state.muted.set()
+            slog(_c(_C_BRI_RED, "[muted] (SIGUSR1 — no tmux client attached)"))
+    signal.signal(signal.SIGUSR1, _sigusr1_mute)
+
+    # Pidfile so external processes can send us SIGUSR1. Best-effort:
+    # write on startup, remove atexit + on SIGTERM. A stale pidfile after
+    # a crash is harmless — the worst outcome is a SIGUSR1 to a wrong pid,
+    # which is a self-correcting no-op almost everywhere.
+    try:
+        args.pidfile.parent.mkdir(parents=True, exist_ok=True)
+        args.pidfile.write_text(str(os.getpid()))
+        def _remove_pidfile():
+            try:
+                args.pidfile.unlink(missing_ok=True)
+            except Exception:
+                pass
+        atexit.register(_remove_pidfile)
+        signal.signal(signal.SIGTERM, lambda *_: (_remove_pidfile(), state.quit.set()))
+    except OSError as e:
+        print(f"saturday-audio: pidfile write failed at {args.pidfile}: {e}", file=sys.stderr)
 
     # Status renderer FIRST — shows "warming up" while the heavier subsystems
     # (kokoro download/init, whisper model load) come up over the next ~5-30s.

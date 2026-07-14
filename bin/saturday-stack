@@ -27,8 +27,12 @@ AUDIO_VENV="${AUDIO_VENV:-$AUDIO_DIR/.venv}"
 
 # V0.2.6: watcher runs headless (no pane). Logs and pidfile follow XDG.
 XDG_STATE_HOME_RESOLVED="${XDG_STATE_HOME:-$HOME/.local/state}"
+XDG_RUNTIME_DIR_RESOLVED="${XDG_RUNTIME_DIR:-/tmp}"
 WATCHER_LOG="$XDG_STATE_HOME_RESOLVED/saturday/watcher.log"
 WATCHER_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-watcher.pid"
+# Must match saturday-audio's DEFAULT_PIDFILE — the client-detached tmux
+# hook below and mayor's watchdog both read this.
+AUDIO_PIDFILE="$XDG_RUNTIME_DIR_RESOLVED/saturday-audio.pid"
 
 # check_audio_venv — verify saturday-audio/.venv is usable. Two failure
 # modes have bitten us in practice:
@@ -253,6 +257,16 @@ tmux split-window -t "${SESSION}:0" -v \
 tmux set-window-option -t "${SESSION}:0" main-pane-width 60%
 tmux select-layout -t "${SESSION}:0" main-vertical
 tmux select-pane -t "${SESSION}:0.2"  # focus audio pane (SPACEBAR mute + spinner)
+
+# Safety: force-mute the audio sidecar when the last tmux client detaches.
+# Open mic + no attached terminal is the failure mode this closes — the
+# operator can't see or SPACEBAR the mute, and utterances would keep
+# routing into whichever session the router picks. The hook fires
+# SIGUSR1 (unconditional mute; no unmute pair — operator must SPACEBAR
+# re-arm after reattaching). Mayor runs a redundant client-count
+# watchdog too; this is just the fast path.
+tmux set-hook -t "$SESSION" client-detached \
+    "run-shell 'kill -USR1 \$(cat $AUDIO_PIDFILE 2>/dev/null) 2>/dev/null || true'"
 
 # Attach only if invoked from a terminal. When run headless (e.g. from a
 # script or a non-TTY environment), leave the session detached for the

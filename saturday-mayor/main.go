@@ -1534,6 +1534,73 @@ func (m *Mayor) fireCompletion(p *pendingInject) {
 	fmt.Fprintf(os.Stderr, "\033[1;32m✓ completion report\033[0m \033[2m(%s)\033[0m: \033[32m%q\033[0m\n", p.project, summary)
 }
 
+func defaultRuntimeDir() string {
+	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+		return d
+	}
+	return "/tmp"
+}
+
+// runClientWatchdog is V0.3.1's open-mic safety belt. When mayor is
+// running inside a tmux session (saturday-stack), poll the client count
+// every 10s; two consecutive zeros → send SIGUSR1 to the audio sidecar's
+// pid (force-mute). Redundant with saturday-stack's client-detached tmux
+// hook, but that hook can fail to fire (tmux server crash, weird session
+// teardown, session started outside saturday-stack) and open mic without
+// an attached client is the exact failure mode we're closing. SIGUSR1 on
+// audio's side is asymmetric (mute-only, no unmute pair), so the operator
+// still has to SPACEBAR re-arm after reattach — a stealth reattach can't
+// silently restart capture.
+func (m *Mayor) runClientWatchdog(pidfile string) {
+	if os.Getenv("TMUX") == "" || pidfile == "" {
+		return
+	}
+	sessionOut, err := exec.Command("tmux", "display-message", "-p", "#{session_name}").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[2m  client-watchdog: can't read tmux session name: %v (disabled)\033[0m\n", err)
+		return
+	}
+	session := strings.TrimSpace(string(sessionOut))
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+	zeros := 0
+	muted := false
+	for range tick.C {
+		out, err := exec.Command("tmux", "list-clients", "-t", session).Output()
+		if err != nil {
+			return // session gone; nothing left to watch
+		}
+		clients := 0
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.TrimSpace(line) != "" {
+				clients++
+			}
+		}
+		if clients == 0 {
+			zeros++
+			if zeros >= 2 && !muted {
+				pidBytes, err := os.ReadFile(pidfile)
+				if err != nil {
+					continue
+				}
+				pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+				if err != nil || pid <= 0 {
+					continue
+				}
+				if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+					fmt.Fprintf(os.Stderr, "\033[2m  client-watchdog: SIGUSR1 pid %d failed: %v\033[0m\n", pid, err)
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "\033[1;33m  client-watchdog: 0 tmux clients — sent SIGUSR1 to audio pid %d\033[0m\n", pid)
+				muted = true
+			}
+		} else {
+			zeros = 0
+			muted = false // reset so a future detach re-arms the SIGUSR1 send
+		}
+	}
+}
+
 // runArcRefresher is V0.2.7's slow-loop session-arc summarizer. Every
 // arcInterval, fetches the watcher state, and for each active session with
 // substantive content (LastUserTurn or LastAssistantText non-empty) calls
@@ -1803,6 +1870,7 @@ func main() {
 	noBlink := flag.Bool("no-blink", false, "V0.2.6: disable das blinkenlights — the mid-height right-edge corner tag overlaid on the target CC pane during inject lifecycle.")
 	hookSock := flag.String("hook-sock", "/tmp/saturday-mayor-hooks.sock", "V0.2.7: Unix socket receiving CC UserPromptSubmit/Stop events from the saturday-hook helper. One JSON line per accept. Empty disables.")
 	arcInterval := flag.Duration("arc-interval", 5*time.Minute, "V0.2.7: cadence of slow-loop session-arc summarizer refresh per active session. 0 disables.")
+	audioPidfile := flag.String("audio-pidfile", filepath.Join(defaultRuntimeDir(), "saturday-audio.pid"), "V0.3.1: pidfile written by saturday-audio; if set AND $TMUX is present, mayor polls tmux client count every 10s and sends SIGUSR1 to this pid when zero for two consecutive checks (force-mute the sidecar). Defense in depth against the tmux client-detached hook not firing. Empty disables.")
 	askConf := flag.Float64("ask-conf", 0.7, "V0.3: classifier conf threshold to route an utterance to ask-mode (Saturday answers from arcs) instead of inject-mode (relayed to a CC session). Wake-word prefix bypasses this. Higher = stricter (fewer false-positive ask, more retypes).")
 	flag.Parse()
 
@@ -1861,6 +1929,10 @@ func main() {
 	if m.arcInterval > 0 {
 		go m.runArcRefresher()
 	}
+
+	// V0.3.1 safety belt — force-mute audio if no tmux client is attached.
+	// Self-disables when mayor isn't inside tmux or when --audio-pidfile="".
+	go m.runClientWatchdog(*audioPidfile)
 
 	if *audioSock != "" {
 		runAudioSock(m, *audioSock)
