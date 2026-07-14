@@ -35,6 +35,34 @@ fi
 proj="$(pwd)"
 sname="cc-$(basename "$proj")"
 
+# Collision guard. `tmux new-session -A -s NAME` attaches on name match,
+# regardless of the existing session's project — so two projects whose
+# leaf dir is the same (e.g. .../dogfood/web and .../firecrawl/web both
+# → cc-web) would silently share one pane, and the second invocation
+# would hijack the first. Detect this and disambiguate by prepending a
+# parent segment; keep escalating up the path until unique.
+if tmux has-session -t "$sname" 2>/dev/null; then
+    existing_dir="$(tmux display-message -p -t "${sname}:0.0" '#{pane_current_path}' 2>/dev/null || true)"
+    if [ -n "$existing_dir" ] && [ "$existing_dir" != "$proj" ]; then
+        segments="$(basename "$proj")"
+        walk="$(dirname "$proj")"
+        while :; do
+            if [ "$walk" = "/" ] || [ "$walk" = "$HOME" ] || [ -z "$walk" ]; then
+                break
+            fi
+            segments="$(basename "$walk")-$segments"
+            candidate="cc-$segments"
+            if ! tmux has-session -t "$candidate" 2>/dev/null; then
+                sname="$candidate"; break
+            fi
+            other="$(tmux display-message -p -t "${candidate}:0.0" '#{pane_current_path}' 2>/dev/null || true)"
+            [ "$other" = "$proj" ] && { sname="$candidate"; break; }
+            walk="$(dirname "$walk")"
+        done
+        echo "saturday-claude: name 'cc-$(basename "$proj")' already used by $existing_dir; using '$sname'" >&2
+    fi
+fi
+
 # Build a shell-safe command string for tmux. printf %q quotes each arg so
 # things like spaces, glob chars, and quotes survive intact.
 cmd="command claude"

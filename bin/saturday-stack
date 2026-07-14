@@ -30,9 +30,93 @@ XDG_STATE_HOME_RESOLVED="${XDG_STATE_HOME:-$HOME/.local/state}"
 WATCHER_LOG="$XDG_STATE_HOME_RESOLVED/saturday/watcher.log"
 WATCHER_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-watcher.pid"
 
+# check_audio_venv — verify saturday-audio/.venv is usable. Two failure
+# modes have bitten us in practice:
+#
+# 1. Python-version drift. venv was built against python3.13, the OS
+#    upgraded to 3.14, the venv's own python binary now can't find its
+#    site-packages (loads /usr/lib/python3.14/* stdlib instead of the
+#    site-packages under lib/python3.13/). Every import fails.
+# 2. Corruption / partial install. venv exists but `pip` or `numpy`
+#    aren't importable — e.g. install got interrupted.
+#
+# On failure, print the exact repair command. `saturday-stack
+# repair-audio` runs it non-interactively.
+check_audio_venv() {
+    if [ ! -f "$AUDIO_VENV/bin/activate" ]; then
+        return 2  # missing entirely — caller handles
+    fi
+    local venv_py="$AUDIO_VENV/pyvenv.cfg"
+    if [ -f "$venv_py" ]; then
+        local venv_version
+        venv_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$venv_py" | head -n1 | tr -d '[:space:]')"
+        local sys_version
+        sys_version="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo unknown)"
+        if [ -n "$venv_version" ] && [ "$sys_version" != "unknown" ]; then
+            local venv_minor="${venv_version%.*}"
+            local sys_minor="${sys_version%.*}"
+            if [ "$venv_minor" != "$sys_minor" ]; then
+                echo "saturday-stack: audio venv Python drift — venv was built for $venv_version, system is $sys_version." >&2
+                echo "  Rebuild:  saturday-stack repair-audio" >&2
+                return 1
+            fi
+        fi
+    fi
+    # Smoke import — catches corruption even when versions match.
+    if ! "$AUDIO_VENV/bin/python" -c 'import numpy, sounddevice, faster_whisper' 2>/dev/null; then
+        echo "saturday-stack: audio venv exists but a smoke import failed (numpy/sounddevice/faster_whisper missing)." >&2
+        echo "  Rebuild:  saturday-stack repair-audio" >&2
+        return 1
+    fi
+    return 0
+}
+
+# repair_audio_venv — rebuild the audio venv from scratch. Long: pulls
+# torch + faster-whisper + kokoro-onnx (~3-5 GB). Idempotent.
+repair_audio_venv() {
+    if [ ! -d "$AUDIO_DIR" ]; then
+        echo "saturday-stack: audio dir missing: $AUDIO_DIR" >&2
+        return 1
+    fi
+    if [ ! -f "$AUDIO_DIR/requirements.txt" ]; then
+        echo "saturday-stack: no requirements.txt at $AUDIO_DIR/requirements.txt" >&2
+        return 1
+    fi
+    echo "saturday-stack: rebuilding audio venv at $AUDIO_VENV (this may take several minutes)"
+    rm -rf "$AUDIO_VENV"
+    python3 -m venv "$AUDIO_VENV"
+    "$AUDIO_VENV/bin/pip" install --upgrade pip wheel setuptools
+    "$AUDIO_VENV/bin/pip" install -r "$AUDIO_DIR/requirements.txt"
+    echo "saturday-stack: audio venv rebuilt."
+}
+
 # Subcommands: `stop` / `down` kills the session (tearing down all panes via
 # SIGHUP, which mayor/watcher/audio's signal handlers clean up cleanly).
 case "${1:-}" in
+    repair-audio)
+        repair_audio_venv
+        exit $?
+        ;;
+    doctor)
+        rc=0
+        if ! command -v tmux >/dev/null 2>&1; then
+            echo "saturday-stack: tmux missing (apt install tmux)" >&2; rc=1
+        fi
+        for bin in saturday-watcher saturday-mayor saturday-thinking; do
+            if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
+                echo "saturday-stack: $bin not found on PATH or ~/go/bin" >&2; rc=1
+            fi
+        done
+        if [ ! -d "$AUDIO_DIR" ]; then
+            echo "saturday-stack: audio dir missing: $AUDIO_DIR" >&2; rc=1
+        elif [ ! -f "$AUDIO_VENV/bin/activate" ]; then
+            echo "saturday-stack: audio venv missing — saturday-stack repair-audio" >&2; rc=1
+        else
+            check_audio_venv || rc=1
+        fi
+        [ $rc -eq 0 ] && echo "saturday-stack: doctor OK."
+        exit $rc
+        ;;
     stop|down|kill)
         if tmux has-session -t "$SESSION" 2>/dev/null; then
             tmux kill-session -t "$SESSION"
@@ -104,7 +188,13 @@ if [ ! -d "$AUDIO_DIR" ]; then
 fi
 if [ ! -f "$AUDIO_VENV/bin/activate" ]; then
     echo "saturday-stack: audio venv missing: $AUDIO_VENV/bin/activate" >&2
-    echo "  cd $AUDIO_DIR && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+    echo "  Rebuild:  saturday-stack repair-audio" >&2
+    exit 1
+fi
+# Verify the venv actually works before we try to start the audio pane —
+# a broken venv (Python drift, missing packages) would otherwise just
+# print a stack trace inside the audio pane and die.
+if ! check_audio_venv; then
     exit 1
 fi
 for bin in saturday-watcher saturday-mayor saturday-thinking; do
