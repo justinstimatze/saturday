@@ -2,20 +2,26 @@
 
 ## Ranked backlog
 
-Reranked 2026-07-14 after the cache_control + drift-guard + collision-guard
-push landed. Format: rank, item, size, why-now.
+Reranked 2026-07-14 (second pass) after today's audio safety belt +
+socket-timeout fixes landed. Format: rank, item, size, why-now.
+
+**Prior rank 1 (README accuracy pass) shipped as `89792d9`.** Two items
+landed that were NOT on the prior backlog — surfaced by real use, not
+by planning: the audio SIGUSR1 mute-on-detach path + client watchdog
+(safety), and the send-timeout split (noise reduction). Both in
+`8f6494a`. Pattern to notice: recent operational hardening has been
+reactive to bugs surfaced by using Saturday, not chosen off a plan.
 
 ### A. Bounded, high-leverage, no waiting for a signal
 
-1. **README accuracy pass** — soften "every utterance = billed",
-   surface the local-LLM swap point, note the new cache_control
-   savings. ~30 min. Public surface; the pre-cache_control claim was
-   already an overstatement, now it's more so. *(Landed alongside this
-   backlog.)*
-2. **Decide on `claude/saturday-window-monitoring-rTGp7` branch** — the
+1. **Decide on `claude/saturday-window-monitoring-rTGp7` branch** — the
    ~902 LoC `saturday-stage` sidecar on origin. 30-60 min: review,
    then merge / rebase / abandon. Cost of leaving it: bit-rot as main
    moves; strangers browsing branches see dead work.
+2. **Extend `saturday-stack doctor`** — check that the tmux
+   `client-detached` hook is actually set and that the audio pidfile
+   is being written. ~10 min. Closes the loop on today's safety belt:
+   a silently unset hook reopens the open-mic-on-detach risk.
 3. **Onboarding/install consolidation** — apt + pip + Go + tool
    downloads are scattered across README, per-module READMEs, and
    scripts. 1-2 hr. Blocks the first non-author user.
@@ -24,20 +30,21 @@ push landed. Format: rank, item, size, why-now.
 
 | rank | item | trigger not yet met |
 |---|---|---|
-| 4 | Callsigns half-2 (expander resolves referents like *"the bravo one"*) | no callsigns appearing in real session JSONLs yet |
-| 5 | Live turn detection (smart-turn) | no reports of premature-send or trailing-speech artifacts |
-| 6 | Dialog clarifier (state-of-2) | no observed lossy disambiguation from `--conf-threshold` gating |
-| 7 | Per-session lockfile coordination | quiet-window probe hasn't demonstrably missed a collision |
+| 4 | Audio audible cue on force-mute (short tone / TTS after SIGUSR1) | operator missing a force-mute event in practice — not yet seen |
+| 5 | Callsigns half-2 (expander resolves referents like *"the bravo one"*) | no callsigns appearing in real session JSONLs yet |
+| 6 | Live turn detection (smart-turn) | no reports of premature-send or trailing-speech artifacts |
+| 7 | Dialog clarifier (state-of-2) | no observed lossy disambiguation from `--conf-threshold` gating |
+| 8 | Per-session lockfile coordination | quiet-window probe hasn't demonstrably missed a collision |
 
 ### C. Larger scope
 
 | rank | item | notes |
 |---|---|---|
-| 8 | Expansion-feedback loop (track user edits post-inject) | Real prompt-tuning payoff. Needs a feedback-storage design. |
-| 9 | Ask-mode deep JSONL pull | Only worth building after ask-mode usage shows arcs-alone gap |
-| 10 | Drivermap integration | Blocked on drivermap's state export |
-| 11 | Effigy-driven verifier (elaboration) | V0.2.7 has a lexical stub; roadmap wants small-LLM version |
-| 12 | FUI Go TUI library spin-out | Creative work, not blocking |
+| 9 | Expansion-feedback loop (track user edits post-inject) | Real prompt-tuning payoff. Needs a feedback-storage design. |
+| 10 | Ask-mode deep JSONL pull | Only worth building after ask-mode usage shows arcs-alone gap |
+| 11 | Drivermap integration | Blocked on drivermap's state export |
+| 12 | Effigy-driven verifier (elaboration) | V0.2.7 has a lexical stub; roadmap wants small-LLM version |
+| 13 | FUI Go TUI library spin-out | Creative work, not blocking |
 
 ### D. Speculative
 
@@ -45,7 +52,7 @@ Federated state · Roaming voice · Breakroom / long-arc · 3D substrate — lon
 
 ## Built (V0 substrate)
 
-- **V0.3.1 — post-release hardening (2026-07-14).** `llmcore` `cache_control` markers on the shared system-prompt seam — every LLM call in the fleet (arc/router/expander/summarizer/classifier/asker/judge) now caches its tools+system prefix server-side; ~10% cost on repeat prefixes, disk cache key unchanged so existing `.cache/*.json` still hit. `bin/saturday-stack` gains `doctor` (pre-launch venv health check) and `repair-audio` (one-word rebuild) with a Python-version drift detector — the audio pane no longer dies silently after an OS Python upgrade. `bin/saturday-claude` gains a `cc-<basename>` collision guard: two projects with the same leaf dir (e.g. `.../dogfood/web` and `.../firecrawl/web`) no longer silently hijack each other's tmux session. `watcher/decodeProjectName` handles `~` and `~/Documents` cases that were leaking raw encoded paths into arc labels.
+- **V0.3.1 — post-release hardening (2026-07-14).** `llmcore` `cache_control` markers on the shared system-prompt seam — every LLM call in the fleet (arc/router/expander/summarizer/classifier/asker/judge) now caches its tools+system prefix server-side; ~10% cost on repeat prefixes, disk cache key unchanged so existing `.cache/*.json` still hit. `bin/saturday-stack` gains `doctor` (pre-launch venv health check) and `repair-audio` (one-word rebuild) with a Python-version drift detector — the audio pane no longer dies silently after an OS Python upgrade. `bin/saturday-claude` gains a `cc-<basename>` collision guard: two projects with the same leaf dir (e.g. `.../dogfood/web` and `.../firecrawl/web`) no longer silently hijack each other's tmux session. `watcher/decodeProjectName` handles `~` and `~/Documents` cases that were leaking raw encoded paths into arc labels. Audio safety belt: `saturday-audio` writes a pidfile and installs a SIGUSR1 handler that force-mutes (no unmute pair — operator must SPACEBAR re-arm); `saturday-stack` sets a tmux `client-detached` hook that hits that pid; mayor runs a redundant client-count watchdog (2 consecutive zeros → SIGUSR1) so open-mic can't persist through a stealth tmux disconnect. Sidecar's socket send timeout split from the recv poll (5s send, 0.1s recv) — kills the spurious `[sock] send failed: timed out — reconnecting` spam that made real socket failures harder to notice.
 - **V0.2.7 — Sonnet expander, mic RMS, mayor color register, voice callsigns, effigy.** ExpanderModel upgraded to `claude-sonnet-4-6` (was Haiku); router and a new `SummarizerModel` constant stay on Haiku. Hotphrase opt-in already accepts the latency tax, so trade ms for fewer over-cautious asks. Eval pass-rate dropped 77% → 63% but failure profile shifted from `over_cautious` to `over_eager` — recoverable mistakes beat silent asks. An attempted "expand-v4" Haiku prompt with appended rules regressed 77% → 57%; reverted, lesson recorded in `expander.go` + memory. New audio→mayor frame `{"type":"rms","db":...}` at 5 Hz; mayor mirrors a 32-sample dBFS ring into `MayorState.Rms`; `saturday-thinking` renders a sparkline in the status card (mute = flat, talking = peaks). Mayor stderr now uses a three-act color register: cyan `← utt` (heard), dim cyan `→ route:`, bright yellow `→ Saturday → <project>` (sent), magenta `? expander asks`, red `✗ expander declined`, green `✓ completion report`, bright red `× err`. The `bin/` launcher scripts (`saturday-stack`, `saturday-claude`) are kept symlinked from `$(go env GOPATH)/bin/` to the repo so script edits propagate without a manual reinstall. Eval re-run with v3 prompts captured fresh baseline before model swap. Voice-friendly callsigns now appended to every expand-mode inject as a `[saturday: ...]` rule asking CC to label enumerated items with phonetic callsigns (alpha/bravo/cherry/...) so the user can later say "the bravo one"; verbatim mode skipped (the inject is the literal text). Half-2 of callsigns (expander prompt resolves callsign references in utterances) deferred until callsigns appear in real session JSONL — needs corpus evidence to know what referent patterns to handle. `saturday.effigy` written and wired in (relocated to `llmcore/saturday.effigy`, embedded via `go:embed`, appended to ExpanderSystem and SummarizerSystem with cache prefixes `expand-v3-sonnet-effigy` / `summary-v2`). Eval pass-rate moved 63% → **80%** with the persona file feeding the expander — over_cautious dropped from 5 to 1 because the voice register's "Don't seek validation" rules push toward inject more reliably than the original prompt's bias rules. `llmcore/verifier.go` (V0.2.7 verifier) lexically strips NEVER-list violations from summarizer output (apologies, hedges, preamble, exclamation, performed feeling) — cheap safety net, no extra LLM call. Influences acknowledged in the effigy header: Jarvis pattern (existing), Banks-Mind register, TARS, Bioshock-derived hotphrase.
 - `llmcore/` — shared Go package: router/expander prompts + tools, content-hash cache, Anthropic API plumbing, dotenv loader, `State`/`ToolUseSnap` types. Single source of truth across mayor + both evals; cache-key compatible with pre-lift binaries (verified: zero new cache files post-lift).
 - `eval/expander_backtest.go` — Haiku-as-expander, Sonnet-as-judge, **0% destructive** on local corpus; pass-rate ~50% (lots of `over_cautious` and `needs_ask_correct`).
