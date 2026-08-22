@@ -242,7 +242,9 @@ func (t *tmuxSource) proportionalTile(paneID string) error {
 	if len(panes) < 2 {
 		return nil // nothing to tile against
 	}
-	_ = tmuxRun("select-layout", "-t", win, "even-horizontal")
+	if err := tmuxRun("select-layout", "-t", win, "even-horizontal"); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[2m  tile: select-layout -t %s even-horizontal: %v\033[0m\n", win, err)
+	}
 	wStr, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_width}")
 	var cols int
 	fmt.Sscanf(wStr, "%d", &cols)
@@ -254,6 +256,8 @@ func (t *tmuxSource) proportionalTile(paneID string) error {
 	// Resize every pane but the last (tmux balances the remainder into it),
 	// giving the addressed pane the emphasis share and the rest an even split.
 	rest := (cols - target) / (len(panes) - 1)
+	fmt.Fprintf(os.Stderr, "\033[2m  tile: win=%s panes=%v target=%s→%dcol rest=%dcol cols=%d emphasis=%.1f\033[0m\n",
+		win, panes, paneID, target, rest, cols, t.tileEmphasis)
 	for i, p := range panes {
 		if i == len(panes)-1 {
 			break
@@ -262,7 +266,9 @@ func (t *tmuxSource) proportionalTile(paneID string) error {
 		if p == paneID {
 			w = target
 		}
-		_ = tmuxRun("resize-pane", "-t", p, "-x", fmt.Sprintf("%d", w))
+		if err := tmuxRun("resize-pane", "-t", p, "-x", fmt.Sprintf("%d", w)); err != nil {
+			fmt.Fprintf(os.Stderr, "\033[2m  tile: resize-pane -t %s -x %d: %v\033[0m\n", p, w, err)
+		}
 	}
 	return nil
 }
