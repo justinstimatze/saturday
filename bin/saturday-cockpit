@@ -23,6 +23,10 @@
 #                                   # with --pellicle. For a known session id
 #                                   # instead of the picker, still use
 #                                   # CLAUDE_CMD='claude --resume <id>' add.
+#   saturday-cockpit add --dangerously-skip-permissions <dir> [<dir> ...]
+#                                   # pass the flag straight through to claude
+#                                   # for that pane. Composes with --pellicle
+#                                   # and --resume.
 #   saturday-cockpit stop          # kill the cockpit window/session
 #   saturday-cockpit status        # list panes (pane_id, pid, cwd)
 #
@@ -143,10 +147,12 @@ case "${1:-}" in
         bind_hotkeys
         pellicle=0
         resume=0
+        yolo=0
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --pellicle) pellicle=1; shift ;;
                 --resume) resume=1; shift ;;
+                --dangerously-skip-permissions) yolo=1; shift ;;
                 --) shift; break ;;
                 --*)
                     echo "saturday-cockpit: unknown flag: $1" >&2
@@ -158,8 +164,11 @@ case "${1:-}" in
         if [ "$resume" -eq 1 ]; then
             CLAUDE_CMD="$CLAUDE_CMD --resume"
         fi
+        if [ "$yolo" -eq 1 ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
+        fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
             exit 2
         fi
         for d in "$@"; do
