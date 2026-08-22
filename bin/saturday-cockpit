@@ -124,7 +124,11 @@ bind_hotkeys() {
     for n in 1 2 3 4 5 6 7 8 9; do
         tmux bind-key -n "M-$n" run-shell "tmux select-pane -t $n ; tmux resize-pane -Z"
     done
-    tmux bind-key -n M-0 run-shell 'tmux if-shell -F "#{window_zoomed_flag}" "resize-pane -Z"'
+    # Un-zoom if zoomed, then always re-tile to even shares — stage's
+    # proportionalTile leaves panes at an emphasis skew (resize-pane -x) that
+    # zoom-checking alone doesn't touch, so without this second command M-0
+    # only fixed the zoom case and left a tile-skewed layout untouched.
+    tmux bind-key -n M-0 run-shell "tmux if-shell -F '#{window_zoomed_flag}' 'resize-pane -Z' ; tmux select-layout -t $SESSION $LAYOUT"
 
     # kill-pane (e.g. clearing a dead remain-on-exit pane) doesn't re-tile on
     # its own — tmux just hands the freed space to a neighbor, leaving an
