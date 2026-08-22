@@ -26,6 +26,7 @@ results.csv
 /watcher/watcher
 /bin/saturday-hook
 /bin/saturday-mayor
+/bin/saturday-stage
 /bin/saturday-sync
 /bin/saturday-thinking
 /bin/saturday-watcher

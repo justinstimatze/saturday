@@ -19,6 +19,7 @@ build:
 	@cd saturday-mayor    && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-mayor .
 	@cd watcher           && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-watcher .
 	@cd saturday-hook     && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-hook .
+	@cd saturday-stage    && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-stage .
 	@cd saturday-thinking && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-sync .
 	@echo "built $(VERSION) → $(BINDIR)/"
@@ -27,6 +28,7 @@ install:
 	@cd saturday-mayor    && go build $(LDFLAGS) -o $(GOBIN)/saturday-mayor .
 	@cd watcher           && go build $(LDFLAGS) -o $(GOBIN)/saturday-watcher .
 	@cd saturday-hook     && go build $(LDFLAGS) -o $(GOBIN)/saturday-hook .
+	@cd saturday-stage    && go build $(LDFLAGS) -o $(GOBIN)/saturday-stage .
 	@cd saturday-thinking && go build $(LDFLAGS) -o $(GOBIN)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o $(GOBIN)/saturday-sync .
 	@echo "installed $(VERSION) → $(GOBIN)/"
@@ -41,7 +43,7 @@ lint:
 	@golangci-lint run ./...
 
 tidy:
-	@for d in saturday-mayor watcher saturday-hook saturday-thinking sync eval eval/router llmcore; do \
+	@for d in saturday-mayor watcher saturday-hook saturday-stage saturday-thinking sync eval eval/router llmcore; do \
 		(cd $$d && go mod tidy); \
 	done
 
@@ -54,10 +56,10 @@ hooks:
 ci:
 	@out=$$(gofmt -l .); \
 	if [ -n "$$out" ]; then echo "gofmt drift in:"; echo "$$out"; exit 1; fi
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-thinking sync watcher; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher; do \
 		(cd $$d && go vet ./...) || exit 1; \
 	done
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-thinking sync watcher; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher; do \
 		(cd $$d && go test -race ./...) || exit 1; \
 	done
 	@$(MAKE) build >/dev/null
