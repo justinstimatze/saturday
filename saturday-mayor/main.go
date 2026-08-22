@@ -494,7 +494,7 @@ func (m *Mayor) serveHookSock(sockPath string) {
 		fmt.Fprintf(os.Stderr, "hook-sock: listen %s: %v\n", sockPath, err)
 		return
 	}
-	if err := os.Chmod(sockPath, 0o666); err != nil {
+	if err := os.Chmod(sockPath, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "hook-sock: chmod %s: %v\n", sockPath, err)
 	}
 	fmt.Fprintf(os.Stderr, "[hook-sock] listening on %s\n", sockPath)
@@ -594,7 +594,7 @@ func (m *Mayor) serveStateSock(sockPath string) {
 		fmt.Fprintf(os.Stderr, "state-sock: listen %s: %v\n", sockPath, err)
 		return
 	}
-	if err := os.Chmod(sockPath, 0o666); err != nil {
+	if err := os.Chmod(sockPath, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "state-sock: chmod %s: %v\n", sockPath, err)
 	}
 	fmt.Fprintf(os.Stderr, "[state-sock] listening on %s\n", sockPath)
