@@ -34,6 +34,12 @@ WATCHER_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-watcher.pid"
 # hook below and mayor's watchdog both read this.
 AUDIO_PIDFILE="$XDG_RUNTIME_DIR_RESOLVED/saturday-audio.pid"
 
+# saturday-stage runs headless too, same shape as watcher — window
+# choreography sidecar mayor dials as a client for focus/restore commands.
+STAGE_SOCK="${STAGE_SOCK:-/tmp/saturday-stage.sock}"
+STAGE_LOG="$XDG_STATE_HOME_RESOLVED/saturday/stage.log"
+STAGE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-stage.pid"
+
 # check_audio_venv — verify saturday-audio/.venv is usable. Two failure
 # modes have bitten us in practice:
 #
@@ -106,7 +112,7 @@ case "${1:-}" in
         if ! command -v tmux >/dev/null 2>&1; then
             echo "saturday-stack: tmux missing (apt install tmux)" >&2; rc=1
         fi
-        for bin in saturday-watcher saturday-mayor saturday-thinking; do
+        for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking; do
             if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
                 echo "saturday-stack: $bin not found on PATH or ~/go/bin" >&2; rc=1
             fi
@@ -135,6 +141,14 @@ case "${1:-}" in
                 kill "$WPID" 2>/dev/null && echo "saturday-stack: watcher (pid $WPID) killed."
             fi
             rm -f "$WATCHER_PIDFILE"
+        fi
+        # Kill headless stage (same shape as watcher above).
+        if [ -f "$STAGE_PIDFILE" ]; then
+            SPID=$(cat "$STAGE_PIDFILE" 2>/dev/null)
+            if [ -n "$SPID" ] && kill -0 "$SPID" 2>/dev/null; then
+                kill "$SPID" 2>/dev/null && echo "saturday-stack: stage (pid $SPID) killed."
+            fi
+            rm -f "$STAGE_PIDFILE"
         fi
         exit 0
         ;;
@@ -201,7 +215,7 @@ fi
 if ! check_audio_venv; then
     exit 1
 fi
-for bin in saturday-watcher saturday-mayor saturday-thinking; do
+for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking; do
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
         echo "saturday-stack: $bin not found on PATH or in ~/go/bin" >&2
         exit 1
@@ -231,8 +245,16 @@ mkdir -p "$(dirname "$WATCHER_LOG")"
 echo $! > "$WATCHER_PIDFILE"
 echo "saturday-stack: watcher running headless (pid $(cat "$WATCHER_PIDFILE")), log → $WATCHER_LOG"
 
+# Headless stage — window choreography sidecar. No ordering dependency on
+# mayor (runStageClient reconnects with backoff regardless), but launched
+# alongside watcher so "headless services first" stays one visible block.
+mkdir -p "$(dirname "$STAGE_LOG")"
+~/go/bin/saturday-stage --sock "$STAGE_SOCK" >> "$STAGE_LOG" 2>&1 &
+echo $! > "$STAGE_PIDFILE"
+echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log → $STAGE_LOG"
+
 tmux new-session -d -s "$SESSION" -n "stack" \
-    "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK'"
+    "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK' --stage-sock '$STAGE_SOCK' --stage-tile"
 
 # Keep panes around after their process exits so failures are inspectable.
 tmux set-option -t "$SESSION" remain-on-exit on

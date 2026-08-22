@@ -12,19 +12,43 @@ by planning: the audio SIGUSR1 mute-on-detach path + client watchdog
 `8f6494a`. Pattern to notice: recent operational hardening has been
 reactive to bugs surfaced by using Saturday, not chosen off a plan.
 
+**Rank 1 (`claude/saturday-window-monitoring-rTGp7` branch decision)
+resolved 2026-08-22 — ported, not merged.** `saturday-stage` landed on
+main as `2e61ac9`, mayor's wiring to it as `385167e`, and an unrelated
+socket-permission hardening the branch also carried as `a21a67e`. The
+branch predated a lot of what's since shipped (the `--version` flag,
+the V0.3.1 `runClientWatchdog` audio safety belt, dynamic CC-version
+detection in `directWriteUserTurn`) — a straight merge would have
+deleted all of it, so the stage code was hand-spliced onto current
+main instead. The origin branch itself is safe to delete now; not done
+here.
+
 ### A. Bounded, high-leverage, no waiting for a signal
 
-1. **Decide on `claude/saturday-window-monitoring-rTGp7` branch** — the
-   ~902 LoC `saturday-stage` sidecar on origin. 30-60 min: review,
-   then merge / rebase / abandon. Cost of leaving it: bit-rot as main
-   moves; strangers browsing branches see dead work.
-2. **Extend `saturday-stack doctor`** — check that the tmux
+1. **Extend `saturday-stack doctor`** — check that the tmux
    `client-detached` hook is actually set and that the audio pidfile
    is being written. ~10 min. Closes the loop on today's safety belt:
    a silently unset hook reopens the open-mic-on-detach risk.
-3. **Onboarding/install consolidation** — apt + pip + Go + tool
+2. **Onboarding/install consolidation** — apt + pip + Go + tool
    downloads are scattered across README, per-module READMEs, and
    scripts. 1-2 hr. Blocks the first non-author user.
+3. **`saturday-stage` tile scaling + resize tweener** — `proportionalTile`
+   is two-tier only (addressed pane vs. one even row-split of the rest),
+   so it doesn't scale past a handful of concurrent sessions into
+   anything resembling a real grid. Same code path also wants a stepped/
+   interpolated resize instead of one instant jump on focus transitions —
+   feasibility isn't in question (pellicle's mouse-drag pane resize
+   already proves tmux resize+redraw is fast/clean enough to read as
+   smooth), only the step-count/delay/easing tuning is open. [jonaburg/
+   tmux-animated](https://github.com/jonaburg/tmux-animated) is relevant
+   prior art here — a tmux patch with real interpolated pane-resize
+   animation (configurable duration + easing) already exists; worth
+   evaluating as an adopt-don't-build option before hand-rolling a
+   tweener, though it means running a patched tmux binary and its
+   "control-mode clients don't animate" caveat needs checking against
+   how `saturday-stage` issues `resize-pane` before relying on it.
+   Trigger: once you're routinely running enough concurrent sessions
+   that a single thinning row stops being legible.
 
 ### B. Trigger-gated (roadmap explicitly says wait)
 
