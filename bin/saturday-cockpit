@@ -125,6 +125,13 @@ bind_hotkeys() {
         tmux bind-key -n "M-$n" run-shell "tmux select-pane -t $n ; tmux resize-pane -Z"
     done
     tmux bind-key -n M-0 run-shell 'tmux if-shell -F "#{window_zoomed_flag}" "resize-pane -Z"'
+
+    # kill-pane (e.g. clearing a dead remain-on-exit pane) doesn't re-tile on
+    # its own — tmux just hands the freed space to a neighbor, leaving an
+    # uneven layout. add_pane/add_pane_pellicle already re-balance after every
+    # split; this is the same fix for the removal side. Verified live: without
+    # it, killing 1 of 3 even-horizontal panes left 33/33/66; with it, 50/50.
+    tmux set-hook -t "$SESSION" after-kill-pane "select-layout -t $SESSION $LAYOUT"
 }
 
 case "${1:-}" in
