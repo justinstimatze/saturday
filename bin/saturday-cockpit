@@ -11,6 +11,18 @@
 # Usage:
 #   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
 #   saturday-cockpit add <dir> [<dir> ...]   # add pane(s) to a running cockpit
+#   saturday-cockpit add --pellicle <dir> [<dir> ...]
+#                                   # add pane(s) as a pellicle status+claude
+#                                   # pair instead of a bare claude pane —
+#                                   # needs ~/Documents/pellicle (PELLICLE_DIR)
+#   saturday-cockpit add --resume <dir> [<dir> ...]
+#                                   # run `claude --resume` instead of a
+#                                   # fresh session — drops into Claude's own
+#                                   # interactive picker per pane, scoped to
+#                                   # that dir's own past sessions. Composes
+#                                   # with --pellicle. For a known session id
+#                                   # instead of the picker, still use
+#                                   # CLAUDE_CMD='claude --resume <id>' add.
 #   saturday-cockpit stop          # kill the cockpit window/session
 #   saturday-cockpit status        # list panes (pane_id, pid, cwd)
 #
@@ -43,6 +55,46 @@ LAYOUT="${COCKPIT_TILE:-even-horizontal}"
 # panes the same way.
 add_pane() {
     tmux split-window -t "$SESSION" "cd '$1' && exec $CLAUDE_CMD"
+    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+}
+
+# Same as add_pane, but the new slot is itself a nested pellicle pair — a
+# claude pane with a 3-line status-render strip split above it — instead of
+# a bare claude pane. Ported from ~/Documents/pellicle/pellicle-claude's own
+# split logic (that script won't do this itself: it detects it's already
+# inside tmux and falls back to plain claude, by design, so cockpit has to
+# build the pair itself). Coordinated with the pellicle session before
+# landing this.
+#
+# Known rough edge: add_pane's select-layout call for any OTHER dir, later,
+# rebalances every pane in the window including this one's 3-line strip
+# back to the general grid. pellicle's own Stop-hook resize in
+# status-fallback.sh reasserts the right height on that project's next
+# turn, so this self-heals rather than staying broken — but there's a
+# window where it's wrong. Not fixed here; flagged instead.
+add_pane_pellicle() {
+    local dir="$1"
+    local pellicle_dir="${PELLICLE_DIR:-$HOME/Documents/pellicle}"
+    if [ ! -x "$pellicle_dir/pellicle-pane-render.sh" ]; then
+        echo "saturday-cockpit: --pellicle needs $pellicle_dir/pellicle-pane-render.sh (set PELLICLE_DIR?)" >&2
+        return 1
+    fi
+    if ! command -v watch >/dev/null 2>&1; then
+        echo "saturday-cockpit: --pellicle needs 'watch' (procps)." >&2
+        return 1
+    fi
+
+    local claude_pane_id
+    claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $CLAUDE_CMD")"
+
+    local watch_cmd
+    watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
+
+    local render_pane_id
+    render_pane_id="$(tmux split-window -v -b -l 3 -t "$claude_pane_id" -c "$dir" -P -F '#{pane_id}' "$watch_cmd")"
+    echo "$render_pane_id" > "$dir/.pellicle-pane"
+
+    tmux select-pane -t "$claude_pane_id"
     tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 }
 
@@ -89,8 +141,25 @@ case "${1:-}" in
             exit 1
         fi
         bind_hotkeys
+        pellicle=0
+        resume=0
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --pellicle) pellicle=1; shift ;;
+                --resume) resume=1; shift ;;
+                --) shift; break ;;
+                --*)
+                    echo "saturday-cockpit: unknown flag: $1" >&2
+                    exit 2
+                    ;;
+                *) break ;;
+            esac
+        done
+        if [ "$resume" -eq 1 ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --resume"
+        fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume] <dir> [<dir> ...]" >&2
             exit 2
         fi
         for d in "$@"; do
@@ -100,7 +169,11 @@ case "${1:-}" in
             fi
         done
         for d in "$@"; do
-            add_pane "$d"
+            if [ "$pellicle" -eq 1 ]; then
+                add_pane_pellicle "$d"
+            else
+                add_pane "$d"
+            fi
         done
         total="$(tmux list-panes -t "$SESSION" | wc -l)"
         echo "saturday-cockpit: added $# pane(s), $total total."
