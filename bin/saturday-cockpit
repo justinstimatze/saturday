@@ -10,11 +10,19 @@
 #
 # Usage:
 #   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
+#   saturday-cockpit [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]
+#                                   # both flags apply to CLAUDE_CMD for every
+#                                   # pane in this initial batch (see below —
+#                                   # same flags, same meaning, as on `add`).
+#                                   # --pellicle is add-only; see below.
 #   saturday-cockpit add <dir> [<dir> ...]   # add pane(s) to a running cockpit
 #   saturday-cockpit add --pellicle <dir> [<dir> ...]
 #                                   # add pane(s) as a pellicle status+claude
 #                                   # pair instead of a bare claude pane —
-#                                   # needs ~/Documents/pellicle (PELLICLE_DIR)
+#                                   # needs ~/Documents/pellicle (PELLICLE_DIR).
+#                                   # add-only: the first/initial pane is built
+#                                   # via new-session, not split-window, so it
+#                                   # has no pellicle path of its own yet.
 #   saturday-cockpit add --resume <dir> [<dir> ...]
 #                                   # run `claude --resume` instead of a
 #                                   # fresh session — drops into Claude's own
@@ -204,9 +212,39 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 fi
 
+# --resume/--dangerously-skip-permissions apply to CLAUDE_CMD for the whole
+# initial batch, same as they do in `add`. --pellicle isn't accepted here:
+# the first pane is built via `new-session`, not `split-window`, so it needs
+# its own pane-creation path that doesn't exist yet — launch plain, then
+# `add --pellicle` once the session is up.
+resume=0
+yolo=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --resume) resume=1; shift ;;
+        --dangerously-skip-permissions) yolo=1; shift ;;
+        --pellicle)
+            echo "saturday-cockpit: --pellicle only works with 'add' — launch plain, then: saturday-cockpit add --pellicle <dir>" >&2
+            exit 2
+            ;;
+        --) shift; break ;;
+        --*)
+            echo "saturday-cockpit: unknown flag: $1" >&2
+            exit 2
+            ;;
+        *) break ;;
+    esac
+done
+if [ "$resume" -eq 1 ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --resume"
+fi
+if [ "$yolo" -eq 1 ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
+fi
+
 if [ "$#" -lt 1 ]; then
-    echo "usage: saturday-cockpit <dir> [<dir> ...]   (one Claude Code pane per dir)" >&2
-    echo "       saturday-cockpit add <dir> [<dir> ...]" >&2
+    echo "usage: saturday-cockpit [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+    echo "       saturday-cockpit add [--pellicle] [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
     exit 2
 fi
