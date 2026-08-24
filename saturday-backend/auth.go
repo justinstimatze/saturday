@@ -14,10 +14,14 @@ import (
 	"google.golang.org/api/drive/v3"
 )
 
-// driveScopes is read-only on purpose: saturday-backend's whole job is
-// consuming notes, never managing them. A leaked token under this scope
-// can't write or delete anything in the user's Drive.
-var driveScopes = []string{drive.DriveReadonlyScope}
+// driveScopes: readonly covers listing/downloading notes Claude's voice-mode
+// connector writes (files this app didn't create). drive.file is added on
+// top, not in place of it, for the session-inventory manifest (manifest.go)
+// — drive.file only grants access to files this app itself creates, so a
+// leaked token still can't touch anything else in the user's Drive, read or
+// write. Changing this set requires re-running --drive-login: a cached
+// token from before the change doesn't carry the new scope.
+var driveScopes = []string{drive.DriveReadonlyScope, drive.DriveFileScope}
 
 // loadOAuthConfig reads the OAuth client secret downloaded from Google
 // Cloud Console (an OAuth 2.0 Desktop-app client ID) and returns it as an

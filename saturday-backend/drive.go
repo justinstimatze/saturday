@@ -35,19 +35,21 @@ const googleDocMimeType = "application/vnd.google-apps.document"
 
 // driveClient is the real driveSource, backed by the Drive API v3 client.
 type driveClient struct {
-	svc      *drive.Service
-	folderID string
+	svc          *drive.Service
+	folderID     string
+	manifestName string // see manifest.go — excluded from ListNew below
+	manifestID   string // discovered/created lazily, see manifest.go
 }
 
 // newDriveClient builds a driveClient from a cached OAuth token. tok must
 // already have a refresh token (see auth.go's login flow) — this does not
 // perform interactive consent.
-func newDriveClient(ctx context.Context, cfg *oauth2.Config, tok *oauth2.Token, folderID string) (*driveClient, error) {
+func newDriveClient(ctx context.Context, cfg *oauth2.Config, tok *oauth2.Token, folderID, manifestName string) (*driveClient, error) {
 	svc, err := drive.NewService(ctx, option.WithTokenSource(cfg.TokenSource(ctx, tok)))
 	if err != nil {
 		return nil, fmt.Errorf("drive service: %w", err)
 	}
-	return &driveClient{svc: svc, folderID: folderID}, nil
+	return &driveClient{svc: svc, folderID: folderID, manifestName: manifestName}, nil
 }
 
 // buildQuery constructs the Drive API query for listing notes in folderID
@@ -75,6 +77,9 @@ func (d *driveClient) ListNew(ctx context.Context, since time.Time) ([]note, err
 	var notes []note
 	err := call.Pages(ctx, func(page *drive.FileList) error {
 		for _, f := range page.Files {
+			if d.manifestName != "" && f.Name == d.manifestName {
+				continue // the session-inventory manifest this backend itself wrote — not a note
+			}
 			created, err := time.Parse(time.RFC3339, f.CreatedTime)
 			if err != nil {
 				continue // malformed timestamp — skip rather than fail the whole page

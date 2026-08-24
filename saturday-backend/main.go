@@ -116,6 +116,7 @@ func main() {
 	folderID := flag.String("drive-folder-id", "", "Drive folder ID to poll (the folder ID segment from its URL)")
 	pollInterval := flag.Duration("poll-interval", 15*time.Second, "how often to check the Drive folder for new notes")
 	cursorPath := flag.String("cursor", defaultCursor, "cursor state file (what's already been processed)")
+	manifestName := flag.String("drive-manifest-name", "saturday-sessions.txt", "filename for the live-session inventory this backend writes back to the Drive folder, so voice mode can check real session names before writing a note; empty disables it (requires the drive.file scope — re-run --drive-login after upgrading from a readonly-only token)")
 	drivelogin := flag.Bool("drive-login", false, "run the one-time interactive OAuth consent flow, save the token, and exit")
 	flag.Parse()
 
@@ -167,7 +168,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	src, err := newDriveClient(ctx, cfg, tok, *folderID)
+	src, err := newDriveClient(ctx, cfg, tok, *folderID, *manifestName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "drive client:", err)
 		os.Exit(1)
@@ -192,6 +193,14 @@ func main() {
 	for {
 		c = pollOnce(ctx, src, c, b.processNote)
 		saveCursor(*cursorPath, c)
+		if *manifestName != "" && !*dryRun {
+			n, err := refreshManifest(ctx, src, *sock)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "manifest: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "↻ manifest: %d live session(s) → %s\n", n, *manifestName)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return

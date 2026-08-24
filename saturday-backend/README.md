@@ -50,9 +50,29 @@ saturday-backend --drive-credentials ~/.config/saturday/drive-credentials.json \
 
 This opens a URL to approve in a browser once, then caches a token (with a
 refresh token, so this step never repeats) to
-`~/.config/saturday/drive-token.json` at `0600`. The requested scope is
-`drive.readonly` — this program can never write to or delete anything in
-your Drive.
+`~/.config/saturday/drive-token.json` at `0600`. Two scopes are requested:
+`drive.readonly` (list/read notes Claude's connector writes) and
+`drive.file` (write *only* files this program itself creates — the
+session-inventory manifest below; it still can't touch anything else in
+your Drive, read or write). If you ran `--drive-login` before this scope
+was added, re-run it — a cached token from before doesn't carry the new
+scope, and manifest writes will fail with a permissions error until you do.
+
+## Session inventory — written back to Drive
+
+Every poll tick, `saturday-backend` also writes a small
+`saturday-sessions.txt` file into the same folder, listing every session
+`saturday-watcher` currently sees as live, by project name. The intent is
+for voice mode to check real session names against this file before
+naming one in a note — but that half is **not yet verified**: it needs an
+account-wide instruction added to your own Claude Preferences telling
+voice mode to actually read it, and a live test the same way the note-
+writing side already got one. Until that's done, this file exists and
+updates correctly, but nothing consumes it yet.
+
+Set `--drive-manifest-name ""` to disable this and fall back to
+read-only behavior (matches the scope you'd have from before this was
+added, if you'd rather not re-consent yet).
 
 ## Setup: ANTHROPIC_API_KEY and the LLM cache
 
@@ -85,6 +105,7 @@ Flags mirror `saturday-mayor` where the same concept applies
 | `--drive-folder-id` | *(required)* | the folder to poll |
 | `--poll-interval` | `15s` | how often to check for new notes |
 | `--cursor` | `~/.config/saturday/backend-cursor.json` | what's already been processed |
+| `--drive-manifest-name` | `saturday-sessions.txt` | live-session inventory written back each poll; `""` disables it |
 
 ## What this doesn't do yet
 
