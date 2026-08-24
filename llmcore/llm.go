@@ -225,7 +225,7 @@ func CachedCall(apiKey, model, system, userText string, tool Tool, cacheDir, cid
 				return nil, err
 			}
 			pretty, _ := json.MarshalIndent(out, "", "  ")
-			_ = os.WriteFile(cachePath, pretty, 0o644)
+			_ = os.WriteFile(cachePath, pretty, 0o600)
 			return out, nil
 		}
 	}

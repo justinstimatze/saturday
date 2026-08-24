@@ -72,13 +72,19 @@ after its process exits so you can read crash output. `tmux
 respawn-pane` to restart a single pane; `tmux kill-session -t
 saturday-stack` to start fresh.
 
-**Env overrides** (rarely needed):
+Also runs headless (no pane): `saturday-watcher`, `saturday-stage`
+(window choreography), and `saturday-backend` (phone-voice Drive relay —
+see `saturday-backend/README.md`).
 
-| var            | default                                       | meaning                                          |
-|----------------|-----------------------------------------------|--------------------------------------------------|
-| `SATURDAY_DIR` | `$HOME/Documents/saturday`                    | repo root containing `saturday-audio/`           |
-| `SOCK`         | `/tmp/saturday-audio.sock`                    | mayor↔audio Unix socket                          |
-| `AUDIO_VENV`   | `$SATURDAY_DIR/saturday-audio/.venv`          | venv with faster-whisper, kokoro-onnx, etc.      |
+**Env overrides:**
+
+| var                     | default                              | meaning                                          |
+|-------------------------|---------------------------------------|--------------------------------------------------|
+| `SATURDAY_DIR`          | `$HOME/Documents/saturday`            | repo root containing `saturday-audio/`           |
+| `SOCK`                  | `/tmp/saturday-audio.sock`            | mayor↔audio Unix socket                          |
+| `AUDIO_VENV`            | `$SATURDAY_DIR/saturday-audio/.venv`  | venv with faster-whisper, kokoro-onnx, etc.      |
+| `DRIVE_FOLDER_ID`       | *(required)*                          | Drive folder Claude's voice-mode connector writes notes to |
+| `BACKEND_POLL_INTERVAL` | `5s`                                   | how often `saturday-backend` polls Drive         |
 
 The script sanity-checks before constructing the session: aborts with a
 helpful message if `saturday-watcher` / `saturday-mayor` aren't on

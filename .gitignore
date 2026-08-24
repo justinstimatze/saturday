@@ -19,11 +19,13 @@ results.csv
 # instead of the whole dir.
 /eval/eval
 /eval/router/router
+/saturday-backend/saturday-backend
 /saturday-hook/saturday-hook
 /saturday-mayor/saturday-mayor
 /saturday-thinking/saturday-thinking
 /sync/sync
 /watcher/watcher
+/bin/saturday-backend
 /bin/saturday-hook
 /bin/saturday-mayor
 /bin/saturday-stage

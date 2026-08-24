@@ -22,6 +22,7 @@ build:
 	@cd saturday-stage    && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-stage .
 	@cd saturday-thinking && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-sync .
+	@cd saturday-backend  && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-backend .
 	@echo "built $(VERSION) → $(BINDIR)/"
 
 install:
@@ -31,6 +32,7 @@ install:
 	@cd saturday-stage    && go build $(LDFLAGS) -o $(GOBIN)/saturday-stage .
 	@cd saturday-thinking && go build $(LDFLAGS) -o $(GOBIN)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o $(GOBIN)/saturday-sync .
+	@cd saturday-backend  && go build $(LDFLAGS) -o $(GOBIN)/saturday-backend .
 	@echo "installed $(VERSION) → $(GOBIN)/"
 
 test:
@@ -43,7 +45,7 @@ lint:
 	@golangci-lint run ./...
 
 tidy:
-	@for d in saturday-mayor watcher saturday-hook saturday-stage saturday-thinking sync eval eval/router llmcore; do \
+	@for d in saturday-mayor watcher saturday-hook saturday-stage saturday-thinking sync eval eval/router llmcore inject settle watcherclient saturday-backend; do \
 		(cd $$d && go mod tidy); \
 	done
 
@@ -56,10 +58,10 @@ hooks:
 ci:
 	@out=$$(gofmt -l .); \
 	if [ -n "$$out" ]; then echo "gofmt drift in:"; echo "$$out"; exit 1; fi
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient saturday-backend; do \
 		(cd $$d && go vet ./...) || exit 1; \
 	done
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient saturday-backend; do \
 		(cd $$d && go test -race ./...) || exit 1; \
 	done
 	@$(MAKE) build >/dev/null

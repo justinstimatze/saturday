@@ -19,15 +19,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,7 +35,10 @@ import (
 	"syscall"
 	"time"
 
+	"saturday/inject"
 	llm "saturday/llmcore"
+	"saturday/settle"
+	"saturday/watcherclient"
 )
 
 // version is baked in at build time via `-ldflags "-X main.version=$(git describe …)"`.
@@ -81,40 +80,6 @@ func buildVersion() string {
 	return rev
 }
 
-type SessionEntry struct {
-	State       llm.State `json:"state"`
-	LastEventAt time.Time `json:"last_event_at"`
-	JSONLPath   string    `json:"jsonl_path"`
-	EventsSeen  int       `json:"events_seen"`
-}
-
-// --- Watcher socket query ---
-
-func fetchSessions(sockPath string) ([]SessionEntry, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", sockPath)
-			},
-		},
-		Timeout: 5 * time.Second,
-	}
-	resp, err := client.Get("http://x/state")
-	if err != nil {
-		return nil, fmt.Errorf("watcher %s: %w", sockPath, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("watcher %s: status %d", sockPath, resp.StatusCode)
-	}
-	var sessions []SessionEntry
-	if err := json.NewDecoder(resp.Body).Decode(&sessions); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	return sessions, nil
-}
-
 // --- Pipeline ---
 
 type Mayor struct {
@@ -124,7 +89,7 @@ type Mayor struct {
 	dryRun             bool
 	collisionWait      time.Duration // window the JSONL must be stable before injecting
 	collisionMax       time.Duration // give up waiting after this and inject anyway
-	confThreshold      float64       // skip inject if router or expander conf < this (0 disables)
+	confThreshold      float64       // skip inject if router or expander conf <= this, must exceed to proceed (0 disables)
 	askConf            float64       // V0.3: classifier conf >= this AND type==ask → answerAsk path. Default 0.7. Higher = stricter ask gate (more inject false-negatives, fewer ask false-positives).
 	injectDirectTokens int           // est. tokens since last compact > this → direct-write skip headless
 
@@ -220,12 +185,9 @@ type pendingInject struct {
 	// "auto" = current default (speak if filters pass).
 	narrate string
 
-	// V0.2.6 corner tag state. Set by startBlink at trackInject time.
-	// Implementation lives in tmux session status-right (see startBlink);
-	// blinkSavedStatus holds the user's original status-right value so
-	// stopBlink can restore it.
-	blinkSession     string
-	blinkSavedStatus string
+	// V0.2.6 corner tag state. Set by startBlink at trackInject time; see
+	// inject.Blinker for what it holds and stopBlink for how it's restored.
+	blinker inject.Blinker
 }
 
 // audioWrite serializes JSON event writes to the audio sidecar conn under
@@ -653,113 +615,33 @@ func writeStateFrame(conn net.Conn, snap MayorState) error {
 
 // --- V0.2.6 corner tag (das blinkenlights) ---
 //
-// Small overlay on the target CC pane during inject lifecycle. Implemented
-// via the target tmux session's status-right — tmux owns its status line
-// outside the pane's scroll region, so the tag persists across CC output
-// without leaving ghost trails (which the prior raw-tty approach did).
-//
-// We save the session's existing status-right on start and restore it on
-// stop so user customizations survive the inject cycle.
+// Mechanics (pane discovery, status-right get/set/restore) live in
+// saturday/inject; these are thin Mayor-owning wrappers that hold the
+// per-inject inject.Blinker value under pendingMu.
 
-// resolvePaneSession returns the tmux session that owns paneID, plus the
-// current status-right value (so we can restore it on stop). Returns
-// ("", "") if paneID isn't a tmux pane or tmux isn't available.
-func (m *Mayor) resolvePaneSession(paneID string) (string, string) {
-	out, err := exec.Command("tmux", "display-message", "-p", "-t", paneID,
-		"#{session_name}").Output()
-	if err != nil {
-		return "", ""
-	}
-	session := strings.TrimSpace(string(out))
-	if session == "" {
-		return "", ""
-	}
-	saved, err := exec.Command("tmux", "show-option", "-vt", session, "status-right").Output()
-	if err != nil {
-		return session, ""
-	}
-	return session, strings.TrimRight(string(saved), "\n")
-}
-
-// setBlinkStatus sets the target session's status-right to a tmux-styled
-// banner. Tmux interprets `#[fg=…]…#[default]` natively in status formats.
-func (m *Mayor) setBlinkStatus(session, text, color string) {
-	if m.noBlink || session == "" {
-		return
-	}
-	formatted := fmt.Sprintf("#[fg=%s,bold]%s#[default]", color, text)
-	_ = exec.Command("tmux", "set-option", "-t", session, "status-right", formatted).Run()
-}
-
-// clearBlinkStatus restores the original status-right (or unsets if it
-// was empty).
-func (m *Mayor) clearBlinkStatus(session, original string) {
-	if m.noBlink || session == "" {
-		return
-	}
-	if original == "" {
-		_ = exec.Command("tmux", "set-option", "-t", session, "-u", "status-right").Run()
-		return
-	}
-	_ = exec.Command("tmux", "set-option", "-t", session, "status-right", original).Run()
-}
-
-// activeTag is the in-progress banner; doneTag fires briefly on completion.
-// Project name + braille bar is enough signal — no need to spell out
-// "injecting".
-func activeTag(project string) string {
-	return fmt.Sprintf("[⠿⠿⠿⠶⠆ %s]", project)
-}
-
-func doneTag(project string) string {
-	return fmt.Sprintf("[✓ %s]", project)
-}
-
-// startBlink looks up the target tmux session, saves its current
-// status-right, and sets the active tag. No goroutine — tmux owns the
-// rendering, no rewrite ticker needed (was needed for raw-tty writes that
-// got pushed into scrollback by CC's scroll region).
+// startBlink tags paneID's tmux session and stores the resulting
+// inject.Blinker on p so stopBlink can restore the original status-right.
 func (m *Mayor) startBlink(p *pendingInject, paneID string) {
-	if m.noBlink || p == nil || paneID == "" {
+	if p == nil {
 		return
 	}
-	session, saved := m.resolvePaneSession(paneID)
-	if session == "" {
-		return
-	}
+	b := inject.StartBlink(paneID, p.project, m.noBlink)
 	m.pendingMu.Lock()
-	p.blinkSession = session
-	p.blinkSavedStatus = saved
+	p.blinker = b
 	m.pendingMu.Unlock()
-	m.setBlinkStatus(session, activeTag(p.project), "colour51") // bright cyan
 }
 
 // stopBlink optionally flashes a final banner (e.g. done), then restores
-// the session's original status-right after fadeAfter. If finalText is
-// empty, restore is immediate (silent drop).
+// the tagged session's original status-right. See inject.Blinker.Stop.
 func (m *Mayor) stopBlink(p *pendingInject, finalText, finalColor string, fadeAfter time.Duration) {
 	if p == nil {
 		return
 	}
 	m.pendingMu.Lock()
-	session := p.blinkSession
-	saved := p.blinkSavedStatus
-	p.blinkSession = ""
+	b := p.blinker
+	p.blinker = inject.Blinker{}
 	m.pendingMu.Unlock()
-	if session == "" {
-		return
-	}
-	if finalText != "" {
-		m.setBlinkStatus(session, finalText, finalColor)
-		if fadeAfter > 0 {
-			go func() {
-				time.Sleep(fadeAfter)
-				m.clearBlinkStatus(session, saved)
-			}()
-			return
-		}
-	}
-	m.clearBlinkStatus(session, saved)
+	b.Stop(finalText, finalColor, fadeAfter, m.noBlink)
 }
 
 // getPending fetches a pending inject by sessionID under lock. Returns
@@ -856,12 +738,12 @@ func (m *Mayor) handle(utterance, mode, narrate string) error {
 
 	m.emitState("routing")
 	defer m.emitState("")
-	sessions, err := fetchSessions(m.sockPath)
+	sessions, err := watcherclient.FetchSessions(m.sockPath)
 	if err != nil {
 		return fmt.Errorf("fetch sessions: %w", err)
 	}
 	// Filter: must have a session_id (some entries may be project-only stubs)
-	live := make([]SessionEntry, 0, len(sessions))
+	live := make([]watcherclient.SessionEntry, 0, len(sessions))
 	for _, s := range sessions {
 		if s.State.SessionID != "" {
 			live = append(live, s)
@@ -897,7 +779,7 @@ func (m *Mayor) handle(utterance, mode, narrate string) error {
 	target := live[idx]
 	fmt.Fprintf(os.Stderr, "\033[2;36m→ route:\033[0m %s \033[2m(conf=%.2f)\033[0m \033[2m— %s\033[0m\n",
 		target.State.Project, conf, oneLine(getStr(rt, "rationale")))
-	if m.confThreshold > 0 && conf < m.confThreshold {
+	if m.confThreshold > 0 && conf <= m.confThreshold {
 		fmt.Fprintf(os.Stderr, "  ↳ router conf below threshold %.2f; skipping inject\n", m.confThreshold)
 		return nil
 	}
@@ -928,7 +810,7 @@ func (m *Mayor) answerAsk(utterance string) error {
 	// Pair each cached arc with its project name from the watcher
 	// snapshot. Sessions with no arc cached yet are omitted — RunAsk's
 	// prompt tells the model how to handle absences.
-	if sessions, err := fetchSessions(m.sockPath); err == nil {
+	if sessions, err := watcherclient.FetchSessions(m.sockPath); err == nil {
 		m.arcMu.Lock()
 		for _, s := range sessions {
 			sid := s.State.SessionID
@@ -979,7 +861,7 @@ func (m *Mayor) answerAsk(utterance string) error {
 // narration, path selection (tmux → direct-write → headless). Used by both
 // expand-mode (after the expander returns action=inject) and verbatim-mode
 // (utterance text becomes the inject directly, narration empty).
-func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate string) error {
+func (m *Mayor) commitInject(target watcherclient.SessionEntry, text, narration, narrate string) error {
 	m.emitState("injecting → " + target.State.Project)
 	if m.dryRun {
 		fmt.Fprintln(os.Stderr, "  [dry-run; skipping exec]")
@@ -990,7 +872,7 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 			fmt.Fprintf(os.Stderr, "  ↳ narrating: %q\n", narration)
 		}
 	}
-	waited, timedOut := m.waitForQuiet(target.JSONLPath)
+	waited, timedOut := settle.WaitForQuiet(target.JSONLPath, m.collisionWait, m.collisionMax)
 	if waited > 0 {
 		tag := "stable"
 		if timedOut {
@@ -1002,9 +884,9 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 	// 1. Target's claude is running in a tmux pane → tmux send-keys.
 	// 2. No tmux pane, JSONL post-compact size > threshold → direct-write user turn.
 	// 3. Else → headless `claude --resume --print`.
-	if paneID := findTmuxPane(target.State.Cwd); paneID != "" {
+	if paneID := inject.FindTmuxPane(target.State.Cwd); paneID != "" {
 		fmt.Fprintf(os.Stderr, "  ↳ found tmux pane %s for cwd=%s; using tmux send-keys\n", paneID, target.State.Cwd)
-		if err := injectViaTmux(paneID, text); err != nil {
+		if err := inject.ViaTmux(paneID, text); err != nil {
 			return fmt.Errorf("tmux send-keys: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "  ↳ injected via tmux send-keys (live pane handles)")
@@ -1027,13 +909,13 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 	}
 	fmt.Fprintln(os.Stderr, "  ↳ no tmux pane found for target cwd; using JSONL fallback path")
 	if m.injectDirectTokens > 0 && target.JSONLPath != "" {
-		est, err := tokensSinceLastCompact(target.JSONLPath)
+		est, err := inject.TokensSinceLastCompact(target.JSONLPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  ↳ token-estimate failed: %v; falling back to headless inject\n", err)
 		} else if est > m.injectDirectTokens {
 			fmt.Fprintf(os.Stderr, "  ↳ post-compact tokens-est %d > %d threshold; direct-writing user turn (no headless invocation)\n",
 				est, m.injectDirectTokens)
-			if err := directWriteUserTurn(target.JSONLPath, target.State.SessionID, target.State.Cwd, text); err != nil {
+			if err := inject.DirectWriteUserTurn(target.JSONLPath, target.State.SessionID, target.State.Cwd, text); err != nil {
 				return fmt.Errorf("direct-write: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "  ↳ direct-wrote user turn to %s\n", target.JSONLPath)
@@ -1044,22 +926,15 @@ func (m *Mayor) commitInject(target SessionEntry, text, narration, narrate strin
 				est, m.injectDirectTokens)
 		}
 	}
-	return m.inject(target.State.SessionID, target.State.Cwd, text)
+	n, err := inject.Headless(target.State.SessionID, target.State.Cwd, text)
+	if err != nil {
+		return fmt.Errorf("claude --resume --print: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "  ↳ injected (cwd=%s), %d bytes assistant reply\n", target.State.Cwd, n)
+	return nil
 }
 
-// callsignRule is appended to expand-mode injects so CC labels enumerated
-// items with phonetically-distinct callsigns. Voice-friendly referent
-// grounding — the user can then say "fix the bravo one" and the expander
-// can resolve via state.last_assistant_text. Skipped for verbatim mode
-// because the user typed the literal text. Pre-rendered constant to keep
-// the pre-pended block byte-stable in CC's prompt cache.
-const callsignRule = "\n\n[saturday: when listing more than one item, label each with a phonetically-distinct callsign — alpha bravo cherry delta echo foxtrot golf hotel — and reuse the same callsign for the same item across this session. Skip for single-item or pure-prose answers.]"
-
-func withCallsignRule(text string) string {
-	return text + callsignRule
-}
-
-func (m *Mayor) expandAndInject(utterance string, target SessionEntry, mode, narrate string) error {
+func (m *Mayor) expandAndInject(utterance string, target watcherclient.SessionEntry, mode, narrate string) error {
 	if mode == "verbatim" {
 		// Verbatim mode: utterance text becomes the inject directly. No
 		// expander LLM call. No narration speak event — sidecar's instant
@@ -1081,11 +956,11 @@ func (m *Mayor) expandAndInject(utterance string, target SessionEntry, mode, nar
 	case "inject":
 		fmt.Fprintf(os.Stderr, "\033[1;33m→ Saturday → %s\033[0m \033[2m(conf=%.2f)\033[0m: \033[33m%s\033[0m\n",
 			target.State.Project, conf, oneLine(text))
-		if m.confThreshold > 0 && conf < m.confThreshold {
+		if m.confThreshold > 0 && conf <= m.confThreshold {
 			fmt.Fprintf(os.Stderr, "  ↳ expander conf below threshold %.2f; skipping inject\n", m.confThreshold)
 			return nil
 		}
-		text = withCallsignRule(text)
+		text = inject.WithCallsignRule(text)
 		return m.commitInject(target, text, getStr(exp, "confirmation"), narrate)
 	case "ask":
 		fmt.Fprintf(os.Stderr, "\033[1;35m? expander asks\033[0m \033[2m(%s)\033[0m: %s\n", target.State.Project, oneLine(text))
@@ -1103,343 +978,6 @@ func (m *Mayor) expandAndInject(utterance string, target SessionEntry, mode, nar
 	}
 }
 
-// findTmuxPane locates the tmux pane_id (e.g. "%5") whose pane process
-// tree contains a `claude` process running in wantCwd. Returns "" if no
-// tmux server is running, no matching pane exists, or wantCwd is empty.
-//
-// Discovery: `tmux list-panes -aF '#{pane_id} #{pane_pid}'` enumerates
-// every pane across every session/window/server. For each pane_pid, BFS
-// through descendants via /proc/<pid>/task/<pid>/children and check each
-// process's argv[0] for "claude" (the CLI is a Node binary but argv[0]
-// is the wrapper script's filename). Once a claude is found, read its
-// /proc/<pid>/cwd and match against wantCwd.
-//
-// Cost: one tmux call + ~tens of /proc reads per inject. Negligible.
-func findTmuxPane(wantCwd string) string {
-	if wantCwd == "" {
-		return ""
-	}
-	out, err := exec.Command("tmux", "list-panes", "-aF", "#{pane_id} #{pane_pid}").Output()
-	if err != nil {
-		return "" // no tmux server, or tmux not installed
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			continue
-		}
-		paneID := parts[0]
-		panePid, err := strconv.Atoi(parts[1])
-		if err != nil {
-			continue
-		}
-		claudePid := findClaudeDescendant(panePid)
-		if claudePid == 0 {
-			continue
-		}
-		cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", claudePid))
-		if err != nil {
-			continue
-		}
-		if cwd == wantCwd {
-			return paneID
-		}
-	}
-	return ""
-}
-
-// findClaudeDescendant BFS-walks process descendants of root, returning
-// the pid of the first one whose argv contains a "claude" binary. Bounded
-// to 200 visited processes so a runaway parent tree can't hang us.
-func findClaudeDescendant(root int) int {
-	queue := []int{root}
-	visited := make(map[int]bool, 32)
-	for len(queue) > 0 && len(visited) < 200 {
-		cur := queue[0]
-		queue = queue[1:]
-		if visited[cur] {
-			continue
-		}
-		visited[cur] = true
-		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", cur))
-		if err == nil {
-			args := strings.Split(string(cmdline), "\x00")
-			for _, a := range args {
-				if a == "claude" || strings.HasSuffix(a, "/claude") {
-					return cur
-				}
-			}
-		}
-		queue = append(queue, readChildPIDs(cur)...)
-	}
-	return 0
-}
-
-// readChildPIDs returns the immediate child pids of pid, via the
-// procfs `children` file (Linux 3.5+).
-func readChildPIDs(pid int) []int {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
-	if err != nil {
-		return nil
-	}
-	var out []int
-	for _, s := range strings.Fields(string(data)) {
-		if n, err := strconv.Atoi(s); err == nil {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
-// injectViaTmux types the expanded text + Enter into a tmux pane.
-// Two send-keys calls: first `-l <text>` writes the literal string into
-// the pane's input buffer (no escape interpretation), then a separate
-// `Enter` keystroke submits it. The live claude in that pane handles it
-// as if the user typed it. UserPromptSubmit hook fires natively, all
-// permissions inherit, scrollback shows everything.
-func injectViaTmux(paneID, text string) error {
-	if err := exec.Command("tmux", "send-keys", "-t", paneID, "-l", text).Run(); err != nil {
-		return fmt.Errorf("send-keys text: %w", err)
-	}
-	if err := exec.Command("tmux", "send-keys", "-t", paneID, "Enter").Run(); err != nil {
-		return fmt.Errorf("send-keys Enter: %w", err)
-	}
-	return nil
-}
-
-// tokensSinceLastCompact estimates how many tokens are loaded into the
-// model's context window when claude --resume is invoked: bytes from the
-// most recent isCompactSummary turn (or beginning of file) to EOF, divided
-// by 4. JSONL grows monotonically past compacts, but CC's resume only
-// loads the post-compact slice. Used to predict autocompact pressure: when
-// the slice is too big, --resume --print autocompacts at load time and
-// diverts the inject's response (the buddy-turtle effect).
-func tokensSinceLastCompact(jsonlPath string) (int, error) {
-	f, err := os.Open(jsonlPath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	fileSize := info.Size()
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var byteOffset int64 = 0
-	var lastCompactEndOffset int64 = 0
-	for sc.Scan() {
-		line := sc.Bytes()
-		// Cheap pre-filter before JSON parse.
-		if bytes.Contains(line, []byte(`"isCompactSummary":true`)) {
-			var t struct {
-				IsCompactSummary bool `json:"isCompactSummary"`
-			}
-			if err := json.Unmarshal(line, &t); err == nil && t.IsCompactSummary {
-				lastCompactEndOffset = byteOffset + int64(len(line)) + 1 // +1 for the trailing \n
-			}
-		}
-		byteOffset += int64(len(line)) + 1
-	}
-	if err := sc.Err(); err != nil {
-		return 0, err
-	}
-	delta := fileSize - lastCompactEndOffset
-	if delta < 0 {
-		delta = 0
-	}
-	return int(delta / 4), nil
-}
-
-// lastLeafAndVersion returns the leafUuid from the most recent
-// "last-prompt" entry (CC's pointer to the conversation-tree leaf, used
-// as parentUuid for direct-written turns) along with the most recent
-// CC version string seen on any turn. Mirroring CC's own version keeps
-// our synthesized entries shaped like whatever just touched the file
-// instead of pinning a stale literal that would drift after a CC update.
-// Either field may be empty on a fresh session; callers handle empties.
-func lastLeafAndVersion(jsonlPath string) (leaf, version string, err error) {
-	f, err := os.Open(jsonlPath)
-	if err != nil {
-		return "", "", err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if bytes.Contains(line, []byte(`"type":"last-prompt"`)) {
-			var t struct {
-				Type     string `json:"type"`
-				LeafUUID string `json:"leafUuid"`
-			}
-			if err := json.Unmarshal(line, &t); err == nil &&
-				t.Type == "last-prompt" && t.LeafUUID != "" {
-				leaf = t.LeafUUID
-			}
-		}
-		if bytes.Contains(line, []byte(`"version":"`)) {
-			var t struct {
-				Version string `json:"version"`
-			}
-			if err := json.Unmarshal(line, &t); err == nil && t.Version != "" {
-				version = t.Version
-			}
-		}
-	}
-	return leaf, version, sc.Err()
-}
-
-// genUUID4 returns a UUID v4 string. Stdlib only — no google/uuid dep
-// for a single call site.
-func genUUID4() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// rand.Read failure is essentially impossible on Linux; fall back
-		// to a timestamp-based pseudo-uuid that's still unique enough.
-		ts := time.Now().UnixNano()
-		for i := range b {
-			b[i] = byte(ts >> (8 * (i % 8)))
-		}
-	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-// directWriteUserTurn appends a synthetic user turn + updated last-prompt
-// pointer directly to the target session's JSONL, bypassing claude
-// --resume --print. Used when the post-compact context size would trigger
-// autocompact-on-load and divert the headless response. The sync hook
-// surfaces the dangling user turn to the live pane on the user's next
-// interaction (framed as "no auto reply — request still pending"), and
-// the live claude (with proper live context) handles it correctly.
-//
-// Schema mirrors what CC itself writes. The `version` field is sampled
-// from the most recent live turn in the JSONL so direct-writes track
-// whatever CC version is currently touching the file. flock-protected
-// against concurrent writers.
-func directWriteUserTurn(jsonlPath, sessionID, cwd, text string) error {
-	f, err := os.OpenFile(jsonlPath, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("open jsonl: %w", err)
-	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
-	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-
-	leaf, ccVersion, err := lastLeafAndVersion(jsonlPath)
-	if err != nil {
-		return fmt.Errorf("find leaf: %w", err)
-	}
-
-	newUUID := genUUID4()
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-
-	userTurn := map[string]any{
-		"isSidechain":    false,
-		"promptId":       genUUID4(),
-		"type":           "user",
-		"message":        map[string]any{"role": "user", "content": text},
-		"uuid":           newUUID,
-		"timestamp":      timestamp,
-		"permissionMode": "bypassPermissions",
-		"userType":       "external",
-		"entrypoint":     "sdk-cli",
-		"cwd":            cwd,
-		"gitBranch":      "HEAD",
-	}
-	if ccVersion != "" {
-		userTurn["version"] = ccVersion
-	}
-	userTurn["sessionId"] = sessionID
-	if leaf == "" {
-		userTurn["parentUuid"] = nil
-	} else {
-		userTurn["parentUuid"] = leaf
-	}
-
-	lastPrompt := map[string]any{
-		"type":       "last-prompt",
-		"lastPrompt": text,
-		"leafUuid":   newUUID,
-		"sessionId":  sessionID,
-	}
-
-	enc := json.NewEncoder(f)
-	if err := enc.Encode(userTurn); err != nil {
-		return fmt.Errorf("write user turn: %w", err)
-	}
-	if err := enc.Encode(lastPrompt); err != nil {
-		return fmt.Errorf("write last-prompt: %w", err)
-	}
-	return nil
-}
-
-// waitForQuiet defers until the target JSONL has been stable for
-// m.collisionWait, or aborts the wait at m.collisionMax. JSONL writes from
-// the user's live `claude` process come in bursts (assistant streaming, tool
-// chains); waiting for a quiet window minimizes the chance our headless
-// inject interleaves mid-turn with their writes. Returns waited duration and
-// whether we hit the timeout.
-func (m *Mayor) waitForQuiet(jsonlPath string) (time.Duration, bool) {
-	if m.collisionWait <= 0 || jsonlPath == "" {
-		return 0, false
-	}
-	start := time.Now()
-	var lastSize int64 = -1
-	var stableSince time.Time
-	for {
-		info, err := os.Stat(jsonlPath)
-		if err != nil {
-			// missing JSONL = nothing to collide with; proceed.
-			return time.Since(start), false
-		}
-		if info.Size() != lastSize {
-			lastSize = info.Size()
-			stableSince = time.Now()
-		} else if time.Since(stableSince) >= m.collisionWait {
-			return time.Since(start), false
-		}
-		if time.Since(start) >= m.collisionMax {
-			return time.Since(start), true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (m *Mayor) inject(sid, cwd, text string) error {
-	cmd := exec.Command("claude", "--resume", sid, "--print", text)
-	// `claude --resume <sid>` resolves the JSONL relative to cwd. Without
-	// this, the resolver looks under the wrong project dir and fails with
-	// "No conversation found". State.Cwd is recorded by the watcher from the
-	// session's own JSONL events.
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	// `--print` still reads stdin if attached to a tty; without /dev/null
-	// the headless inject hangs ~3s waiting on user input, even though
-	// `text` is already on the command line. See INJECTION.md gotchas.
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		return fmt.Errorf("open /dev/null: %w", err)
-	}
-	defer devNull.Close()
-	cmd.Stdin = devNull
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("claude --resume --print: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "  ↳ injected (cwd=%s), %d bytes assistant reply\n", cwd, len(out))
-	return nil
-}
-
 // --- Phase 3: completion-report tracking ---
 
 // trackInject records that we just sent text to target's live pane (via tmux
@@ -1450,11 +988,11 @@ func (m *Mayor) inject(sid, cwd, text string) error {
 // Re-tracking the same session overwrites the prior record. This is the
 // right behavior for "user injected B before A finished": A's report is
 // dropped (the user has moved on), and we now wait for B's completion.
-func (m *Mayor) trackInject(target SessionEntry, text, narrate string) {
+func (m *Mayor) trackInject(target watcherclient.SessionEntry, text, narrate string) {
 	if target.State.SessionID == "" || target.JSONLPath == "" {
 		return
 	}
-	sz, _ := fileSize(target.JSONLPath)
+	sz, _ := settle.FileSize(target.JSONLPath)
 	now := time.Now()
 	m.pendingMu.Lock()
 	defer m.pendingMu.Unlock()
@@ -1490,14 +1028,6 @@ func (m *Mayor) removePending(sessionID string) {
 	// expiry, interruption). No-op in stage for sessions it never highlighted.
 	m.stageWrite(map[string]any{"type": "restore", "session_id": sessionID, "project": proj})
 	go m.publishState()
-}
-
-func fileSize(path string) (int64, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
 }
 
 // pollCompletions runs forever, ticking every 3 s and checking each pending
@@ -1544,7 +1074,7 @@ func (m *Mayor) checkOneInject(p *pendingInject) {
 		m.removePending(p.sessionID)
 		return
 	}
-	sz, err := fileSize(p.jsonlPath)
+	sz, err := settle.FileSize(p.jsonlPath)
 	if err != nil {
 		return
 	}
@@ -1575,7 +1105,7 @@ func (m *Mayor) checkOneInject(p *pendingInject) {
 		m.removePending(p.sessionID)
 		return
 	}
-	text, ready, err := assistantTextAfterInject(p.jsonlPath, p.sizeAtInject, p.injectText)
+	text, ready, err := settle.AssistantTextAfterInject(p.jsonlPath, p.sizeAtInject, p.injectText)
 	if err != nil || !ready {
 		return
 	}
@@ -1595,7 +1125,7 @@ func (m *Mayor) checkOneInject(p *pendingInject) {
 // when an inject queued behind unrelated work.
 func (m *Mayor) fireCompletion(p *pendingInject) {
 	defer m.removePending(p.sessionID)
-	defer m.stopBlink(p, doneTag(p.project), "colour46", 2*time.Second)
+	defer m.stopBlink(p, inject.DoneTag(p.project), "colour46", 2*time.Second)
 	lastText := strings.TrimSpace(p.candidateText)
 	if lastText == "" {
 		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: empty candidate text for %s, skipping\n", p.project)
@@ -1710,7 +1240,7 @@ func (m *Mayor) runArcRefresher() {
 }
 
 func (m *Mayor) refreshArcs() {
-	sessions, err := fetchSessions(m.sockPath)
+	sessions, err := watcherclient.FetchSessions(m.sockPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\033[2m  arc-refresher: watcher fetch failed: %v\033[0m\n", err)
 		return
@@ -1760,116 +1290,6 @@ func (m *Mayor) enrichWithArc(s *llm.State) {
 	if arc, ok := m.arcSummaries[s.SessionID]; ok && arc != "" {
 		s.SessionArc = arc
 	}
-}
-
-// assistantTextAfterInject scans the JSONL forward from fromOff and returns
-// the text of the last assistant block that follows a user message
-// containing injectText. ready=false means inject hasn't surfaced as a user
-// message yet (still queued behind unrelated work) OR the most recent
-// assistant block after our user-message is still tool_use/thinking
-// (chain in progress) — caller should keep polling.
-//
-// The user-message gate is what makes this correct under "inject queued
-// behind a previous task": pre-inject assistant text is ignored even if
-// it's freshly written, because it predates our user message.
-//
-// CC stores actual user input as message.content="<string>"; tool_results
-// arrive as content=[{"type":"tool_result",...}]. We only match string-form
-// user content — tool_results never carry our injectText anyway.
-//
-// fromOff is sizeAtInject (the JSONL size when the inject went out). We
-// rely on json.Valid to drop any partial line we land in mid-record.
-func assistantTextAfterInject(jsonlPath string, fromOff int64, injectText string) (string, bool, error) {
-	needle := strings.ToLower(strings.TrimSpace(injectText))
-	if needle == "" {
-		return "", false, nil
-	}
-	f, err := os.Open(jsonlPath)
-	if err != nil {
-		return "", false, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", false, err
-	}
-	seekFrom := fromOff
-	if seekFrom > info.Size() {
-		return "", false, nil
-	}
-	if _, err := f.Seek(seekFrom, 0); err != nil {
-		return "", false, err
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	userSeen := false
-	var lastAssistantLine []byte
-	for sc.Scan() {
-		line := sc.Bytes()
-		if !json.Valid(line) {
-			continue
-		}
-		if bytes.Contains(line, []byte(`"type":"user"`)) {
-			var ev struct {
-				Type    string `json:"type"`
-				Message struct {
-					Content json.RawMessage `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(line, &ev) != nil || ev.Type != "user" {
-				continue
-			}
-			var s string
-			if json.Unmarshal(ev.Message.Content, &s) != nil {
-				continue // array form (tool_result), not human input
-			}
-			if strings.Contains(strings.ToLower(s), needle) {
-				userSeen = true
-				lastAssistantLine = nil
-			}
-			continue
-		}
-		if !userSeen {
-			continue
-		}
-		if !bytes.Contains(line, []byte(`"type":"assistant"`)) {
-			continue
-		}
-		cp := make([]byte, len(line))
-		copy(cp, line)
-		lastAssistantLine = cp
-	}
-	if err := sc.Err(); err != nil {
-		return "", false, err
-	}
-	if !userSeen || lastAssistantLine == nil {
-		return "", false, nil
-	}
-	var ev struct {
-		Type    string `json:"type"`
-		Message struct {
-			Content json.RawMessage `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.Unmarshal(lastAssistantLine, &ev); err != nil {
-		return "", false, err
-	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(ev.Message.Content, &blocks); err == nil && len(blocks) > 0 {
-		last := blocks[len(blocks)-1]
-		if last.Type == "text" {
-			return last.Text, true, nil
-		}
-		return "", false, nil // tool_use / thinking — chain still running
-	}
-	var s string
-	if err := json.Unmarshal(ev.Message.Content, &s); err == nil {
-		return s, true, nil
-	}
-	return "", false, nil
 }
 
 // --- helpers ---
@@ -1945,7 +1365,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "log proposals but do not exec claude --resume --print")
 	collisionWait := flag.Duration("collision-wait", 500*time.Millisecond, "JSONL must be size-stable for this long before injecting")
 	collisionMax := flag.Duration("collision-max", 5*time.Second, "give up waiting and inject anyway after this")
-	confThreshold := flag.Float64("conf-threshold", 0.5, "skip inject if router or expander confidence < this; 0 disables")
+	confThreshold := flag.Float64("conf-threshold", 0.5, "skip inject if router or expander confidence <= this (must exceed to proceed); 0 disables")
 	injectDirectTokens := flag.Int("inject-direct-threshold", 80000, "if est. tokens since last isCompactSummary in target JSONL exceed this, skip headless `claude --resume --print` and write user turn directly to JSONL (let sync hook + live pane handle); 0 disables direct-write path. 80k is conservative for typical Sonnet/Opus context budgets — lower if you see autocompact-divert symptoms (e.g. mayor logs `injected, N bytes` but the assistant's reply is unrelated to the inject)")
 	audioSock := flag.String("audio-sock", "", "if set, listen on this Unix socket for line-delimited JSON utterances from saturday-audio (V0.2 sidecar) instead of reading stdin. Empty = stdin mode.")
 	cacheMax := flag.Int("cache-max", 1000, "max files in --cache dir; oldest by mtime are pruned on startup. Open-mic accumulates ~2 cache files per utterance (one route + one expand); 1000 ≈ a few weeks of normal use. 0 disables pruning.")

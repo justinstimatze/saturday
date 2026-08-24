@@ -3,11 +3,15 @@ go 1.26
 use (
 	./eval
 	./eval/router
+	./inject
 	./llmcore
+	./saturday-backend
 	./saturday-hook
 	./saturday-mayor
 	./saturday-stage
 	./saturday-thinking
+	./settle
 	./sync
 	./watcher
+	./watcherclient
 )

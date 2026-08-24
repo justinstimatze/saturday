@@ -45,7 +45,7 @@ import (
 )
 
 // Command is one instruction from mayor. PaneID is a tmux pane id (e.g. %5)
-// resolved on mayor's side via findTmuxPane; the tmux backend uses it to
+// resolved on mayor's side via inject.FindTmuxPane; the tmux backend uses it to
 // locate the window/session. Conf is informational — mayor only emits focus
 // after an inject has already passed its confidence gate, so by the time a
 // command arrives it is confident by construction; Level lets a caller ask

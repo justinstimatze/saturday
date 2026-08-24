@@ -19,6 +19,7 @@ jobs:
           cache-dependency-path: |
             saturday-mayor/go.sum
             saturday-thinking/go.sum
+            saturday-backend/go.sum
 
       # The `make ci` target runs gofmt + vet + test -race + build in the
       # same per-module loop as the .githooks/pre-commit hook, so the

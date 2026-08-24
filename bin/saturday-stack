@@ -15,6 +15,11 @@
 #                 saturday-audio/.venv
 #   SOCK          default /tmp/saturday-audio.sock — mayor↔audio Unix socket
 #   AUDIO_VENV    default $SATURDAY_DIR/saturday-audio/.venv
+#   DRIVE_FOLDER_ID       required — the Drive folder Claude's voice-mode
+#                         connector writes notes to (saturday-backend's
+#                         phone-voice relay leg; see saturday-backend/README.md
+#                         for the one-time Google Cloud / --drive-login setup)
+#   BACKEND_POLL_INTERVAL default 5s — how often saturday-backend polls Drive
 
 set -euo pipefail
 
@@ -39,6 +44,15 @@ AUDIO_PIDFILE="$XDG_RUNTIME_DIR_RESOLVED/saturday-audio.pid"
 STAGE_SOCK="${STAGE_SOCK:-/tmp/saturday-stage.sock}"
 STAGE_LOG="$XDG_STATE_HOME_RESOLVED/saturday/stage.log"
 STAGE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-stage.pid"
+
+# Headless backend, same shape as watcher/stage — Drive-relay poller for
+# phone voice mode (SATURDAY-VOICE-NATIVE.md §2). No sane default for
+# DRIVE_FOLDER_ID — it's the user's own private Drive folder id, not
+# something to bake into a tracked script. Required, hard-fail if unset.
+DRIVE_FOLDER_ID="${DRIVE_FOLDER_ID:-}"
+BACKEND_POLL_INTERVAL="${BACKEND_POLL_INTERVAL:-5s}"
+BACKEND_LOG="$XDG_STATE_HOME_RESOLVED/saturday/backend.log"
+BACKEND_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-backend.pid"
 
 # check_audio_venv — verify saturday-audio/.venv is usable. Two failure
 # modes have bitten us in practice:
@@ -112,11 +126,14 @@ case "${1:-}" in
         if ! command -v tmux >/dev/null 2>&1; then
             echo "saturday-stack: tmux missing (apt install tmux)" >&2; rc=1
         fi
-        for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking; do
+        for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking saturday-backend; do
             if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
                 echo "saturday-stack: $bin not found on PATH or ~/go/bin" >&2; rc=1
             fi
         done
+        if [ -z "$DRIVE_FOLDER_ID" ]; then
+            echo "saturday-stack: DRIVE_FOLDER_ID not set — backend leg won't start (export it, see saturday-backend/README.md)" >&2
+        fi
         if [ ! -d "$AUDIO_DIR" ]; then
             echo "saturday-stack: audio dir missing: $AUDIO_DIR" >&2; rc=1
         elif [ ! -f "$AUDIO_VENV/bin/activate" ]; then
@@ -149,6 +166,14 @@ case "${1:-}" in
                 kill "$SPID" 2>/dev/null && echo "saturday-stack: stage (pid $SPID) killed."
             fi
             rm -f "$STAGE_PIDFILE"
+        fi
+        # Kill headless backend (same shape as watcher/stage above).
+        if [ -f "$BACKEND_PIDFILE" ]; then
+            BPID=$(cat "$BACKEND_PIDFILE" 2>/dev/null)
+            if [ -n "$BPID" ] && kill -0 "$BPID" 2>/dev/null; then
+                kill "$BPID" 2>/dev/null && echo "saturday-stack: backend (pid $BPID) killed."
+            fi
+            rm -f "$BACKEND_PIDFILE"
         fi
         exit 0
         ;;
@@ -215,12 +240,18 @@ fi
 if ! check_audio_venv; then
     exit 1
 fi
-for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking; do
+for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking saturday-backend; do
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
         echo "saturday-stack: $bin not found on PATH or in ~/go/bin" >&2
         exit 1
     fi
 done
+if [ -z "$DRIVE_FOLDER_ID" ]; then
+    echo "saturday-stack: DRIVE_FOLDER_ID not set." >&2
+    echo "  export DRIVE_FOLDER_ID=<id of the Drive folder Claude's voice-mode connector writes notes to>" >&2
+    echo "  (one-time Google Cloud / --drive-login setup: saturday-backend/README.md)" >&2
+    exit 1
+fi
 
 # V0.2.6 layout: mayor takes the big left column ("most interesting and
 # relevant log"); right column splits into thinking (top, FUI cognitive-state
@@ -252,6 +283,14 @@ mkdir -p "$(dirname "$STAGE_LOG")"
 ~/go/bin/saturday-stage --sock "$STAGE_SOCK" >> "$STAGE_LOG" 2>&1 &
 echo $! > "$STAGE_PIDFILE"
 echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log → $STAGE_LOG"
+
+# Headless backend — phone-voice Drive relay. Same "headless services first"
+# block as watcher/stage; only needs the watcher socket, no ordering
+# dependency on mayor.
+mkdir -p "$(dirname "$BACKEND_LOG")"
+~/go/bin/saturday-backend --drive-folder-id "$DRIVE_FOLDER_ID" --poll-interval "$BACKEND_POLL_INTERVAL" >> "$BACKEND_LOG" 2>&1 &
+echo $! > "$BACKEND_PIDFILE"
+echo "saturday-stack: backend running headless (pid $(cat "$BACKEND_PIDFILE")), log → $BACKEND_LOG"
 
 tmux new-session -d -s "$SESSION" -n "stack" \
     "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK' --stage-sock '$STAGE_SOCK' --stage-tile"
