@@ -63,6 +63,14 @@ type session struct {
 	utteranceMu  sync.Mutex
 	utteranceBuf strings.Builder
 
+	// specFired/specSnapshot track a speculative reply already in flight
+	// (fired from ActionBeginFlush, before the pause is confirmed) — see
+	// runSTTLoop's ActionResponseReady case. Guarded by utteranceMu since
+	// they're part of the same "what has the user said so far" state as
+	// utteranceBuf.
+	specFired    bool
+	specSnapshot string
+
 	// genMu guards generation (bumped on every interrupt, so a stale
 	// respond() call can tell it's been superseded and skip its
 	// now-irrelevant EndResponse) and activeTTS (the current turn's TTS
@@ -258,9 +266,48 @@ func (s *session) runSTTLoop() error {
 			switch action := s.tt.OnStep(prs2); action {
 			case moshiclient.ActionBeginFlush:
 				log.Printf("turn-taking: begin flush (prs2=%.3f)", prs2)
+				// Fire preemptive generation here, not at
+				// ActionResponseReady: this is the earliest point the
+				// turn-taking model itself considers a pause likely (the
+				// same prs2>0.6 crossing that will, ~STTDelaySec later,
+				// confirm the pause) — starting orchestrator.Handle now
+				// overlaps its classify/route/expand network calls with
+				// the flush wait instead of paying for both in sequence.
+				// See ActionResponseReady below for the staleness check.
+				if snap := s.peekUtterance(); strings.TrimSpace(snap) != "" {
+					s.utteranceMu.Lock()
+					s.specFired = true
+					s.specSnapshot = snap
+					s.utteranceMu.Unlock()
+					log.Printf("turn-taking: firing speculative reply on %q", snap)
+					go s.respondSpeculative(snap)
+				}
 				s.flushSTT()
 			case moshiclient.ActionResponseReady:
 				utterance := s.takeUtterance()
+				s.utteranceMu.Lock()
+				specFired, specSnap := s.specFired, s.specSnapshot
+				s.specFired, s.specSnapshot = false, ""
+				s.utteranceMu.Unlock()
+				if specFired && specSnap == utterance {
+					// Nothing changed since the speculative call fired —
+					// let it run its course; orchestrator.Handle already
+					// speaks (or injects) from inside that goroutine, and
+					// its own EndResponse/state bookkeeping fires when it
+					// returns. Nothing more to do here.
+					log.Printf("turn-taking: response ready, speculative reply already covers %q", utterance)
+					continue
+				}
+				if specFired {
+					log.Printf("turn-taking: response ready, utterance grew past speculative snapshot (%q -> %q); invalidating and re-firing", specSnap, utterance)
+					// Bumps generation (so the speculative call's
+					// orchestrator.Handle sees cancelled()==true at its
+					// next checkpoint and stops short of speaking/
+					// injecting) and closes activeTTS in case the
+					// speculative call was fast enough to already be
+					// mid-speech on the stale, incomplete input.
+					s.cancelActive()
+				}
 				log.Printf("turn-taking: response ready, utterance=%q", utterance)
 				go s.respond(utterance)
 			case moshiclient.ActionInterrupt:
@@ -303,6 +350,15 @@ func (s *session) takeUtterance() string {
 	return t
 }
 
+// peekUtterance returns the utterance accumulated so far without clearing
+// it — used to snapshot a speculative-reply candidate at ActionBeginFlush,
+// before the pause is confirmed and takeUtterance() actually claims it.
+func (s *session) peekUtterance() string {
+	s.utteranceMu.Lock()
+	defer s.utteranceMu.Unlock()
+	return s.utteranceBuf.String()
+}
+
 // cancelActive bumps the generation counter (so any in-flight respond()
 // call knows its result is now stale) and closes the current turn's TTS
 // connection if one is open, which stops moshi-server mid-synthesis and
@@ -319,12 +375,39 @@ func (s *session) cancelActive() {
 	s.sendControl(map[string]any{"type": "interrupted"})
 }
 
-// respond calls the orchestrator for one utterance. The orchestrator
-// speaks any reply itself via the Speak callback (wired to s.speak) —
-// respond's own job is just to run Handle and, if this call hasn't been
-// superseded by an interrupt in the meantime, tell the turn-taking state
-// machine the bot's turn is over once Handle returns.
+// respond calls the orchestrator for one utterance whose pause has been
+// confirmed (ActionResponseReady already fired). See runReply.
 func (s *session) respond(utterance string) {
+	s.runReply(utterance, false)
+}
+
+// respondSpeculative calls the orchestrator early, on a snapshot of the
+// utterance taken at ActionBeginFlush — before the pause is confirmed —
+// so its network calls overlap the flush wait instead of following it.
+// See runSTTLoop's ActionBeginFlush/ActionResponseReady handling and
+// runReply.
+func (s *session) respondSpeculative(utterance string) {
+	s.runReply(utterance, true)
+}
+
+// runReply calls the orchestrator for one utterance. The orchestrator
+// speaks any reply (or commits an inject) itself via the Speak callback
+// (wired to s.speak) and the cancelled closure passed to Handle —
+// runReply's own job is to run Handle and, if this call hasn't been
+// superseded by an interrupt or a discovered-stale speculative snapshot
+// in the meantime, tell the turn-taking state machine the bot's turn is
+// over once Handle returns.
+//
+// cancelled is built from the generation counter already used for
+// interrupt-cancellation (see cancelActive) — it also doubles as the
+// staleness check for a speculative call whose snapshot turned out
+// incomplete (see runSTTLoop's ActionResponseReady case, which bumps
+// generation via cancelActive before firing a fresh respond call).
+// Passing it into Handle means a superseded call stops at its next
+// checkpoint inside the orchestrator — before speaking or committing an
+// inject to a live session — rather than only being noticed here, after
+// the fact, once it's too late to un-speak or un-inject.
+func (s *session) runReply(utterance string, speculative bool) {
 	if strings.TrimSpace(utterance) == "" {
 		return
 	}
@@ -333,21 +416,28 @@ func (s *session) respond(utterance string) {
 	s.generation++
 	myGen := s.generation
 	s.genMu.Unlock()
+	cancelled := func() bool {
+		s.genMu.Lock()
+		defer s.genMu.Unlock()
+		return s.generation != myGen
+	}
+
+	tag := "respond"
+	if speculative {
+		tag = "respond(speculative)"
+	}
 
 	s.sendControl(map[string]any{"type": "state", "value": "thinking"})
 
-	log.Printf("respond: calling orchestrator.Handle(%q)", utterance)
-	reply, err := s.orch.Handle(utterance, "expand", "auto")
+	log.Printf("%s: calling orchestrator.Handle(%q)", tag, utterance)
+	reply, err := s.orch.Handle(utterance, "expand", "auto", cancelled)
 	if err != nil {
 		log.Printf("orchestrator.Handle: %v", err)
 	} else {
-		log.Printf("respond: orchestrator.Handle returned %+v", reply)
+		log.Printf("%s: orchestrator.Handle returned %+v", tag, reply)
 	}
 
-	s.genMu.Lock()
-	current := myGen == s.generation
-	s.genMu.Unlock()
-	if current {
+	if !cancelled() {
 		s.turnTaking().EndResponse()
 		s.sendControl(map[string]any{"type": "state", "value": "listening"})
 	}

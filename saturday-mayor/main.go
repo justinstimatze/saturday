@@ -309,7 +309,7 @@ func (m *Mayor) recordUtterance(text, mode, route string, conf float64) {
 // the same recordUtterance call the pre-extraction handle() made inline,
 // now driven by what Handle reports back.
 func (m *Mayor) dispatch(utterance, mode, narrate string) error {
-	dec, err := m.orch.Handle(utterance, mode, narrate)
+	dec, err := m.orch.Handle(utterance, mode, narrate, nil)
 	if dec != nil {
 		m.recordUtterance(utterance, dec.Mode, dec.Route, dec.Conf)
 	}

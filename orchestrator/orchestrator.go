@@ -251,14 +251,27 @@ func head(s string, n int) string {
 // "force"|"silent"|"auto" — controls whether a Phase 3 spoken completion
 // summary fires.
 //
+// cancelled, if non-nil, is polled at each natural checkpoint before an
+// externally-visible action (speaking, or committing an inject) — it
+// exists for a caller that starts Handle speculatively, on a transcript
+// that might still be growing, and needs to abandon a call whose input
+// turned out to be stale rather than let it speak or inject a reply to
+// incomplete input. nil means never cancelled (the normal case). Once a
+// checkpoint sees cancelled() return true, Handle stops short and returns
+// (nil, nil) rather than continuing — the caller's own generation counter
+// (whatever cancelled closes over) is authoritative, not Handle's.
+//
 // Returns a non-nil Decision for any utterance the caller should log to
 // its own presentation layer; nil means nothing to log (e.g. a
-// confidence-gated skip, or a fetch/router error).
-func (o *Orchestrator) Handle(utterance, mode, narrate string) (*Decision, error) {
+// confidence-gated skip, a cancelled call, or a fetch/router error).
+func (o *Orchestrator) Handle(utterance, mode, narrate string, cancelled func() bool) (*Decision, error) {
+	if cancelled == nil {
+		cancelled = func() bool { return false }
+	}
 	if mode != "verbatim" {
 		if cleaned, isAsk := stripWakeWord(utterance); isAsk {
 			fmt.Fprintf(os.Stderr, "\033[35m? ask\033[0m \033[2m(wake-word)\033[0m\n")
-			return o.answerAsk(cleaned)
+			return o.answerAsk(cleaned, cancelled)
 		}
 		// Classifier — Haiku call, ~$0.0001 per utterance. Errors fall
 		// through silently to inject; classifier is a UX optimization, not
@@ -268,13 +281,17 @@ func (o *Orchestrator) Handle(utterance, mode, narrate string) (*Decision, error
 			if t == "ask" && conf >= o.cfg.AskConf {
 				fmt.Fprintf(os.Stderr, "\033[35m? ask\033[0m \033[2m(conf=%.2f — %s)\033[0m\n",
 					conf, oneLine(rat))
-				return o.answerAsk(utterance)
+				return o.answerAsk(utterance, cancelled)
 			}
 			if t == "ask" {
 				fmt.Fprintf(os.Stderr, "  \033[2m↳ classifier ask conf=%.2f below %.2f; treating as inject\033[0m\n",
 					conf, o.cfg.AskConf)
 			}
 		}
+	}
+
+	if cancelled() {
+		return nil, nil
 	}
 
 	o.emitState("routing")
@@ -297,7 +314,7 @@ func (o *Orchestrator) Handle(utterance, mode, narrate string) (*Decision, error
 		// only target.
 		dec := &Decision{Mode: mode, Route: live[0].State.Project, Conf: 0}
 		o.recordRecentUtterance(fmt.Sprintf("%s → %s (%s)", oneLine(utterance), dec.Route, dec.Mode))
-		return dec, o.expandAndInject(utterance, live[0], mode, narrate)
+		return dec, o.expandAndInject(utterance, live[0], mode, narrate, cancelled)
 	}
 
 	cands := make([]llm.State, len(live))
@@ -326,14 +343,14 @@ func (o *Orchestrator) Handle(utterance, mode, narrate string) (*Decision, error
 	}
 	dec := &Decision{Mode: mode, Route: target.State.Project, Conf: conf}
 	o.recordRecentUtterance(fmt.Sprintf("%s → %s (%s)", oneLine(utterance), dec.Route, dec.Mode))
-	return dec, o.expandAndInject(utterance, target, mode, narrate)
+	return dec, o.expandAndInject(utterance, target, mode, narrate, cancelled)
 }
 
 // answerAsk is the ask-mode path: gather Saturday's bird's-eye state
 // (arcs, recent utterances, in-flight injects) and call llm.RunAsk to
 // produce a brief spoken answer. No pendingInject is created — ask is a
 // terminal action.
-func (o *Orchestrator) answerAsk(utterance string) (*Decision, error) {
+func (o *Orchestrator) answerAsk(utterance string, cancelled func() bool) (*Decision, error) {
 	o.emitState("asking")
 	defer o.emitState("")
 
@@ -383,6 +400,10 @@ func (o *Orchestrator) answerAsk(utterance string) (*Decision, error) {
 		oneLine(utterance), reply)
 
 	o.recordRecentUtterance(fmt.Sprintf("%s → saturday (ask)", oneLine(utterance)))
+	if cancelled() {
+		fmt.Fprintln(os.Stderr, "  ↳ ask reply superseded before speaking; discarding")
+		return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
+	}
 	o.speak(reply)
 	return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
 }
@@ -392,10 +413,14 @@ func (o *Orchestrator) answerAsk(utterance string) (*Decision, error) {
 // both expand-mode (after the expander returns action=inject) and
 // verbatim-mode (utterance text becomes the inject directly, narration
 // empty).
-func (o *Orchestrator) commitInject(target watcherclient.SessionEntry, text, narration, narrate string) error {
+func (o *Orchestrator) commitInject(target watcherclient.SessionEntry, text, narration, narrate string, cancelled func() bool) error {
 	o.emitState("injecting → " + target.State.Project)
 	if o.cfg.DryRun {
 		fmt.Fprintln(os.Stderr, "  [dry-run; skipping exec]")
+		return nil
+	}
+	if cancelled() {
+		fmt.Fprintln(os.Stderr, "  ↳ inject superseded before commit; skipping")
 		return nil
 	}
 	if narration != "" {
@@ -409,6 +434,14 @@ func (o *Orchestrator) commitInject(target watcherclient.SessionEntry, text, nar
 			tag = "timed-out"
 		}
 		fmt.Fprintf(os.Stderr, "  ↳ collision-window %s after %s\n", tag, waited.Round(time.Millisecond))
+	}
+	if cancelled() {
+		// Superseded during the collision-wait — text was built from an
+		// utterance that's since grown or been interrupted; injecting it
+		// now would land a wrong or incomplete instruction in a live
+		// coding session, worse than just staying silent.
+		fmt.Fprintln(os.Stderr, "  ↳ inject superseded during collision-wait; skipping")
+		return nil
 	}
 	// Path selection (preferred → fallback):
 	// 1. Target's claude is running in a tmux pane → tmux send-keys.
@@ -463,14 +496,17 @@ func (o *Orchestrator) commitInject(target watcherclient.SessionEntry, text, nar
 	return nil
 }
 
-func (o *Orchestrator) expandAndInject(utterance string, target watcherclient.SessionEntry, mode, narrate string) error {
+func (o *Orchestrator) expandAndInject(utterance string, target watcherclient.SessionEntry, mode, narrate string, cancelled func() bool) error {
 	if mode == "verbatim" {
 		// Verbatim mode: utterance text becomes the inject directly. No
 		// expander LLM call, no narration speak event — the caller's
 		// instant stock ack is the audible feedback.
 		fmt.Fprintf(os.Stderr, "\033[1;33m→ Saturday → %s\033[0m \033[2m(verbatim)\033[0m: \033[33m%s\033[0m\n",
 			target.State.Project, oneLine(utterance))
-		return o.commitInject(target, utterance, "", narrate)
+		return o.commitInject(target, utterance, "", narrate, cancelled)
+	}
+	if cancelled() {
+		return nil
 	}
 	o.emitState("expanding")
 	o.enrichWithArc(&target.State)
@@ -490,9 +526,12 @@ func (o *Orchestrator) expandAndInject(utterance string, target watcherclient.Se
 			return nil
 		}
 		text = inject.WithCallsignRule(text)
-		return o.commitInject(target, text, getStr(exp, "confirmation"), narrate)
+		return o.commitInject(target, text, getStr(exp, "confirmation"), narrate, cancelled)
 	case "ask":
 		fmt.Fprintf(os.Stderr, "\033[1;35m? expander asks\033[0m \033[2m(%s)\033[0m: %s\n", target.State.Project, oneLine(text))
+		if cancelled() {
+			return nil
+		}
 		o.speak(text)
 		return nil
 	case "decline":
