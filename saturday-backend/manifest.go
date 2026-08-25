@@ -9,26 +9,56 @@ import (
 
 	"google.golang.org/api/drive/v3"
 
+	"saturday/inject"
 	"saturday/watcherclient"
 )
 
 // buildManifestContent renders the live-session inventory voice mode is
-// meant to check before naming a session in a note — plain text, one line
-// per session, sorted by project name so re-renders diff cleanly. now is
-// passed in rather than read via time.Now() so this stays a pure, testable
-// function (same reasoning as buildQuery's since parameter).
-func buildManifestContent(sessions []watcherclient.SessionEntry, now time.Time) string {
+// meant to check before naming a session in a note. Split into two lists,
+// not one: watcher considers a session "live" purely from recent JSONL
+// activity, which says nothing about whether saturday-backend can actually
+// reach it via a tmux pane right now — a session with no pane still gets a
+// real inject (commitInject falls back to direct-write/headless), just not
+// a live-interactive one. Hiding those entirely would drop real, working
+// targets from the inventory; folding them into one undifferentiated list
+// would misrepresent what "live" means. tmuxLive is keyed by cwd (the same
+// key inject.FindTmuxPane matches on), built by the caller since the tmux
+// lookup itself is a live system call, not something this pure function
+// should perform — same reasoning as buildQuery's since parameter for now.
+func buildManifestContent(sessions []watcherclient.SessionEntry, tmuxLive map[string]bool, now time.Time) string {
+	var tmux, headlessOnly []watcherclient.SessionEntry
+	for _, s := range sessions {
+		if tmuxLive[s.State.Cwd] {
+			tmux = append(tmux, s)
+		} else {
+			headlessOnly = append(headlessOnly, s)
+		}
+	}
+	sort.Slice(tmux, func(i, j int) bool { return tmux[i].State.Project < tmux[j].State.Project })
+	sort.Slice(headlessOnly, func(i, j int) bool { return headlessOnly[i].State.Project < headlessOnly[j].State.Project })
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "Saturday session inventory — updated %s, %d live.\n",
-		now.UTC().Format(time.RFC3339), len(sessions))
+	fmt.Fprintf(&b, "Saturday session inventory — updated %s, %d live (%d reachable now, %d headless-only).\n",
+		now.UTC().Format(time.RFC3339), len(sessions), len(tmux), len(headlessOnly))
 	fmt.Fprintln(&b, "Say the exact project name below to route a note to that session.")
 	b.WriteString("\n")
 
-	sorted := make([]watcherclient.SessionEntry, len(sessions))
-	copy(sorted, sessions)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].State.Project < sorted[j].State.Project })
+	b.WriteString("Reachable now — live, interactive tmux pane:\n")
+	writeManifestSessions(&b, tmux)
+	b.WriteString("\n")
 
-	for _, s := range sorted {
+	b.WriteString("Live but no tmux pane right now — still routable, runs as a one-shot headless reply instead of live:\n")
+	writeManifestSessions(&b, headlessOnly)
+
+	return b.String()
+}
+
+func writeManifestSessions(b *strings.Builder, sessions []watcherclient.SessionEntry) {
+	if len(sessions) == 0 {
+		b.WriteString("  (none)\n")
+		return
+	}
+	for _, s := range sessions {
 		summary := s.State.SessionArc
 		if summary == "" {
 			summary = s.State.LastAssistantText
@@ -36,9 +66,8 @@ func buildManifestContent(sessions []watcherclient.SessionEntry, now time.Time) 
 		if summary == "" {
 			summary = "(no summary yet)"
 		}
-		fmt.Fprintf(&b, "%s — %s\n", s.State.Project, oneLine(summary, 140))
+		fmt.Fprintf(b, "  %s — %s\n", s.State.Project, oneLine(summary, 140))
 	}
-	return b.String()
 }
 
 // ensureManifest finds the manifest file by name in folderID, creating it
@@ -79,12 +108,17 @@ func refreshManifest(ctx context.Context, d *driveClient, sockPath string) (int,
 		return 0, fmt.Errorf("fetch sessions: %w", err)
 	}
 	live := make([]watcherclient.SessionEntry, 0, len(sessions))
+	tmuxLive := make(map[string]bool, len(sessions))
 	for _, s := range sessions {
-		if s.State.SessionID != "" {
-			live = append(live, s)
+		if s.State.SessionID == "" {
+			continue
+		}
+		live = append(live, s)
+		if s.State.Cwd != "" && inject.FindTmuxPane(s.State.Cwd) != "" {
+			tmuxLive[s.State.Cwd] = true
 		}
 	}
-	content := buildManifestContent(live, time.Now())
+	content := buildManifestContent(live, tmuxLive, time.Now())
 	if err := d.writeManifest(ctx, content); err != nil {
 		return 0, fmt.Errorf("write manifest: %w", err)
 	}
