@@ -31,6 +31,15 @@
 #                                   # with --pellicle. For a known session id
 #                                   # instead of the picker, still use
 #                                   # CLAUDE_CMD='claude --resume <id>' add.
+#   saturday-cockpit add --resume-last <dir> [<dir> ...]
+#                                   # non-interactive: resolve each dir's
+#                                   # most-recently-modified session file
+#                                   # under ~/.claude/projects/<encoded-dir>/
+#                                   # and pass it straight through as
+#                                   # `claude --resume <id>` — no picker.
+#                                   # A dir with no prior session starts
+#                                   # fresh instead of failing the batch.
+#                                   # Mutually exclusive with --resume.
 #   saturday-cockpit add --dangerously-skip-permissions <dir> [<dir> ...]
 #                                   # pass the flag straight through to claude
 #                                   # for that pane. Composes with --pellicle
@@ -62,12 +71,95 @@ SESSION="${COCKPIT:-cc-cockpit}"
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
 LAYOUT="${COCKPIT_TILE:-even-horizontal}"
 
+# Alt+letter pane-jump keys for panes 10+ (Alt+1..9 covers panes 1-9, Alt+0
+# is the overview reset — see bind_hotkeys). Ordered by physical proximity
+# to the left Alt key itself, skipping b/c/d/f/l/r/t/u/y: those are
+# readline's default Meta-letter word-navigation bindings (forward/
+# backward-word, kill-word, ...) in every bash/zsh pane, and these are
+# root-table, global-to-server binds, not just Saturday's. One array feeds
+# both bind_hotkeys (the actual keybinding) and the pane-border label below
+# it, so the two can't drift apart.
+COCKPIT_HOTKEY_LETTERS=(z s x a w q v e)
+
+# wait_pane_settled polls a pane's rendered content until it stops changing
+# for two consecutive polls, or max_wait seconds elapse. Used between pane
+# launches: starting two `claude` processes within the same fraction of a
+# second races Claude Code's own startup project-identity bookkeeping — a
+# pane launched simultaneously with another has been observed to inherit
+# the OTHER pane's project name in its own status line (reproduced live,
+# 2026-08-24: a pellicle-free mcp-dispatch pane launched alongside a
+# basanite one showed "basanite" in its own status line and dispatch
+# identity until relaunched alone). Waiting for the previous pane's
+# startup rendering to finish before starting the next avoids the race
+# without guessing a fixed sleep duration. Never hard-fails the caller —
+# a timeout just means "settle-detection gave up," not "this pane is
+# broken," so add_pane's loop logs a warning and moves on regardless.
+wait_pane_settled() {
+    local pane="$1" max_wait="${2:-10}" poll=0.3
+    local iters=$(( (max_wait * 10) / 3 ))
+    local prev="" cur="" stable=0 i=0
+    while [ "$i" -lt "$iters" ]; do
+        cur="$(tmux capture-pane -t "$pane" -p 2>/dev/null || true)"
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+            stable=$((stable + 1))
+            [ "$stable" -ge 2 ] && return 0
+        else
+            stable=0
+        fi
+        prev="$cur"
+        sleep "$poll"
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # Split a new pane for $1 into the running session and re-balance. Shared by
 # the initial build loop and `add`, so a running cockpit and a fresh one grow
-# panes the same way.
+# panes the same way. Callers that launch more than one pane in a batch are
+# responsible for wait_pane_settled-ing between calls (see wait_pane_settled
+# above for why) — add_pane itself stays a single, fast, unconditional split
+# so callers that only ever add one pane at a time pay no extra latency.
 add_pane() {
-    tmux split-window -t "$SESSION" "cd '$1' && exec $CLAUDE_CMD"
+    local dir="$1" cmd="${2:-$CLAUDE_CMD}"
+    tmux split-window -t "$SESSION" "cd '$dir' && exec $cmd"
     tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+}
+
+# resolve_last_session prints the session id (jsonl basename) of the
+# most-recently-modified transcript for $1's project dir, or nothing (exit 1)
+# if the dir has no ~/.claude/projects/ entry or no session files yet.
+# Encoding matches watcher/main.go's encodedHomePrefix exactly: absolute
+# path, leading slash stripped, every remaining '/' turned into '-', whole
+# thing prefixed with '-' (verified against this host's own live
+# ~/.claude/projects/-home-gas6amus-Documents-saturday).
+resolve_last_session() {
+    local dir="$1" abs encoded projdir latest
+    abs="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+    encoded="-${abs#/}"
+    encoded="${encoded//\//-}"
+    projdir="$HOME/.claude/projects/$encoded"
+    [ -d "$projdir" ] || return 1
+    latest="$(find "$projdir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2-)"
+    [ -n "$latest" ] || return 1
+    basename "$latest" .jsonl
+}
+
+# resolved_cmd_for prints the command to launch for $1, given the caller's
+# already-parsed $resume_last flag and (possibly yolo-suffixed) $CLAUDE_CMD.
+# A dir with no resolvable prior session warns and falls back to a fresh
+# session rather than failing the whole batch — matches wait_pane_settled's
+# own warn-and-continue convention above.
+resolved_cmd_for() {
+    local dir="$1" sid
+    if [ "$resume_last" -eq 1 ]; then
+        if sid="$(resolve_last_session "$dir")" && [ -n "$sid" ]; then
+            echo "$CLAUDE_CMD --resume $sid"
+            return
+        fi
+        echo "saturday-cockpit: no prior session found for $dir, starting fresh" >&2
+    fi
+    echo "$CLAUDE_CMD"
 }
 
 # Same as add_pane, but the new slot is itself a nested pellicle pair — a
@@ -85,7 +177,7 @@ add_pane() {
 # turn, so this self-heals rather than staying broken — but there's a
 # window where it's wrong. Not fixed here; flagged instead.
 add_pane_pellicle() {
-    local dir="$1"
+    local dir="$1" cmd="${2:-$CLAUDE_CMD}"
     local pellicle_dir="${PELLICLE_DIR:-$HOME/Documents/pellicle}"
     if [ ! -x "$pellicle_dir/pellicle-pane-render.sh" ]; then
         echo "saturday-cockpit: --pellicle needs $pellicle_dir/pellicle-pane-render.sh (set PELLICLE_DIR?)" >&2
@@ -97,7 +189,7 @@ add_pane_pellicle() {
     fi
 
     local claude_pane_id
-    claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $CLAUDE_CMD")"
+    claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
@@ -124,6 +216,14 @@ bind_hotkeys() {
     for n in 1 2 3 4 5 6 7 8 9; do
         tmux bind-key -n "M-$n" run-shell "tmux select-pane -t $n ; tmux resize-pane -Z"
     done
+    # Alt+letter: same scheme, panes 10+, once a session outgrows the nine
+    # digits (M-0 is the overview reset above, not a tenth pane). See
+    # COCKPIT_HOTKEY_LETTERS above for why these letters and not others.
+    local pane=10
+    for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
+        tmux bind-key -n "M-$l" run-shell "tmux select-pane -t $pane ; tmux resize-pane -Z"
+        pane=$((pane + 1))
+    done
     # Un-zoom if zoomed, then always re-tile to even shares — stage's
     # proportionalTile leaves panes at an emphasis skew (resize-pane -x) that
     # zoom-checking alone doesn't touch, so without this second command M-0
@@ -136,6 +236,26 @@ bind_hotkeys() {
     # split; this is the same fix for the removal side. Verified live: without
     # it, killing 1 of 3 even-horizontal panes left 33/33/66; with it, 50/50.
     tmux set-hook -t "$SESSION" after-kill-pane "select-layout -t $SESSION $LAYOUT"
+}
+
+# pane_hotkey_label builds the tmux format expression for the pane-border
+# label: #{pane_index} is already the right label for panes 1-9 (that
+# number IS the Alt+N key), but for pane 10+ the border must show the
+# actual Alt+letter from COCKPIT_HOTKEY_LETTERS instead of the raw index,
+# or the label lies about which key selects that pane. A chain of
+# #{?#{==:...}} ternaries, built from the same array bind_hotkeys uses, so
+# label and binding can't drift apart. NOT #{if:...} — that reads as a
+# literal, unrecognized format function on tmux 3.6 (verified live: it
+# just dumps "if:1,YES,NO" instead of evaluating) — #{?cond,true,false} is
+# the real ternary, confirmed live nested 8 deep.
+pane_hotkey_label() {
+    local expr='#{pane_index}'
+    local pane=10
+    for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
+        expr="#{?#{==:#{pane_index},$pane},$l,$expr}"
+        pane=$((pane + 1))
+    done
+    echo "$expr"
 }
 
 case "${1:-}" in
@@ -166,11 +286,13 @@ case "${1:-}" in
         bind_hotkeys
         pellicle=0
         resume=0
+        resume_last=0
         yolo=0
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --pellicle) pellicle=1; shift ;;
                 --resume) resume=1; shift ;;
+                --resume-last) resume_last=1; shift ;;
                 --dangerously-skip-permissions) yolo=1; shift ;;
                 --) shift; break ;;
                 --*)
@@ -180,6 +302,10 @@ case "${1:-}" in
                 *) break ;;
             esac
         done
+        if [ "$resume" -eq 1 ] && [ "$resume_last" -eq 1 ]; then
+            echo "saturday-cockpit: --resume and --resume-last are mutually exclusive" >&2
+            exit 2
+        fi
         if [ "$resume" -eq 1 ]; then
             CLAUDE_CMD="$CLAUDE_CMD --resume"
         fi
@@ -187,7 +313,7 @@ case "${1:-}" in
             CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
         fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
             exit 2
         fi
         for d in "$@"; do
@@ -196,11 +322,21 @@ case "${1:-}" in
                 exit 1
             fi
         done
+        n="$#"; i=0
         for d in "$@"; do
+            i=$((i + 1))
+            dcmd="$(resolved_cmd_for "$d")"
             if [ "$pellicle" -eq 1 ]; then
-                add_pane_pellicle "$d"
+                add_pane_pellicle "$d" "$dcmd"
             else
-                add_pane "$d"
+                add_pane "$d" "$dcmd"
+            fi
+            # Only wait between launches, not after the last one — see
+            # wait_pane_settled's comment for why this matters.
+            if [ "$i" -lt "$n" ]; then
+                newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+                wait_pane_settled "$newpane" 10 ||
+                    echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
             fi
         done
         total="$(tmux list-panes -t "$SESSION" | wc -l)"
@@ -229,10 +365,12 @@ fi
 # its own pane-creation path that doesn't exist yet — launch plain, then
 # `add --pellicle` once the session is up.
 resume=0
+resume_last=0
 yolo=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume) resume=1; shift ;;
+        --resume-last) resume_last=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
         --pellicle)
             echo "saturday-cockpit: --pellicle only works with 'add' — launch plain, then: saturday-cockpit add --pellicle <dir>" >&2
@@ -246,6 +384,10 @@ while [ "$#" -gt 0 ]; do
         *) break ;;
     esac
 done
+if [ "$resume" -eq 1 ] && [ "$resume_last" -eq 1 ]; then
+    echo "saturday-cockpit: --resume and --resume-last are mutually exclusive" >&2
+    exit 2
+fi
 if [ "$resume" -eq 1 ]; then
     CLAUDE_CMD="$CLAUDE_CMD --resume"
 fi
@@ -254,8 +396,8 @@ if [ "$yolo" -eq 1 ]; then
 fi
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: saturday-cockpit [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
-    echo "       saturday-cockpit add [--pellicle] [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+    echo "usage: saturday-cockpit [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
     exit 2
 fi
@@ -270,21 +412,38 @@ done
 
 # First pane = first dir.
 first="$1"; shift
+firstcmd="$(resolved_cmd_for "$first")"
 tmux new-session -d -s "$SESSION" -n "cockpit" \
-    "cd '$first' && exec $CLAUDE_CMD"
+    "cd '$first' && exec $firstcmd"
 bind_hotkeys
 
 # Remaining dirs → one split each. Re-balance after every split so tmux always
-# has room for the next pane.
+# has room for the next pane. Staggered via wait_pane_settled — see its
+# comment above for why. The pane new-session just launched is a `claude`
+# startup too, so if there's at least one more dir queued, wait on it before
+# the first split — otherwise that split races the exact same way a second
+# add_pane call would.
+if [ "$#" -gt 0 ]; then
+    firstpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+    wait_pane_settled "$firstpane" 10 ||
+        echo "saturday-cockpit: warning: $first's pane didn't settle within 10s, continuing anyway" >&2
+fi
+n="$#"; i=0
 for d in "$@"; do
-    add_pane "$d"
+    i=$((i + 1))
+    add_pane "$d" "$(resolved_cmd_for "$d")"
+    if [ "$i" -lt "$n" ]; then
+        newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+        wait_pane_settled "$newpane" 10 ||
+            echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
+    fi
 done
 
 # Keep dead panes readable; show per-pane titles (basenames) along the top
 # border so the cockpit is legible and stage's title marker has a home.
 tmux set-option -t "$SESSION" remain-on-exit on
 tmux set-window-option -t "$SESSION" pane-border-status top
-tmux set-window-option -t "$SESSION" pane-border-format ' #{pane_index}:#{b:pane_current_path} '
+tmux set-window-option -t "$SESSION" pane-border-format " $(pane_hotkey_label):#{b:pane_current_path} "
 tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
