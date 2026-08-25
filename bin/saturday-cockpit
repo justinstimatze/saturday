@@ -44,6 +44,13 @@
 #                                   # pass the flag straight through to claude
 #                                   # for that pane. Composes with --pellicle
 #                                   # and --resume.
+#   saturday-cockpit add --title "Name" <dir>
+#                                   # label the pane border with "Name"
+#                                   # instead of the dir basename — for when
+#                                   # the dir name alone doesn't say what the
+#                                   # session is. Single-dir only (one title
+#                                   # can't label a whole batch); add panes
+#                                   # one at a time to title each.
 #   saturday-cockpit stop          # kill the cockpit window/session
 #   saturday-cockpit status        # list panes (pane_id, pid, cwd)
 #
@@ -120,8 +127,10 @@ wait_pane_settled() {
 # above for why) — add_pane itself stays a single, fast, unconditional split
 # so callers that only ever add one pane at a time pay no extra latency.
 add_pane() {
-    local dir="$1" cmd="${2:-$CLAUDE_CMD}"
-    tmux split-window -t "$SESSION" "cd '$dir' && exec $cmd"
+    local dir="$1" cmd="${2:-$CLAUDE_CMD}" title="${3:-}"
+    local pane_id
+    pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+    [ -n "$title" ] && tmux set-option -p -t "$pane_id" @cockpit_title "$title"
     tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 }
 
@@ -177,7 +186,7 @@ resolved_cmd_for() {
 # turn, so this self-heals rather than staying broken — but there's a
 # window where it's wrong. Not fixed here; flagged instead.
 add_pane_pellicle() {
-    local dir="$1" cmd="${2:-$CLAUDE_CMD}"
+    local dir="$1" cmd="${2:-$CLAUDE_CMD}" title="${3:-}"
     local pellicle_dir="${PELLICLE_DIR:-$HOME/Documents/pellicle}"
     if [ ! -x "$pellicle_dir/pellicle-pane-render.sh" ]; then
         echo "saturday-cockpit: --pellicle needs $pellicle_dir/pellicle-pane-render.sh (set PELLICLE_DIR?)" >&2
@@ -190,6 +199,7 @@ add_pane_pellicle() {
 
     local claude_pane_id
     claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+    [ -n "$title" ] && tmux set-option -p -t "$claude_pane_id" @cockpit_title "$title"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
@@ -258,6 +268,20 @@ pane_hotkey_label() {
     echo "$expr"
 }
 
+# apply_border_format (re)asserts the pane-border rendering options. Called
+# at initial launch and again from `add`, so a cockpit already running under
+# an older script version picks up border-format changes (e.g. --title
+# support below) live, without a full restart. The label falls back to the
+# dir basename unless the pane carries a @cockpit_title user option, set by
+# `add --title` — a plain #{pane_title} isn't used for this because Claude
+# Code's own terminal-title escape sequences would fight it.
+apply_border_format() {
+    tmux set-option -t "$SESSION" remain-on-exit on
+    tmux set-window-option -t "$SESSION" pane-border-status top
+    tmux set-window-option -t "$SESSION" pane-border-format \
+        " $(pane_hotkey_label):#{?@cockpit_title,#{@cockpit_title},#{b:pane_current_path}} "
+}
+
 case "${1:-}" in
     stop|down|kill)
         if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -284,16 +308,24 @@ case "${1:-}" in
             exit 1
         fi
         bind_hotkeys
+        apply_border_format
         pellicle=0
         resume=0
         resume_last=0
         yolo=0
+        title=""
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --pellicle) pellicle=1; shift ;;
                 --resume) resume=1; shift ;;
                 --resume-last) resume_last=1; shift ;;
                 --dangerously-skip-permissions) yolo=1; shift ;;
+                --title)
+                    if [ "$#" -lt 2 ]; then
+                        echo "saturday-cockpit: --title needs a value" >&2
+                        exit 2
+                    fi
+                    title="$2"; shift 2 ;;
                 --) shift; break ;;
                 --*)
                     echo "saturday-cockpit: unknown flag: $1" >&2
@@ -313,7 +345,11 @@ case "${1:-}" in
             CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
         fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--title <name>] <dir> [<dir> ...]" >&2
+            exit 2
+        fi
+        if [ -n "$title" ] && [ "$#" -gt 1 ]; then
+            echo "saturday-cockpit: --title only applies to a single <dir> — add panes one at a time to title each" >&2
             exit 2
         fi
         for d in "$@"; do
@@ -327,9 +363,9 @@ case "${1:-}" in
             i=$((i + 1))
             dcmd="$(resolved_cmd_for "$d")"
             if [ "$pellicle" -eq 1 ]; then
-                add_pane_pellicle "$d" "$dcmd"
+                add_pane_pellicle "$d" "$dcmd" "$title"
             else
-                add_pane "$d" "$dcmd"
+                add_pane "$d" "$dcmd" "$title"
             fi
             # Only wait between launches, not after the last one — see
             # wait_pane_settled's comment for why this matters.
@@ -439,11 +475,10 @@ for d in "$@"; do
     fi
 done
 
-# Keep dead panes readable; show per-pane titles (basenames) along the top
-# border so the cockpit is legible and stage's title marker has a home.
-tmux set-option -t "$SESSION" remain-on-exit on
-tmux set-window-option -t "$SESSION" pane-border-status top
-tmux set-window-option -t "$SESSION" pane-border-format " $(pane_hotkey_label):#{b:pane_current_path} "
+# Keep dead panes readable; show per-pane titles (basenames, or a custom
+# --title) along the top border so the cockpit is legible and stage's title
+# marker has a home.
+apply_border_format
 tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
