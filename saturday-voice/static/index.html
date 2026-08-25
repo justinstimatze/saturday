@@ -71,6 +71,24 @@ async function connect() {
   const ws = new WebSocket(wsURL);
   ws.binaryType = "arraybuffer";
 
+  // OUTPUT_GAIN: server-side amplitude logging (2026-08-25, saturday-voice
+  // log) showed a real reply peaking at 0.926 with zero samples over 1.0
+  // across 104 frames — no true (sample-level) clipping, ruling that out
+  // as the cause of "peaking too high, grating" reports. moshi-server's
+  // output is mastered close to full scale (0.9+ peaks aren't rare
+  // speech transients, they're closer to the norm), which leaves no
+  // headroom against inter-sample peaks — a signal whose discrete
+  // samples never exceed 1.0 can still overshoot 0 dBFS once the
+  // browser's audio pipeline reconstructs it, which reads as harsh/
+  // grating without ever showing up in a per-sample max check. Fixed
+  // headroom via a persistent gain node, not per-frame logic — cheap,
+  // and it also directly addresses "too loud the first quarter second"
+  // since that's overall level, not the click FADE_IN_SEC already fixed.
+  const OUTPUT_GAIN = 0.5;
+  const masterGain = audioCtx.createGain();
+  masterGain.gain.value = OUTPUT_GAIN;
+  masterGain.connect(audioCtx.destination);
+
   // Playback: queue of AudioBufferSourceNodes scheduled back-to-back
   // starting from whichever is later — audioCtx.currentTime or the end of
   // the last scheduled node — so frames play in order with no gaps or
@@ -84,17 +102,41 @@ async function connect() {
   // first ~250-500ms. LEAD_TIME_SEC gives every fresh reply (nextPlayTime
   // reset to 0 by clearPlayback on interrupt too) a small cushion, which
   // also doubles as slack against a late-arriving frame over the WAN hop.
-  const LEAD_TIME_SEC = 0.1;
+  //
+  // 0.1s fixed the distortion but still felt abrupt live — moshi-server's
+  // first audio frame apparently carries speech from sample zero, no
+  // lead-in silence of its own, so whatever gap plays before src.start()
+  // fires is the only "breath" the listener gets before the voice starts.
+  // Bumped to 0.25s for a softer onset; still small next to the seconds
+  // of thinking/TTS-dial latency already elapsed by the time audio starts.
+  const LEAD_TIME_SEC = 0.25;
+  // FADE_IN_SEC is a separate fix from LEAD_TIME_SEC above: lead time
+  // controls WHEN playback starts (scheduling lookahead), but moshi-server's
+  // first sample isn't itself silence — the waveform jumps straight from
+  // nothing to a non-zero amplitude, which Web Audio plays as an audible
+  // click/pop regardless of how much lookahead it got. Ramping gain 0->1
+  // over a few milliseconds on just the first frame removes the
+  // discontinuity without being perceptible as a fade.
+  const FADE_IN_SEC = 0.02;
   let nextPlayTime = 0;
   function playFrame(floatSamples) {
     const buf = audioCtx.createBuffer(1, floatSamples.length, SAMPLE_RATE);
     buf.copyToChannel(floatSamples, 0);
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(audioCtx.destination);
-    const startAt = nextPlayTime > 0
-      ? Math.max(audioCtx.currentTime, nextPlayTime)
-      : audioCtx.currentTime + LEAD_TIME_SEC;
+    const isFirstFrame = nextPlayTime === 0;
+    const startAt = isFirstFrame
+      ? audioCtx.currentTime + LEAD_TIME_SEC
+      : Math.max(audioCtx.currentTime, nextPlayTime);
+    if (isFirstFrame) {
+      const fadeGain = audioCtx.createGain();
+      fadeGain.gain.setValueAtTime(0, startAt);
+      fadeGain.gain.linearRampToValueAtTime(1, startAt + FADE_IN_SEC);
+      src.connect(fadeGain);
+      fadeGain.connect(masterGain);
+    } else {
+      src.connect(masterGain);
+    }
     src.start(startAt);
     nextPlayTime = startAt + buf.duration;
   }
@@ -155,6 +197,8 @@ async function connect() {
         clearPlayback();
       } else if (msg.type === "state") {
         setStatus(msg.value, "state-" + msg.value);
+      } else if (msg.type === "error") {
+        setStatus(msg.message, "state-error");
       }
       return;
     }

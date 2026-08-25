@@ -204,7 +204,10 @@ var upgrader = websocket.Upgrader{
 }
 
 func (srv *server) serveWS(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("token") != srv.authToken {
+	if got := r.URL.Query().Get("token"); got != srv.authToken {
+		// Deliberately don't log either token in full — just enough to
+		// tell "no token sent" from "wrong token sent" from a stale tab.
+		log.Printf("ws auth: token mismatch (got %d chars, want %d chars) from %s", len(got), len(srv.authToken), r.RemoteAddr)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

@@ -13,19 +13,25 @@ import (
 	"saturday/orchestrator"
 )
 
-// dialTimeout bounds how long dialing moshi-server's STT endpoint may take
-// — generous enough for a real WAN hop (Phase 0.5 measured connects around
-// 350-850ms over a Runpod tunnel) without hanging indefinitely on a dead
-// pod.
-const dialTimeout = 10 * time.Second
+// dialTimeout bounds how long dialing moshi-server's STT endpoint may
+// take. Used to be 10s, sized for a warm Runpod tunnel (Phase 0.5 measured
+// connects around 350-850ms) — that reasoning predates the Modal pivot and
+// went stale: STT's container scales to zero on the same
+// scaledown_window as TTS's, and a real session hit an i/o timeout
+// dialing a cold STT container live (2026-08-25), a bug masked in every
+// earlier test only because the container happened to already be warm.
+// Bumped to match ttsDialTimeout's directly-measured cold-start ceiling —
+// STT and TTS are the same cold-start profile (container scheduling +
+// moshi-server startup + checkpoint load), not a separately-measured
+// number.
+const dialTimeout = 60 * time.Second
 
-// ttsDialTimeout is longer than dialTimeout: unlike the STT link (dialed
-// once per session and typically already warm by the time speech starts),
-// TTS is dialed fresh on every single reply, and a cold Modal container
-// for it has been directly measured taking as long as 42s end-to-end
-// (container scheduling + moshi-server startup + checkpoint/voice-file
-// load) before it's ready to accept the WebSocket handshake — a 30s
-// timeout, measured in isolation, was still too tight.
+// ttsDialTimeout: TTS is dialed fresh on every single reply (unlike STT,
+// dialed once per session), so it pays the cold-start cost far more
+// often — a cold Modal container for it has been directly measured
+// taking as long as 42s end-to-end before it's ready to accept the
+// WebSocket handshake; a 30s timeout, measured in isolation, was still
+// too tight.
 const ttsDialTimeout = 60 * time.Second
 
 // session owns one client connection's lifecycle: dial STT/TTS, run the
@@ -128,8 +134,17 @@ func (s *session) run() error {
 	go s.forwardClientAudio()
 
 	for {
+		// STT's container scales to zero on the same idle window as TTS's
+		// — a cold dial has been directly measured taking 30s+. Unlike
+		// speak()'s "warming up voice" message for a cold TTS dial, this
+		// first dial previously sent nothing to the client while it was
+		// in flight, so a real cold start was indistinguishable from a
+		// hang (confirmed live, 2026-08-25: a 31s cold STT dial read as
+		// "stuck on connected — listening").
+		s.sendControl(map[string]any{"type": "state", "value": "connecting to speech recognition (cold start can take up to a minute)"})
 		stt, err := moshiclient.DialSTT(s.sttURL, s.moshiAPIKey, dialTimeout)
 		if err != nil {
+			log.Printf("dial STT failed: %v", err)
 			s.sendControl(map[string]any{"type": "error", "message": "can't reach moshi-server STT, retrying"})
 			if !s.sleepOrClientGone(backoff) {
 				return fmt.Errorf("dial STT: %w", err)
@@ -137,6 +152,8 @@ func (s *session) run() error {
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
+		log.Printf("STT dialed OK")
+		s.sendControl(map[string]any{"type": "state", "value": "listening"})
 
 		s.connMu.Lock()
 		s.stt = stt
@@ -177,9 +194,12 @@ func (s *session) run() error {
 // clientDone (to tell run() to stop reconnecting), then returns.
 func (s *session) forwardClientAudio() {
 	defer close(s.clientDone)
+	framesIn := 0
+	sendFailing := false
 	for {
 		mt, data, err := s.client.ReadMessage()
 		if err != nil {
+			log.Printf("forwardClientAudio: client read ended after %d frames: %v", framesIn, err)
 			s.connMu.Lock()
 			stt := s.stt
 			s.connMu.Unlock()
@@ -191,13 +211,25 @@ func (s *session) forwardClientAudio() {
 		if mt != websocket.BinaryMessage {
 			continue
 		}
+		framesIn++
+		if framesIn == 1 {
+			log.Printf("forwardClientAudio: first mic frame received from client (%d bytes)", len(data))
+		}
 		s.connMu.Lock()
 		stt := s.stt
 		s.connMu.Unlock()
 		if stt == nil {
 			continue
 		}
-		_ = stt.SendAudio(bytesToFloat32(data))
+		if err := stt.SendAudio(bytesToFloat32(data)); err != nil {
+			if !sendFailing {
+				log.Printf("forwardClientAudio: SendAudio to STT failing: %v", err)
+				sendFailing = true
+			}
+		} else if sendFailing {
+			log.Printf("forwardClientAudio: SendAudio to STT recovered")
+			sendFailing = false
+		}
 	}
 }
 
@@ -487,18 +519,48 @@ func (s *session) speak(text string) error {
 	s.sendControl(map[string]any{"type": "state", "value": "speaking"})
 
 	frames := 0
+	maxAbs := 0.0
+	clippedFrames := 0
+	// onsetFrames tracks the first 3 frames' peak separately (~240ms at
+	// 80ms/frame, roughly "the beginning" the user keeps flagging as
+	// still rough after the flat -6dB fix smoothed out the rest) — if
+	// the onset genuinely peaks higher than the reply's overall max,
+	// that's real data for a targeted onset-only attenuation instead of
+	// another blind guess.
+	const onsetFrameCount = 3
+	onsetMaxAbs := 0.0
 	for {
 		msg, err := tts.Recv()
 		if err != nil {
 			// A closed connection (our own cancelActive, or a normal
 			// server-side close after Eos) ends the stream — not an
 			// error worth surfacing.
-			log.Printf("speak: stream ended after %d audio frames (%v)", frames, err)
+			log.Printf("speak: stream ended after %d audio frames (%v) — peak amplitude %.3f (first %d frames: %.3f), %d/%d frames with a sample >1.0 (true clipping)",
+				frames, err, maxAbs, onsetFrameCount, onsetMaxAbs, clippedFrames, frames)
 			return nil
 		}
 		switch m := msg.(type) {
 		case moshiclient.TTSAudioMessage:
 			frames++
+			clipped := false
+			for _, sample := range m.PCM {
+				abs := sample
+				if abs < 0 {
+					abs = -abs
+				}
+				if abs > maxAbs {
+					maxAbs = abs
+				}
+				if frames <= onsetFrameCount && abs > onsetMaxAbs {
+					onsetMaxAbs = abs
+				}
+				if abs > 1.0 {
+					clipped = true
+				}
+			}
+			if clipped {
+				clippedFrames++
+			}
 			if err := s.sendAudio(m.PCM); err != nil {
 				log.Printf("speak: sendAudio to client failed: %v", err)
 			}
