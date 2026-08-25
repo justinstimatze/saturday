@@ -36,6 +36,7 @@ func DialTTS(baseURL, apiKey string, voice TTSVoice, cfgAlpha float64, timeout t
 	if err != nil {
 		return nil, fmt.Errorf("moshiclient: parse TTS base URL: %w", err)
 	}
+	wsScheme(u)
 	u.Path = u.Path + TextToSpeechPath
 	q := u.Query()
 	q.Set("format", "PcmMessagePack")

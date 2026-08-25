@@ -221,7 +221,10 @@ func (srv *server) serveWS(w http.ResponseWriter, r *http.Request) {
 	sess.orch = orchestrator.New(cfg)
 	sess.orch.StartCompletionPolling()
 
+	log.Printf("session started")
 	if err := sess.run(); err != nil {
 		log.Printf("session ended: %v", err)
+	} else {
+		log.Printf("session ended: client closed")
 	}
 }

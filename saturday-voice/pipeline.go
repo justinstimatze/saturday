@@ -13,11 +13,20 @@ import (
 	"saturday/orchestrator"
 )
 
-// dialTimeout bounds how long dialing moshi-server's STT/TTS endpoints may
-// take — generous enough for a real WAN hop (Phase 0.5 measured connects
-// around 350-850ms over a Runpod tunnel) without hanging indefinitely on a
-// dead pod.
+// dialTimeout bounds how long dialing moshi-server's STT endpoint may take
+// — generous enough for a real WAN hop (Phase 0.5 measured connects around
+// 350-850ms over a Runpod tunnel) without hanging indefinitely on a dead
+// pod.
 const dialTimeout = 10 * time.Second
+
+// ttsDialTimeout is longer than dialTimeout: unlike the STT link (dialed
+// once per session and typically already warm by the time speech starts),
+// TTS is dialed fresh on every single reply, and a cold Modal container
+// for it has been directly measured taking as long as 42s end-to-end
+// (container scheduling + moshi-server startup + checkpoint/voice-file
+// load) before it's ready to accept the WebSocket handshake — a 30s
+// timeout, measured in isolation, was still too tight.
+const ttsDialTimeout = 60 * time.Second
 
 // session owns one client connection's lifecycle: dial STT/TTS, run the
 // turn-taking loop, call the orchestrator, stream audio both ways. One
@@ -234,6 +243,7 @@ func (s *session) runSTTLoop() error {
 			if m.Text == "" {
 				continue
 			}
+			log.Printf("stt word: %q", m.Text)
 			res := s.tt.OnWord()
 			if res.Interrupted {
 				s.cancelActive()
@@ -245,13 +255,16 @@ func (s *session) runSTTLoop() error {
 			if len(m.Prs) > 2 {
 				prs2 = m.Prs[2]
 			}
-			switch s.tt.OnStep(prs2) {
+			switch action := s.tt.OnStep(prs2); action {
 			case moshiclient.ActionBeginFlush:
+				log.Printf("turn-taking: begin flush (prs2=%.3f)", prs2)
 				s.flushSTT()
 			case moshiclient.ActionResponseReady:
 				utterance := s.takeUtterance()
+				log.Printf("turn-taking: response ready, utterance=%q", utterance)
 				go s.respond(utterance)
 			case moshiclient.ActionInterrupt:
+				log.Printf("turn-taking: interrupt (prs2=%.3f)", prs2)
 				s.cancelActive()
 			}
 
@@ -321,8 +334,14 @@ func (s *session) respond(utterance string) {
 	myGen := s.generation
 	s.genMu.Unlock()
 
-	if _, err := s.orch.Handle(utterance, "expand", "auto"); err != nil {
+	s.sendControl(map[string]any{"type": "state", "value": "thinking"})
+
+	log.Printf("respond: calling orchestrator.Handle(%q)", utterance)
+	reply, err := s.orch.Handle(utterance, "expand", "auto")
+	if err != nil {
 		log.Printf("orchestrator.Handle: %v", err)
+	} else {
+		log.Printf("respond: orchestrator.Handle returned %+v", reply)
 	}
 
 	s.genMu.Lock()
@@ -342,10 +361,17 @@ func (s *session) respond(utterance string) {
 func (s *session) speak(text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
+		log.Printf("speak: empty text, skipping")
 		return nil
 	}
-	tts, err := moshiclient.DialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, dialTimeout)
+	log.Printf("speak: dialing TTS for %q", text)
+	// A cold TTS container has been measured taking up to ~40s to become
+	// reachable (container scheduling + moshi-server startup + checkpoint
+	// load) — "thinking" undersells that wait, so give it its own signal.
+	s.sendControl(map[string]any{"type": "state", "value": "warming up voice (cold start can take up to a minute)"})
+	tts, err := moshiclient.DialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
 	if err != nil {
+		log.Printf("speak: dial TTS failed: %v", err)
 		return fmt.Errorf("dial TTS: %w", err)
 	}
 
@@ -370,18 +396,24 @@ func (s *session) speak(text string) error {
 
 	s.sendControl(map[string]any{"type": "state", "value": "speaking"})
 
+	frames := 0
 	for {
 		msg, err := tts.Recv()
 		if err != nil {
 			// A closed connection (our own cancelActive, or a normal
 			// server-side close after Eos) ends the stream — not an
 			// error worth surfacing.
+			log.Printf("speak: stream ended after %d audio frames (%v)", frames, err)
 			return nil
 		}
 		switch m := msg.(type) {
 		case moshiclient.TTSAudioMessage:
-			s.sendAudio(m.PCM)
+			frames++
+			if err := s.sendAudio(m.PCM); err != nil {
+				log.Printf("speak: sendAudio to client failed: %v", err)
+			}
 		case moshiclient.TTSErrorMessage:
+			log.Printf("speak: tts error: %s", m.Message)
 			return fmt.Errorf("tts error: %s", m.Message)
 		}
 	}

@@ -30,6 +30,7 @@ func DialSTT(baseURL, apiKey string, timeout time.Duration) (*STTClient, error) 
 	if err != nil {
 		return nil, fmt.Errorf("moshiclient: parse STT base URL: %w", err)
 	}
+	wsScheme(u)
 	u.Path = u.Path + SpeechToTextPath
 
 	dialer := websocket.Dialer{HandshakeTimeout: timeout}

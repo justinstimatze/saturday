@@ -7,6 +7,8 @@
 // itself expects.
 package moshiclient
 
+import "net/url"
+
 // --- STT: client → server ---
 
 // sttAudioMsg carries one frame of mono float32 PCM at 24kHz,
@@ -134,3 +136,17 @@ const (
 	// STT is itself delayed relative to real time by roughly this much.
 	STTDelaySec = 0.5
 )
+
+// wsScheme rewrites an http(s) baseURL to the matching ws(s) scheme gorilla/
+// websocket's Dialer requires — callers (flags, docs, moshi-server's own
+// Runpod/Modal proxy URLs) all use http(s), and gorilla/websocket rejects
+// anything else as a "malformed ws or wss URL". Leaves ws/wss untouched so
+// a caller who already got it right isn't double-converted.
+func wsScheme(u *url.URL) {
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	}
+}

@@ -75,6 +75,16 @@ async function connect() {
   // starting from whichever is later — audioCtx.currentTime or the end of
   // the last scheduled node — so frames play in order with no gaps or
   // overlaps as they arrive.
+  //
+  // The very first frame of a reply used to schedule at exactly
+  // audioCtx.currentTime (nextPlayTime starts at 0, so
+  // Math.max(currentTime, 0) === currentTime) — zero lead time, which is
+  // a known Web Audio scheduling gotcha: starting a node with no lookahead
+  // gives the audio thread no room to prepare and audibly distorts the
+  // first ~250-500ms. LEAD_TIME_SEC gives every fresh reply (nextPlayTime
+  // reset to 0 by clearPlayback on interrupt too) a small cushion, which
+  // also doubles as slack against a late-arriving frame over the WAN hop.
+  const LEAD_TIME_SEC = 0.1;
   let nextPlayTime = 0;
   function playFrame(floatSamples) {
     const buf = audioCtx.createBuffer(1, floatSamples.length, SAMPLE_RATE);
@@ -82,7 +92,9 @@ async function connect() {
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
     src.connect(audioCtx.destination);
-    const startAt = Math.max(audioCtx.currentTime, nextPlayTime);
+    const startAt = nextPlayTime > 0
+      ? Math.max(audioCtx.currentTime, nextPlayTime)
+      : audioCtx.currentTime + LEAD_TIME_SEC;
     src.start(startAt);
     nextPlayTime = startAt + buf.duration;
   }
@@ -100,7 +112,12 @@ async function connect() {
   ws.onopen = () => {
     setStatus("connected — listening", "state-listening");
     const source = audioCtx.createMediaStreamSource(stream);
-    const processor = audioCtx.createScriptProcessor(SAMPLES_PER_FRAME, 1, 1);
+    // ScriptProcessorNode's buffer size must be 0 or a power of two
+    // (256-16384) — SAMPLES_PER_FRAME (1920) isn't one. The re-chunking
+    // loop below already rebuilds exact SAMPLES_PER_FRAME frames from
+    // whatever size the callback actually delivers, so any legal size
+    // works here.
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
     let frameBuf = new Float32Array(0);
 
     processor.onaudioprocess = (evt) => {
