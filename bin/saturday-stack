@@ -54,6 +54,20 @@ BACKEND_POLL_INTERVAL="${BACKEND_POLL_INTERVAL:-5s}"
 BACKEND_LOG="$XDG_STATE_HOME_RESOLVED/saturday/backend.log"
 BACKEND_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-backend.pid"
 
+# Headless saturday-voice — talks to a rented moshi-server pod directly
+# (see orchestrator/, moshiclient/, saturday-voice/). Unlike backend's
+# DRIVE_FOLDER_ID (a one-time OAuth setup), SATURDAY_VOICE_STT_URL points
+# at an EPHEMERAL rented pod's subdomain that changes every time a new pod
+# is started — most sessions won't have one running at all. So this leg is
+# opt-in, not hard-fail: unset means "skip it, log why," not "abort the
+# whole stack."
+SATURDAY_VOICE_STT_URL="${SATURDAY_VOICE_STT_URL:-}"
+SATURDAY_VOICE_TTS_URL="${SATURDAY_VOICE_TTS_URL:-}"
+SATURDAY_VOICE_AUTH_TOKEN="${SATURDAY_VOICE_AUTH_TOKEN:-}"
+SATURDAY_VOICE_PORT="${SATURDAY_VOICE_PORT:-8080}"
+VOICE_LOG="$XDG_STATE_HOME_RESOLVED/saturday/voice.log"
+VOICE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-voice.pid"
+
 # check_audio_venv — verify saturday-audio/.venv is usable. Two failure
 # modes have bitten us in practice:
 #
@@ -134,6 +148,11 @@ case "${1:-}" in
         if [ -z "$DRIVE_FOLDER_ID" ]; then
             echo "saturday-stack: DRIVE_FOLDER_ID not set — backend leg won't start (export it, see saturday-backend/README.md)" >&2
         fi
+        if ! command -v saturday-voice >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/saturday-voice" ]; then
+            echo "saturday-stack: saturday-voice not found on PATH or ~/go/bin — that leg is opt-in anyway, not a hard failure" >&2
+        elif [ -z "$SATURDAY_VOICE_STT_URL" ]; then
+            echo "saturday-stack: SATURDAY_VOICE_STT_URL not set — saturday-voice leg won't start this session (expected unless a moshi-server pod is currently rented)"
+        fi
         if [ ! -d "$AUDIO_DIR" ]; then
             echo "saturday-stack: audio dir missing: $AUDIO_DIR" >&2; rc=1
         elif [ ! -f "$AUDIO_VENV/bin/activate" ]; then
@@ -174,6 +193,14 @@ case "${1:-}" in
                 kill "$BPID" 2>/dev/null && echo "saturday-stack: backend (pid $BPID) killed."
             fi
             rm -f "$BACKEND_PIDFILE"
+        fi
+        # Kill headless saturday-voice, if it was started (opt-in leg).
+        if [ -f "$VOICE_PIDFILE" ]; then
+            VPID=$(cat "$VOICE_PIDFILE" 2>/dev/null)
+            if [ -n "$VPID" ] && kill -0 "$VPID" 2>/dev/null; then
+                kill "$VPID" 2>/dev/null && echo "saturday-stack: saturday-voice (pid $VPID) killed."
+            fi
+            rm -f "$VOICE_PIDFILE"
         fi
         exit 0
         ;;
@@ -288,9 +315,28 @@ echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log 
 # block as watcher/stage; only needs the watcher socket, no ordering
 # dependency on mayor.
 mkdir -p "$(dirname "$BACKEND_LOG")"
-~/go/bin/saturday-backend --drive-folder-id "$DRIVE_FOLDER_ID" --poll-interval "$BACKEND_POLL_INTERVAL" >> "$BACKEND_LOG" 2>&1 &
+~/go/bin/saturday-backend --drive-folder-id "$DRIVE_FOLDER_ID" --poll-interval "$BACKEND_POLL_INTERVAL" --stage-sock "$STAGE_SOCK" --stage-tile >> "$BACKEND_LOG" 2>&1 &
 echo $! > "$BACKEND_PIDFILE"
 echo "saturday-stack: backend running headless (pid $(cat "$BACKEND_PIDFILE")), log → $BACKEND_LOG"
+
+# Headless saturday-voice — opt-in (see the var block above for why this
+# is the one leg that doesn't hard-fail the stack when unset).
+if [ -n "$SATURDAY_VOICE_STT_URL" ] && [ -n "$SATURDAY_VOICE_TTS_URL" ] && [ -n "$SATURDAY_VOICE_AUTH_TOKEN" ]; then
+    mkdir -p "$(dirname "$VOICE_LOG")"
+    ~/go/bin/saturday-voice \
+        --port "$SATURDAY_VOICE_PORT" \
+        --auth-token "$SATURDAY_VOICE_AUTH_TOKEN" \
+        --moshi-stt-url "$SATURDAY_VOICE_STT_URL" \
+        --moshi-tts-url "$SATURDAY_VOICE_TTS_URL" \
+        --stage-sock "$STAGE_SOCK" --stage-tile \
+        >> "$VOICE_LOG" 2>&1 &
+    echo $! > "$VOICE_PIDFILE"
+    echo "saturday-stack: saturday-voice running headless (pid $(cat "$VOICE_PIDFILE")) on :$SATURDAY_VOICE_PORT, log → $VOICE_LOG"
+elif [ -n "$SATURDAY_VOICE_STT_URL" ] || [ -n "$SATURDAY_VOICE_TTS_URL" ] || [ -n "$SATURDAY_VOICE_AUTH_TOKEN" ]; then
+    echo "saturday-stack: saturday-voice skipped — SATURDAY_VOICE_STT_URL, SATURDAY_VOICE_TTS_URL, and SATURDAY_VOICE_AUTH_TOKEN must all be set together (some but not all are)." >&2
+else
+    echo "saturday-stack: saturday-voice skipped (SATURDAY_VOICE_STT_URL unset — no rented moshi-server pod configured this session)."
+fi
 
 tmux new-session -d -s "$SESSION" -n "stack" \
     "echo '[mayor]'; exec ~/go/bin/saturday-mayor --audio-sock '$SOCK' --stage-sock '$STAGE_SOCK' --stage-tile"

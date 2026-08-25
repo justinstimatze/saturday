@@ -117,6 +117,11 @@ func main() {
 	pollInterval := flag.Duration("poll-interval", 15*time.Second, "how often to check the Drive folder for new notes")
 	cursorPath := flag.String("cursor", defaultCursor, "cursor state file (what's already been processed)")
 	manifestName := flag.String("drive-manifest-name", "saturday-sessions.txt", "filename for the live-session inventory this backend writes back to the Drive folder, so voice mode can check real session names before writing a note; empty disables it (requires the drive.file scope — re-run --drive-login after upgrading from a readonly-only token)")
+	stageSock := flag.String("stage-sock", "", "if set, dial this Unix socket and send focus/restore commands to the saturday-stage window-choreography sidecar on the inject lifecycle. Empty = disabled (no window choreography).")
+	stageZoom := flag.Bool("stage-zoom", false, "Posture A (cockpit): on inject, ask stage to zoom (maximize) the addressed pane; restore unzooms. Takes precedence over --stage-tile.")
+	stageTile := flag.Bool("stage-tile", false, "Posture A (cockpit): on inject, ask stage to give the addressed pane a proportionally larger share of an even-horizontal row (salience tiling); restore re-evens.")
+	stageRestorePoll := flag.Duration("stage-restore-poll", 3*time.Second, "how often to check whether a tmux-injected reply has finished, before telling stage to restore the pane")
+	stageRestoreMaxWait := flag.Duration("stage-restore-max-wait", 5*time.Minute, "give up waiting for the reply to finish and restore the pane anyway after this long")
 	drivelogin := flag.Bool("drive-login", false, "run the one-time interactive OAuth consent flow, save the token, and exit")
 	flag.Parse()
 
@@ -175,14 +180,21 @@ func main() {
 	}
 
 	b := &backend{
-		apiKey:             apiKey,
-		sockPath:           *sock,
-		cacheDir:           *cacheDir,
-		dryRun:             *dryRun,
-		collisionWait:      *collisionWait,
-		collisionMax:       *collisionMax,
-		confThreshold:      *confThreshold,
-		injectDirectTokens: *injectDirectTokens,
+		apiKey:              apiKey,
+		sockPath:            *sock,
+		cacheDir:            *cacheDir,
+		dryRun:              *dryRun,
+		collisionWait:       *collisionWait,
+		collisionMax:        *collisionMax,
+		confThreshold:       *confThreshold,
+		injectDirectTokens:  *injectDirectTokens,
+		stageZoom:           *stageZoom,
+		stageTile:           *stageTile,
+		stageRestorePoll:    *stageRestorePoll,
+		stageRestoreMaxWait: *stageRestoreMaxWait,
+	}
+	if *stageSock != "" {
+		go b.stage.Run(*stageSock)
 	}
 
 	c := loadCursor(*cursorPath)

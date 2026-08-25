@@ -23,6 +23,7 @@ build:
 	@cd saturday-thinking && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-sync .
 	@cd saturday-backend  && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-backend .
+	@cd saturday-voice    && go build $(LDFLAGS) -o ../$(BINDIR)/saturday-voice .
 	@echo "built $(VERSION) → $(BINDIR)/"
 
 install:
@@ -33,6 +34,7 @@ install:
 	@cd saturday-thinking && go build $(LDFLAGS) -o $(GOBIN)/saturday-thinking .
 	@cd sync              && go build $(LDFLAGS) -o $(GOBIN)/saturday-sync .
 	@cd saturday-backend  && go build $(LDFLAGS) -o $(GOBIN)/saturday-backend .
+	@cd saturday-voice    && go build $(LDFLAGS) -o $(GOBIN)/saturday-voice .
 	@echo "installed $(VERSION) → $(GOBIN)/"
 
 test:
@@ -45,7 +47,7 @@ lint:
 	@golangci-lint run ./...
 
 tidy:
-	@for d in saturday-mayor watcher saturday-hook saturday-stage saturday-thinking sync eval eval/router llmcore inject settle watcherclient saturday-backend; do \
+	@for d in saturday-mayor watcher saturday-hook saturday-stage saturday-thinking sync eval eval/router llmcore inject settle watcherclient stageclient orchestrator moshiclient saturday-backend saturday-voice; do \
 		(cd $$d && go mod tidy); \
 	done
 
@@ -58,10 +60,10 @@ hooks:
 ci:
 	@out=$$(gofmt -l .); \
 	if [ -n "$$out" ]; then echo "gofmt drift in:"; echo "$$out"; exit 1; fi
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient saturday-backend; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient stageclient orchestrator moshiclient saturday-backend saturday-voice; do \
 		(cd $$d && go vet ./...) || exit 1; \
 	done
-	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient saturday-backend; do \
+	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient stageclient orchestrator moshiclient saturday-backend saturday-voice; do \
 		(cd $$d && go test -race ./...) || exit 1; \
 	done
 	@$(MAKE) build >/dev/null

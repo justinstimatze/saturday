@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>saturday-voice</title>
+<style>
+  body { font-family: monospace; background: #111; color: #eee; padding: 2rem; }
+  button { font-size: 1rem; padding: 0.5rem 1rem; }
+  #status { margin-top: 1rem; white-space: pre-wrap; }
+  .state-listening { color: #6cf; }
+  .state-speaking { color: #fc6; }
+  .state-error { color: #f66; }
+</style>
+</head>
+<body>
+<h1>saturday-voice</h1>
+<p>Minimal test client — Phase 1b. Not the real Saturday-branded client (roadmap).</p>
+<button id="connect">Connect</button>
+<div id="status">idle</div>
+
+<script>
+// Wire protocol (see saturday-voice/audio.go and pipeline.go):
+//   binary WS messages, both directions: one frame of mono float32 PCM
+//   at 24kHz, little-endian — exactly a Float32Array's own buffer layout.
+//   text WS messages, server -> client only: small JSON control events,
+//   {"type":"state","value":"listening"|"speaking"} and
+//   {"type":"interrupted"} (clear the playback queue now).
+const SAMPLE_RATE = 24000;
+const SAMPLES_PER_FRAME = 1920;
+
+const statusEl = document.getElementById("status");
+const connectBtn = document.getElementById("connect");
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
+}
+
+async function connect() {
+  connectBtn.disabled = true;
+  setStatus("requesting microphone…");
+
+  let audioCtx;
+  try {
+    // Requesting the context at moshi-server's own sample rate avoids
+    // needing to resample client-side — most modern browsers honor this.
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  } catch (e) {
+    setStatus("this browser won't create a 24kHz AudioContext: " + e, "state-error");
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: SAMPLE_RATE,
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    });
+  } catch (e) {
+    setStatus("microphone access denied: " + e, "state-error");
+    return;
+  }
+
+  const token = new URLSearchParams(location.search).get("token") || prompt("auth token:");
+  const wsURL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
+    "/ws?token=" + encodeURIComponent(token);
+  const ws = new WebSocket(wsURL);
+  ws.binaryType = "arraybuffer";
+
+  // Playback: queue of AudioBufferSourceNodes scheduled back-to-back
+  // starting from whichever is later — audioCtx.currentTime or the end of
+  // the last scheduled node — so frames play in order with no gaps or
+  // overlaps as they arrive.
+  let nextPlayTime = 0;
+  function playFrame(floatSamples) {
+    const buf = audioCtx.createBuffer(1, floatSamples.length, SAMPLE_RATE);
+    buf.copyToChannel(floatSamples, 0);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    const startAt = Math.max(audioCtx.currentTime, nextPlayTime);
+    src.start(startAt);
+    nextPlayTime = startAt + buf.duration;
+  }
+  function clearPlayback() {
+    // Individual sources already scheduled can't be un-scheduled without
+    // tracking every node; simplest correct fix for a barge-in is to
+    // just stop scheduling new audio ahead of "now" — resetting
+    // nextPlayTime means the next frame plays immediately instead of
+    // queued behind whatever's left, which is a reasonable approximation
+    // for this minimal client. A production client would track and stop
+    // each source node explicitly.
+    nextPlayTime = audioCtx.currentTime;
+  }
+
+  ws.onopen = () => {
+    setStatus("connected — listening", "state-listening");
+    const source = audioCtx.createMediaStreamSource(stream);
+    const processor = audioCtx.createScriptProcessor(SAMPLES_PER_FRAME, 1, 1);
+    let frameBuf = new Float32Array(0);
+
+    processor.onaudioprocess = (evt) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const input = evt.inputBuffer.getChannelData(0);
+      // ScriptProcessorNode's buffer size may not exactly match
+      // SAMPLES_PER_FRAME on every browser; re-chunk to be safe.
+      const combined = new Float32Array(frameBuf.length + input.length);
+      combined.set(frameBuf);
+      combined.set(input, frameBuf.length);
+      let offset = 0;
+      while (combined.length - offset >= SAMPLES_PER_FRAME) {
+        const frame = combined.slice(offset, offset + SAMPLES_PER_FRAME);
+        ws.send(frame.buffer);
+        offset += SAMPLES_PER_FRAME;
+      }
+      frameBuf = combined.slice(offset);
+    };
+
+    source.connect(processor);
+    // ScriptProcessorNode requires a destination connection to fire even
+    // though we don't want its output audible — route through a
+    // zero-gain node instead of destination directly.
+    const silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+    processor.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
+  };
+
+  ws.onmessage = (evt) => {
+    if (typeof evt.data === "string") {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch { return; }
+      if (msg.type === "interrupted") {
+        clearPlayback();
+      } else if (msg.type === "state") {
+        setStatus(msg.value, "state-" + msg.value);
+      }
+      return;
+    }
+    const floatSamples = new Float32Array(evt.data);
+    playFrame(floatSamples);
+  };
+
+  ws.onclose = () => {
+    setStatus("disconnected", "state-error");
+    connectBtn.disabled = false;
+  };
+  ws.onerror = () => {
+    setStatus("connection error", "state-error");
+  };
+}
+
+connectBtn.addEventListener("click", connect);
+</script>
+</body>
+</html>

@@ -2,6 +2,23 @@
 
 Helper executables for the Saturday voice loop.
 
+## Quick start
+
+Two commands, in this order:
+
+```bash
+export DRIVE_FOLDER_ID=<your Drive folder id>   # once per shell — see saturday-backend/README.md
+saturday-stack                                   # watcher, mayor, audio, stage, backend — headless legs + panes
+saturday-cockpit ~/Documents/spar ~/Documents/whatever   # your project panes, whichever you want open today
+```
+
+`saturday-stack` first: it brings up everything that has to already be
+running before a session is useful (watcher, `saturday-stage`, the
+Drive-relay backend). `saturday-cockpit` second, for whichever project
+panes you actually want today — deliberately a separate step rather than
+a fixed list, since that list changes daily. Re-run either command any
+time; both attach to what's already running instead of duplicating it.
+
 ## `saturday-claude`
 
 Bash wrapper that starts (or attaches to) a tmux session running `claude`
@@ -91,6 +108,26 @@ helpful message if `saturday-watcher` / `saturday-mayor` aren't on
 `PATH` or in `$(go env GOPATH)/bin`, if `saturday-audio/.venv/bin/activate`
 is missing, or if you're already inside tmux.
 
+## `saturday-cockpit`
+
+Bash wrapper that opens one tmux window holding every project you name as
+a pane, so `saturday-stage` can zoom or salience-tile the addressed pane
+on inject — the alternative to one `saturday-claude` session per project
+spread across separate terminals.
+
+```bash
+saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
+saturday-cockpit add <dir> [<dir> ...]   # add pane(s) to a running cockpit
+saturday-cockpit stop                    # kill the cockpit window/session
+saturday-cockpit status                  # list panes (pane_id, pid, cwd)
+```
+
+Session name is `cc-cockpit` (matches stage's activity allowlist). Hotkeys
+work anywhere in tmux once a cockpit has run once: `Alt+1`..`9` jumps to
+pane N zoomed full-screen (press again to un-zoom), `Alt+0` forces the
+tiled overview. See the script's own header comment for `add --resume`,
+`add --pellicle`, and env overrides (`COCKPIT`, `COCKPIT_TILE`).
+
 ## Install
 
 The Go binaries are installed via `make install` from the workspace
@@ -98,7 +135,8 @@ root. The bash launchers in this directory ship separately — copy them
 to the same `bin` directory once:
 
 ```bash
-cp bin/saturday-claude bin/saturday-stack "$(go env GOPATH)/bin"
+cp bin/saturday-claude bin/saturday-stack bin/saturday-cockpit "$(go env GOPATH)/bin"
 chmod +x "$(go env GOPATH)/bin/saturday-claude" \
-         "$(go env GOPATH)/bin/saturday-stack"
+         "$(go env GOPATH)/bin/saturday-stack" \
+         "$(go env GOPATH)/bin/saturday-cockpit"
 ```

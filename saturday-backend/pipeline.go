@@ -9,6 +9,7 @@ import (
 	"saturday/inject"
 	llm "saturday/llmcore"
 	"saturday/settle"
+	"saturday/stageclient"
 	"saturday/watcherclient"
 )
 
@@ -23,6 +24,17 @@ type backend struct {
 	collisionMax       time.Duration
 	confThreshold      float64
 	injectDirectTokens int
+
+	// saturday-stage window-choreography sidecar, shared with saturday-mayor
+	// via the stageclient package — same dial/write logic, so a phone-voice
+	// inject resizes the pane the same way a local-mic one already does.
+	// Zero-value stage permanently no-ops if --stage-sock was never set,
+	// same resilience posture as mayor's.
+	stage               stageclient.Client
+	stageZoom           bool
+	stageTile           bool
+	stageRestorePoll    time.Duration
+	stageRestoreMaxWait time.Duration
 }
 
 // belowThreshold reports whether conf fails to clear threshold. A threshold
@@ -112,8 +124,9 @@ func (b *backend) processNote(text string) error {
 
 // commitInject mirrors saturday-mayor's commitInject path selection
 // (tmux → direct-write → headless) using Phase 0's inject/settle packages
-// directly. No stage-sidecar/audio-sidecar/state-broadcast/blink wiring —
-// mayor-specific concerns the backend has no use for in Phase 1.
+// directly. No audio-sidecar/state-broadcast/blink wiring — mayor-specific
+// concerns the backend has no use for. Stage wiring (focus/restore) IS
+// shared with mayor now, via stageclient — see the tmux branch below.
 func (b *backend) commitInject(target watcherclient.SessionEntry, text string) error {
 	if b.dryRun {
 		fmt.Fprintln(os.Stderr, "  [dry-run; skipping exec]")
@@ -131,10 +144,27 @@ func (b *backend) commitInject(target watcherclient.SessionEntry, text string) e
 	// commitInject: tmux pane → direct-write → headless.
 	if paneID := inject.FindTmuxPane(target.State.Cwd); paneID != "" {
 		fmt.Fprintf(os.Stderr, "  ↳ found tmux pane %s for cwd=%s; using tmux send-keys\n", paneID, target.State.Cwd)
+		// Captured before the send so restoreWhenSettled's post-inject scan
+		// starts from here, not the file's start — otherwise it could match
+		// an older assistant block with similar text and restore too early.
+		sizeAtInject, err := settle.FileSize(target.JSONLPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ↳ pre-inject size read failed: %v; restore-poll will scan from file start\n", err)
+		}
 		if err := inject.ViaTmux(paneID, text); err != nil {
 			return fmt.Errorf("tmux send-keys: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, "  ↳ injected via tmux send-keys (live pane handles)")
+		b.stage.Write(map[string]any{
+			"type":       "focus",
+			"session_id": target.State.SessionID,
+			"project":    target.State.Project,
+			"pane_id":    paneID,
+			"cwd":        target.State.Cwd,
+			"zoom":       b.stageZoom,
+			"tile":       b.stageTile,
+		})
+		go b.restoreWhenSettled(target, text, sizeAtInject)
 		return nil
 	}
 	fmt.Fprintln(os.Stderr, "  ↳ no tmux pane found for target cwd; using JSONL fallback path")
@@ -161,4 +191,30 @@ func (b *backend) commitInject(target watcherclient.SessionEntry, text string) e
 	}
 	fmt.Fprintf(os.Stderr, "  ↳ injected (cwd=%s), %d bytes assistant reply\n", target.State.Cwd, n)
 	return nil
+}
+
+// restoreWhenSettled polls for the tmux-injected reply to finish, then
+// tells stage to restore the pane's normal size. Deliberately minimal —
+// no pendingInjects map, no TTL bookkeeping, no spoken narration, none of
+// mayor's Phase 3 completion-report filtering. Just enough to know when to
+// de-emphasize the pane, reusing settle.AssistantTextAfterInject, the
+// primitive Phase 0 extracted from mayor specifically for this reuse.
+// Always sends restore on exit, ready or not: saturday-stage's Restore
+// handler is a documented no-op for a session it never focused or already
+// restored, so it's safe to call unconditionally rather than risk a tile
+// stuck expanded after a stuck or crashed session.
+func (b *backend) restoreWhenSettled(target watcherclient.SessionEntry, text string, sizeAtInject int64) {
+	deadline := time.Now().Add(b.stageRestoreMaxWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(b.stageRestorePoll)
+		_, ready, err := settle.AssistantTextAfterInject(target.JSONLPath, sizeAtInject, text)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ↳ restore-poll read failed for %s: %v\n", target.State.Project, err)
+			continue
+		}
+		if ready {
+			break
+		}
+	}
+	b.stage.Write(map[string]any{"type": "restore", "session_id": target.State.SessionID})
 }

@@ -5,12 +5,16 @@ use (
 	./eval/router
 	./inject
 	./llmcore
+	./moshiclient
+	./orchestrator
 	./saturday-backend
 	./saturday-hook
 	./saturday-mayor
 	./saturday-stage
 	./saturday-thinking
+	./saturday-voice
 	./settle
+	./stageclient
 	./sync
 	./watcher
 	./watcherclient

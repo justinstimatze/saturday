@@ -62,13 +62,14 @@ scope, and manifest writes will fail with a permissions error until you do.
 
 Every poll tick, `saturday-backend` also writes a small
 `saturday-sessions.txt` file into the same folder, listing every session
-`saturday-watcher` currently sees as live, by project name. The intent is
-for voice mode to check real session names against this file before
-naming one in a note — but that half is **not yet verified**: it needs an
-account-wide instruction added to your own Claude Preferences telling
-voice mode to actually read it, and a live test the same way the note-
-writing side already got one. Until that's done, this file exists and
-updates correctly, but nothing consumes it yet.
+`saturday-watcher` currently sees as live, by project name, split into
+reachable-now (has a tmux pane) and headless-only. Voice mode checks real
+session names against this file before naming one in a note — confirmed
+live 2026-08-24, via an addendum in Claude's **Instructions for Claude**
+field (not Preferences — see `SATURDAY-VOICE-NATIVE.md` for why that
+field choice matters). Note: the file is only as fresh as the last poll
+tick that wrote it — if `saturday-backend` isn't currently running, voice
+mode reads whatever it last wrote, not a live snapshot.
 
 Set `--drive-manifest-name ""` to disable this and fall back to
 read-only behavior (matches the scope you'd have from before this was
@@ -106,6 +107,11 @@ Flags mirror `saturday-mayor` where the same concept applies
 | `--poll-interval` | `15s` | how often to check for new notes |
 | `--cursor` | `~/.config/saturday/backend-cursor.json` | what's already been processed |
 | `--drive-manifest-name` | `saturday-sessions.txt` | live-session inventory written back each poll; `""` disables it |
+| `--stage-sock` | *(empty)* | if set, dial this Unix socket and send focus/restore commands to `saturday-stage` on the inject lifecycle — same window choreography `saturday-mayor` already has, shared via the `stageclient` package. Empty disables it. |
+| `--stage-zoom` | `false` | on inject, ask stage to zoom (maximize) the addressed pane; restore unzooms. Takes precedence over `--stage-tile`. |
+| `--stage-tile` | `false` | on inject, ask stage to give the addressed pane a proportionally larger share of an even-horizontal row; restore re-evens. |
+| `--stage-restore-poll` | `3s` | how often to check whether a tmux-injected reply has finished, before restoring the pane |
+| `--stage-restore-max-wait` | `5m` | give up waiting and restore the pane anyway after this long |
 
 ## What this doesn't do yet
 

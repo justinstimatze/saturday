@@ -23,6 +23,7 @@ results.csv
 /saturday-hook/saturday-hook
 /saturday-mayor/saturday-mayor
 /saturday-thinking/saturday-thinking
+/saturday-voice/saturday-voice
 /sync/sync
 /watcher/watcher
 /bin/saturday-backend
@@ -31,6 +32,7 @@ results.csv
 /bin/saturday-stage
 /bin/saturday-sync
 /bin/saturday-thinking
+/bin/saturday-voice
 /bin/saturday-watcher
 
 # Local-private corpus pulled from real Claude Code transcripts. Ship

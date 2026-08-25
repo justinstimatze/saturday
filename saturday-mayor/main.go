@@ -8,9 +8,13 @@
 // V0.2 will swap stdin for an audio sidecar and add a press-to-commit
 // confirmation gate IF VAD/saliency surfaces ambiguous transcripts.
 //
-// Router/expander prompts, the API plumbing, and the content-hash cache
-// live in the saturday/llmcore package — shared with eval/router and
-// eval/expander_backtest. See llmcore/llm.go for the cache-key contract.
+// The classify/ask/route/expand/inject/summarize decision core lives in
+// the saturday/orchestrator package (extracted so saturday-voice can
+// reuse it) — this file drives an orchestrator.Orchestrator and owns
+// everything specific to mayor's own local-mic surface: the audio
+// sidecar connection, the cognitive-state socket (thinking-pane UI), the
+// das-blinkenlights session bookkeeping's caller side, and the
+// saturday-hook listener.
 //
 // One mayor process per user. Sequential pipeline — one utterance at a
 // time. JSONL-write serialization is implicit because injects don't
@@ -35,10 +39,8 @@ import (
 	"syscall"
 	"time"
 
-	"saturday/inject"
 	llm "saturday/llmcore"
-	"saturday/settle"
-	"saturday/watcherclient"
+	"saturday/orchestrator"
 )
 
 // version is baked in at build time via `-ldflags "-X main.version=$(git describe …)"`.
@@ -83,47 +85,13 @@ func buildVersion() string {
 // --- Pipeline ---
 
 type Mayor struct {
-	apiKey             string
-	sockPath           string
-	cacheDir           string
-	dryRun             bool
-	collisionWait      time.Duration // window the JSONL must be stable before injecting
-	collisionMax       time.Duration // give up waiting after this and inject anyway
-	confThreshold      float64       // skip inject if router or expander conf <= this, must exceed to proceed (0 disables)
-	askConf            float64       // V0.3: classifier conf >= this AND type==ask → answerAsk path. Default 0.7. Higher = stricter ask gate (more inject false-negatives, fewer ask false-positives).
-	injectDirectTokens int           // est. tokens since last compact > this → direct-write skip headless
+	orch *orchestrator.Orchestrator
 
 	// V0.2.1 audio sidecar back-writes. audioMu serializes writes to audioConn
 	// so concurrent writers (pipeline narration + state events + Phase 3
 	// completion reports from the polling goroutine) don't interleave bytes.
 	audioMu   sync.Mutex
 	audioConn net.Conn
-
-	// saturday-stage window-choreography sidecar. Mayor dials stage as a
-	// client and writes focus/restore commands from the inject lifecycle
-	// (focus in commitInject's tmux branch, restore in removePending). stageMu
-	// serializes writes; stageConn is nil when stage isn't running (commands
-	// no-op). runStageClient reconnects with backoff since stage may start
-	// after mayor.
-	stageMu   sync.Mutex
-	stageConn net.Conn
-	stageZoom bool // Posture A: zoom the addressed pane on focus
-	stageTile bool // Posture A: salience-tile the addressed pane on focus
-
-	// Phase 3 — proactive completion reports. After a successful tmux or
-	// direct-write inject, the target session lands in pendingInjects keyed
-	// by sessionID. A polling goroutine watches each tracked JSONL: when the
-	// latest assistant block is text and the file has been stable for
-	// stabilityWindow, it pulls the latest assistant text via the watcher,
-	// asks Haiku for a ≤15-word past-tense summary, and speaks it. Trivial
-	// tasks (small JSONL growth, fast completion) are filtered out so the
-	// user isn't pelted with reports for one-line bash commands.
-	pendingMu       sync.Mutex
-	pendingInjects  map[string]*pendingInject
-	stabilityWindow time.Duration
-	completionTTL   time.Duration
-	minGrowthBytes  int64
-	minElapsed      time.Duration
 
 	// V0.2.6 state socket — exposes mayor's cognitive state to the
 	// saturday-thinking TUI renderer (and any other observer). Wire format:
@@ -141,53 +109,6 @@ type Mayor struct {
 	// V0.2.7: rolling dBFS samples from saturday-audio (5 Hz). Cap 32 ≈ 6.4s.
 	// Mirrored into MayorState.Rms on every snapshot.
 	rmsRing []float64
-
-	// V0.2.6 corner tag (das blinkenlights). Implemented as tmux session
-	// status-right manipulation so the tag lives outside the pane's
-	// scroll region (avoids ghost-trail artifacts from raw-tty writes).
-	noBlink bool
-
-	// V0.2.7 — slow-loop session arc summarizer. arcSummaries[sessionID] is
-	// the latest ≤30-word arc string from llm.RunArc, refreshed in a
-	// background goroutine every arcInterval. Read on every expand to enrich
-	// target.State.SessionArc before passing to RunExpand. Map is small
-	// (one entry per active session) so a single mutex is fine.
-	arcMu        sync.Mutex
-	arcSummaries map[string]string
-	arcInterval  time.Duration
-
-	// V0.3 — expansion-feedback ring. Each successful inject appends a
-	// recentInjectRec; on each prompt_submit hook event we Jaccard-match
-	// against this ring to detect retypes (user re-typed essentially what
-	// we just injected → likely inject misfired or arrived too late).
-	// Bounded by recentInjectsMaxAge + recentInjectsCap (see feedback.go).
-	recentInjectsMu sync.Mutex
-	recentInjects   []recentInjectRec
-}
-
-// pendingInject tracks one outstanding inject awaiting a completion signal.
-// Lifecycle: created in trackInject, removed in fireCompletion (on report)
-// or checkOneInject (on TTL expiry / user-interruption).
-type pendingInject struct {
-	sessionID          string
-	project            string
-	jsonlPath          string
-	injectText         string
-	injectTime         time.Time
-	sizeAtInject       int64
-	lastSize           int64
-	lastSizeChangeTime time.Time
-	candidateFired     bool
-	candidateText      string // filled by checkOneInject when ready, consumed by fireCompletion
-
-	// V0.2.6: narrate policy for Phase 3 spoken summary. "force" =
-	// always speak (skip trivial-drop filter), "silent" = never speak,
-	// "auto" = current default (speak if filters pass).
-	narrate string
-
-	// V0.2.6 corner tag state. Set by startBlink at trackInject time; see
-	// inject.Blinker for what it holds and stopBlink for how it's restored.
-	blinker inject.Blinker
 }
 
 // audioWrite serializes JSON event writes to the audio sidecar conn under
@@ -207,60 +128,11 @@ func (m *Mayor) audioWrite(evt map[string]any) error {
 	return err
 }
 
-// stageWrite serializes JSON command writes to the saturday-stage sidecar
-// under stageMu. No-op (nil) if stage isn't connected, so the inject path
-// never blocks or errors on stage being absent. On write failure the conn is
-// dropped; runStageClient reconnects.
-func (m *Mayor) stageWrite(evt map[string]any) {
-	m.stageMu.Lock()
-	defer m.stageMu.Unlock()
-	if m.stageConn == nil {
-		return
-	}
-	b, _ := json.Marshal(evt)
-	b = append(b, '\n')
-	if _, err := m.stageConn.Write(b); err != nil {
-		m.stageConn.Close()
-		m.stageConn = nil
-	}
-}
-
-// runStageClient dials the stage sidecar and keeps the connection live,
-// reconnecting with capped backoff (stage may start after mayor, or restart
-// under it). It reads and discards anything stage sends (the window_activity
-// stream) purely to detect disconnects; mayor is a command producer here.
-func (m *Mayor) runStageClient(sockPath string) {
-	backoff := time.Second
-	for {
-		conn, err := net.Dial("unix", sockPath)
-		if err != nil {
-			time.Sleep(backoff)
-			if backoff < 16*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		backoff = time.Second
-		m.stageMu.Lock()
-		m.stageConn = conn
-		m.stageMu.Unlock()
-		fmt.Fprintf(os.Stderr, "\033[2m  stage sidecar connected (%s)\033[0m\n", sockPath)
-
-		// Drain until EOF/error to detect disconnect.
-		buf := make([]byte, 4096)
-		for {
-			if _, err := conn.Read(buf); err != nil {
-				break
-			}
-		}
-		m.stageMu.Lock()
-		if m.stageConn == conn {
-			m.stageConn = nil
-		}
-		m.stageMu.Unlock()
-		conn.Close()
-		fmt.Fprintln(os.Stderr, "\033[2m  stage sidecar disconnected\033[0m")
-	}
+// speak wires orchestrator.Config.Speak — a spoken reply from the
+// decision core becomes a {"type":"speak",...} event on the audio
+// sidecar, exactly as the pre-extraction code wrote it inline.
+func (m *Mayor) speak(text string) error {
+	return m.audioWrite(map[string]any{"type": "speak", "text": text})
 }
 
 // emitState fires a one-shot {"type":"state","activity":...} event over the
@@ -345,22 +217,21 @@ func (m *Mayor) snapshot() MayorState {
 	started := m.startedAt
 	m.stateMu.Unlock()
 
-	m.pendingMu.Lock()
-	tracked := make([]TrackedInject, 0, len(m.pendingInjects))
 	now := time.Now()
-	for _, p := range m.pendingInjects {
+	pending := m.orch.PendingInjects()
+	tracked := make([]TrackedInject, 0, len(pending))
+	for _, p := range pending {
 		block := "running"
-		if p.candidateFired {
+		if p.CandidateFired {
 			block = "text"
 		}
 		tracked = append(tracked, TrackedInject{
-			SID:   p.sessionID,
-			Proj:  p.project,
-			AgeS:  now.Sub(p.injectTime).Seconds(),
+			SID:   p.SessionID,
+			Proj:  p.Project,
+			AgeS:  now.Sub(p.InjectTime).Seconds(),
 			Block: block,
 		})
 	}
-	m.pendingMu.Unlock()
 
 	return MayorState{
 		V:       1,
@@ -414,8 +285,8 @@ func (m *Mayor) publishState() {
 }
 
 // recordUtterance appends to the recent ring buffer (cap 10) and bumps the
-// lifetime turn counter, then broadcasts. Called once per utterance after
-// the route decision is made.
+// lifetime turn counter, then broadcasts. Called once per utterance for
+// which orchestrator.Handle returned a non-nil Decision.
 func (m *Mayor) recordUtterance(text, mode, route string, conf float64) {
 	m.stateMu.Lock()
 	m.turns++
@@ -431,6 +302,18 @@ func (m *Mayor) recordUtterance(text, mode, route string, conf float64) {
 	}
 	m.stateMu.Unlock()
 	m.publishState()
+}
+
+// dispatch runs one utterance through the orchestrator and mirrors its
+// Decision (if any) into mayor's own state-sock recent-utterance ring —
+// the same recordUtterance call the pre-extraction handle() made inline,
+// now driven by what Handle reports back.
+func (m *Mayor) dispatch(utterance, mode, narrate string) error {
+	dec, err := m.orch.Handle(utterance, mode, narrate)
+	if dec != nil {
+		m.recordUtterance(utterance, dec.Mode, dec.Route, dec.Conf)
+	}
+	return err
 }
 
 // serveHookSock listens for one-line JSON hook events from saturday-hook
@@ -494,41 +377,25 @@ func (m *Mayor) handleHookConn(conn net.Conn) {
 			head(sid, 8), oneLine(head(prompt, 80)))
 		// V0.3 expansion-feedback: did the user just retype something we
 		// recently injected into this same session? If so, inject was
-		// likely wrong / late / swallowed. Log + persist for later tuning.
-		if rec, sim, isRetype := m.checkRetype(sid, prompt); isRetype {
+		// likely wrong / late / swallowed. CheckRetype logs the match to
+		// the feedback JSONL itself; we just surface it here.
+		if rec, sim, isRetype := m.orch.CheckRetype(sid, prompt); isRetype {
 			age := time.Since(rec.TS)
 			fmt.Fprintf(os.Stderr,
 				"\033[35m  feedback · retype\033[0m · %s · sim=%.2f · %s ago\n  \033[2minject:\033[0m %q\n  \033[2mtyped:\033[0m  %q\n",
 				rec.Project, sim, age.Round(time.Second), oneLine(head(rec.Text, 80)), oneLine(head(prompt, 80)))
-			appendFeedbackRec(map[string]any{
-				"ts":                 float64(time.Now().UnixNano()) / 1e9,
-				"event":              "retype",
-				"session_id":         sid,
-				"project":            rec.Project,
-				"inject_text":        rec.Text,
-				"prompt_text":        prompt,
-				"similarity":         sim,
-				"inject_age_seconds": age.Seconds(),
-			})
 		}
 	case "stop":
 		// If we have a pendingInject for this session, fire Phase 3
 		// immediately. Stability poll was the JSONL-only proxy for "turn
 		// done"; the Stop hook is the authoritative signal.
-		m.pendingMu.Lock()
-		p, ok := m.pendingInjects[sid]
-		m.pendingMu.Unlock()
+		project, ok := m.orch.AccelerateCompletion(sid)
 		if !ok {
 			fmt.Fprintf(os.Stderr, "\033[2m  hook · stop · %s · (no tracked inject)\033[0m\n", head(sid, 8))
 			return
 		}
 		fmt.Fprintf(os.Stderr, "\033[2m  hook · stop · %s · %s · firing Phase 3\033[0m\n",
-			head(sid, 8), p.project)
-		// Trigger an immediate completion check for this inject. checkOneInject
-		// already handles the user-message gate + assistant-block-text check;
-		// the hook just removes the stability-window wait.
-		p.lastSizeChangeTime = time.Now().Add(-m.stabilityWindow - time.Second)
-		m.checkOneInject(p)
+			head(sid, 8), project)
 	default:
 		fmt.Fprintf(os.Stderr, "\033[2m  hook · unknown event %q\033[0m\n", event)
 	}
@@ -541,6 +408,10 @@ func head(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func oneLine(s string) string {
+	return strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
 }
 
 // serveStateSock listens on the Unix socket and dispatches each incoming
@@ -613,544 +484,6 @@ func writeStateFrame(conn net.Conn, snap MayorState) error {
 	return err
 }
 
-// --- V0.2.6 corner tag (das blinkenlights) ---
-//
-// Mechanics (pane discovery, status-right get/set/restore) live in
-// saturday/inject; these are thin Mayor-owning wrappers that hold the
-// per-inject inject.Blinker value under pendingMu.
-
-// startBlink tags paneID's tmux session and stores the resulting
-// inject.Blinker on p so stopBlink can restore the original status-right.
-func (m *Mayor) startBlink(p *pendingInject, paneID string) {
-	if p == nil {
-		return
-	}
-	b := inject.StartBlink(paneID, p.project, m.noBlink)
-	m.pendingMu.Lock()
-	p.blinker = b
-	m.pendingMu.Unlock()
-}
-
-// stopBlink optionally flashes a final banner (e.g. done), then restores
-// the tagged session's original status-right. See inject.Blinker.Stop.
-func (m *Mayor) stopBlink(p *pendingInject, finalText, finalColor string, fadeAfter time.Duration) {
-	if p == nil {
-		return
-	}
-	m.pendingMu.Lock()
-	b := p.blinker
-	p.blinker = inject.Blinker{}
-	m.pendingMu.Unlock()
-	b.Stop(finalText, finalColor, fadeAfter, m.noBlink)
-}
-
-// getPending fetches a pending inject by sessionID under lock. Returns
-// nil if not present.
-func (m *Mayor) getPending(sessionID string) *pendingInject {
-	m.pendingMu.Lock()
-	defer m.pendingMu.Unlock()
-	return m.pendingInjects[sessionID]
-}
-
-func getInt(m map[string]any, k string) (int, bool) {
-	switch v := m[k].(type) {
-	case float64:
-		return int(v), true
-	case int:
-		return v, true
-	}
-	return 0, false
-}
-
-func getStr(m map[string]any, k string) string {
-	if v, ok := m[k].(string); ok {
-		return v
-	}
-	return ""
-}
-
-func getFloat(m map[string]any, k string) float64 {
-	if v, ok := m[k].(float64); ok {
-		return v
-	}
-	return 0
-}
-
-// stripWakeWord detects a leading "saturday" / "hey saturday" wake word and
-// returns the utterance with the prefix removed plus a true flag. The
-// follow-on character must be whitespace or end-of-string punctuation so
-// that "saturdayfile.go" doesn't accidentally trigger. Bare "saturday"
-// (with nothing after) returns "" + true — caller should still route to
-// ask-mode and the asker will produce a generic "what's on" reply.
-func stripWakeWord(utt string) (string, bool) {
-	s := strings.TrimSpace(utt)
-	lower := strings.ToLower(s)
-	for _, prefix := range []string{"hey saturday", "saturday"} {
-		if !strings.HasPrefix(lower, prefix) {
-			continue
-		}
-		rest := s[len(prefix):]
-		if rest == "" {
-			return "", true
-		}
-		sep := rest[0]
-		if sep == ' ' || sep == ',' || sep == ':' || sep == ';' ||
-			sep == '!' || sep == '.' || sep == '?' || sep == '-' || sep == '\t' {
-			return strings.TrimLeft(rest, " \t,:;!.?-"), true
-		}
-	}
-	return s, false
-}
-
-// handle runs one utterance through the pipeline. mode is "expand" or
-// "verbatim". Verbatim skips the LLM expander; the utterance text becomes
-// the inject directly. Router still picks the session in both modes.
-// narrate is "force"|"silent"|"auto" — controls whether Phase 3 fires the
-// spoken completion summary (force=always, silent=never, auto=current
-// trivial-drop filters apply).
-//
-// V0.3 ask-mode branch: utterances directed AT Saturday (wake-word prefix
-// or classifier-flagged) skip the route/expand/inject pipeline entirely
-// and instead get a spoken answer from cross-session arcs + recent state.
-// Verbatim mode bypasses the branch — user explicitly typed literal text.
-func (m *Mayor) handle(utterance, mode, narrate string) error {
-	if mode != "verbatim" {
-		if cleaned, isAsk := stripWakeWord(utterance); isAsk {
-			fmt.Fprintf(os.Stderr, "\033[35m? ask\033[0m \033[2m(wake-word)\033[0m\n")
-			return m.answerAsk(cleaned)
-		}
-		// Classifier — Haiku call, ~$0.0001 per utterance. Errors fall
-		// through silently to inject; classifier is a UX optimization,
-		// not a load-bearing decision.
-		t, conf, rat, err := llm.RunClassify(m.apiKey, m.cacheDir, utterance)
-		if err == nil {
-			if t == "ask" && conf >= m.askConf {
-				fmt.Fprintf(os.Stderr, "\033[35m? ask\033[0m \033[2m(conf=%.2f — %s)\033[0m\n",
-					conf, oneLine(rat))
-				return m.answerAsk(utterance)
-			}
-			if t == "ask" {
-				fmt.Fprintf(os.Stderr, "  \033[2m↳ classifier ask conf=%.2f below %.2f; treating as inject\033[0m\n",
-					conf, m.askConf)
-			}
-		}
-	}
-
-	m.emitState("routing")
-	defer m.emitState("")
-	sessions, err := watcherclient.FetchSessions(m.sockPath)
-	if err != nil {
-		return fmt.Errorf("fetch sessions: %w", err)
-	}
-	// Filter: must have a session_id (some entries may be project-only stubs)
-	live := make([]watcherclient.SessionEntry, 0, len(sessions))
-	for _, s := range sessions {
-		if s.State.SessionID != "" {
-			live = append(live, s)
-		}
-	}
-	if len(live) == 0 {
-		return errors.New("no active sessions in watcher state")
-	}
-	if len(live) == 1 {
-		// Single-session shortcut: skip the router, just expand against the only target.
-		m.recordUtterance(utterance, mode, live[0].State.Project, 0)
-		return m.expandAndInject(utterance, live[0], mode, narrate)
-	}
-
-	cands := make([]llm.State, len(live))
-	for i, s := range live {
-		cands[i] = s.State
-		// V0.2.8: enrich routing candidates with the cached arc summary so
-		// the router can disambiguate anaphoric references ("rerun it",
-		// "the same one") by session theme, not just last-N-turn signals.
-		// No-op if no arc cached yet; expander still re-enriches its target.
-		m.enrichWithArc(&cands[i])
-	}
-	rt, err := llm.RunRoute(m.apiKey, m.cacheDir, utterance, cands)
-	if err != nil {
-		return fmt.Errorf("router: %w", err)
-	}
-	idx, ok := getInt(rt, "target_index")
-	if !ok || idx < 0 || idx >= len(live) {
-		return fmt.Errorf("router returned bad target_index: %v", rt["target_index"])
-	}
-	conf := getFloat(rt, "confidence")
-	target := live[idx]
-	fmt.Fprintf(os.Stderr, "\033[2;36m→ route:\033[0m %s \033[2m(conf=%.2f)\033[0m \033[2m— %s\033[0m\n",
-		target.State.Project, conf, oneLine(getStr(rt, "rationale")))
-	if m.confThreshold > 0 && conf <= m.confThreshold {
-		fmt.Fprintf(os.Stderr, "  ↳ router conf below threshold %.2f; skipping inject\n", m.confThreshold)
-		return nil
-	}
-	m.recordUtterance(utterance, mode, target.State.Project, conf)
-	return m.expandAndInject(utterance, target, mode, narrate)
-}
-
-// answerAsk is the V0.3 ask-mode path: gather Saturday's bird's-eye state
-// (arcs, recent voice activity, in-flight injects) and call llm.RunAsk to
-// produce a brief spoken answer. The answer goes to the audio sidecar for
-// TTS and is logged to mayor's stderr in the ask register (magenta). No
-// pendingInject is created — ask is a terminal action.
-func (m *Mayor) answerAsk(utterance string) error {
-	m.emitState("asking")
-	defer m.emitState("")
-
-	if utterance == "" {
-		// Bare wake word ("saturday") with no follow-on — treat as a
-		// generic "what's on" probe rather than failing.
-		utterance = "what's on"
-	}
-
-	ctx := llm.AskContext{
-		Arcs:         map[string]string{},
-		ProjectBySID: map[string]string{},
-	}
-
-	// Pair each cached arc with its project name from the watcher
-	// snapshot. Sessions with no arc cached yet are omitted — RunAsk's
-	// prompt tells the model how to handle absences.
-	if sessions, err := watcherclient.FetchSessions(m.sockPath); err == nil {
-		m.arcMu.Lock()
-		for _, s := range sessions {
-			sid := s.State.SessionID
-			if sid == "" {
-				continue
-			}
-			if arc, ok := m.arcSummaries[sid]; ok && arc != "" {
-				ctx.Arcs[sid] = arc
-				ctx.ProjectBySID[sid] = s.State.Project
-			}
-		}
-		m.arcMu.Unlock()
-	}
-
-	m.stateMu.Lock()
-	for _, u := range m.recent {
-		ctx.RecentUtterances = append(ctx.RecentUtterances,
-			fmt.Sprintf("%s → %s (%s)", oneLine(u.Text), u.Route, u.Mode))
-	}
-	m.stateMu.Unlock()
-
-	m.pendingMu.Lock()
-	for _, p := range m.pendingInjects {
-		ctx.TrackedInjects = append(ctx.TrackedInjects,
-			fmt.Sprintf("%s: %s", p.project, oneLine(head(p.injectText, 80))))
-	}
-	m.pendingMu.Unlock()
-
-	reply, err := llm.RunAsk(m.apiKey, m.cacheDir, utterance, ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\033[31m× ask:\033[0m %v\n", err)
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "\033[35m? ask:\033[0m %q\n  \033[35m→\033[0m %s\n",
-		oneLine(utterance), reply)
-
-	// Mark the utterance with mode=ask so the thinking pane and
-	// downstream tools can distinguish ask traffic from inject traffic.
-	m.recordUtterance(utterance, "ask", "saturday", 1.0)
-
-	if err := m.audioWrite(map[string]any{"type": "speak", "text": reply}); err != nil {
-		fmt.Fprintf(os.Stderr, "  \033[2m↳ audio speak failed: %v\033[0m\n", err)
-	}
-	return nil
-}
-
-// commitInject runs the inject-execution path: collision-wait, optional TTS
-// narration, path selection (tmux → direct-write → headless). Used by both
-// expand-mode (after the expander returns action=inject) and verbatim-mode
-// (utterance text becomes the inject directly, narration empty).
-func (m *Mayor) commitInject(target watcherclient.SessionEntry, text, narration, narrate string) error {
-	m.emitState("injecting → " + target.State.Project)
-	if m.dryRun {
-		fmt.Fprintln(os.Stderr, "  [dry-run; skipping exec]")
-		return nil
-	}
-	if narration != "" {
-		if err := m.audioWrite(map[string]any{"type": "speak", "text": narration}); err == nil {
-			fmt.Fprintf(os.Stderr, "  ↳ narrating: %q\n", narration)
-		}
-	}
-	waited, timedOut := settle.WaitForQuiet(target.JSONLPath, m.collisionWait, m.collisionMax)
-	if waited > 0 {
-		tag := "stable"
-		if timedOut {
-			tag = "timed-out"
-		}
-		fmt.Fprintf(os.Stderr, "  ↳ collision-window %s after %s\n", tag, waited.Round(time.Millisecond))
-	}
-	// Path selection (preferred → fallback):
-	// 1. Target's claude is running in a tmux pane → tmux send-keys.
-	// 2. No tmux pane, JSONL post-compact size > threshold → direct-write user turn.
-	// 3. Else → headless `claude --resume --print`.
-	if paneID := inject.FindTmuxPane(target.State.Cwd); paneID != "" {
-		fmt.Fprintf(os.Stderr, "  ↳ found tmux pane %s for cwd=%s; using tmux send-keys\n", paneID, target.State.Cwd)
-		if err := inject.ViaTmux(paneID, text); err != nil {
-			return fmt.Errorf("tmux send-keys: %w", err)
-		}
-		fmt.Fprintln(os.Stderr, "  ↳ injected via tmux send-keys (live pane handles)")
-		m.trackInject(target, text, narrate)
-		m.startBlink(m.getPending(target.State.SessionID), paneID)
-		// Window choreography: surface + highlight the addressed pane. Only
-		// reached after the inject committed (post confThreshold), so this is
-		// confident by construction — stage relocates; on a shaky route the
-		// utterance was dropped before we ever got here.
-		m.stageWrite(map[string]any{
-			"type":       "focus",
-			"session_id": target.State.SessionID,
-			"project":    target.State.Project,
-			"pane_id":    paneID,
-			"cwd":        target.State.Cwd,
-			"zoom":       m.stageZoom,
-			"tile":       m.stageTile,
-		})
-		return nil
-	}
-	fmt.Fprintln(os.Stderr, "  ↳ no tmux pane found for target cwd; using JSONL fallback path")
-	if m.injectDirectTokens > 0 && target.JSONLPath != "" {
-		est, err := inject.TokensSinceLastCompact(target.JSONLPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  ↳ token-estimate failed: %v; falling back to headless inject\n", err)
-		} else if est > m.injectDirectTokens {
-			fmt.Fprintf(os.Stderr, "  ↳ post-compact tokens-est %d > %d threshold; direct-writing user turn (no headless invocation)\n",
-				est, m.injectDirectTokens)
-			if err := inject.DirectWriteUserTurn(target.JSONLPath, target.State.SessionID, target.State.Cwd, text); err != nil {
-				return fmt.Errorf("direct-write: %w", err)
-			}
-			fmt.Fprintf(os.Stderr, "  ↳ direct-wrote user turn to %s\n", target.JSONLPath)
-			m.trackInject(target, text, narrate)
-			return nil
-		} else {
-			fmt.Fprintf(os.Stderr, "  ↳ post-compact tokens-est %d ≤ %d; using headless inject\n",
-				est, m.injectDirectTokens)
-		}
-	}
-	n, err := inject.Headless(target.State.SessionID, target.State.Cwd, text)
-	if err != nil {
-		return fmt.Errorf("claude --resume --print: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "  ↳ injected (cwd=%s), %d bytes assistant reply\n", target.State.Cwd, n)
-	return nil
-}
-
-func (m *Mayor) expandAndInject(utterance string, target watcherclient.SessionEntry, mode, narrate string) error {
-	if mode == "verbatim" {
-		// Verbatim mode: utterance text becomes the inject directly. No
-		// expander LLM call. No narration speak event — sidecar's instant
-		// stock ack is the audible feedback, no need for a second TTS.
-		fmt.Fprintf(os.Stderr, "\033[1;33m→ Saturday → %s\033[0m \033[2m(verbatim)\033[0m: \033[33m%s\033[0m\n",
-			target.State.Project, oneLine(utterance))
-		return m.commitInject(target, utterance, "", narrate)
-	}
-	m.emitState("expanding")
-	m.enrichWithArc(&target.State)
-	exp, err := llm.RunExpand(m.apiKey, m.cacheDir, utterance, target.State)
-	if err != nil {
-		return fmt.Errorf("expander: %w", err)
-	}
-	action := getStr(exp, "action")
-	text := getStr(exp, "text")
-	conf := getFloat(exp, "confidence")
-	switch action {
-	case "inject":
-		fmt.Fprintf(os.Stderr, "\033[1;33m→ Saturday → %s\033[0m \033[2m(conf=%.2f)\033[0m: \033[33m%s\033[0m\n",
-			target.State.Project, conf, oneLine(text))
-		if m.confThreshold > 0 && conf <= m.confThreshold {
-			fmt.Fprintf(os.Stderr, "  ↳ expander conf below threshold %.2f; skipping inject\n", m.confThreshold)
-			return nil
-		}
-		text = inject.WithCallsignRule(text)
-		return m.commitInject(target, text, getStr(exp, "confirmation"), narrate)
-	case "ask":
-		fmt.Fprintf(os.Stderr, "\033[1;35m? expander asks\033[0m \033[2m(%s)\033[0m: %s\n", target.State.Project, oneLine(text))
-		if err := m.audioWrite(map[string]any{"type": "speak", "text": text}); err != nil {
-			fmt.Fprintf(os.Stderr, "  ↳ tts send failed: %v\n", err)
-		} else {
-			fmt.Fprintln(os.Stderr, "  ↳ spoken via TTS")
-		}
-		return nil
-	case "decline":
-		fmt.Fprintf(os.Stderr, "\033[1;31m✗ expander declined\033[0m \033[2m(%s)\033[0m: \033[2m%s\033[0m\n", target.State.Project, oneLine(getStr(exp, "rationale")))
-		return nil
-	default:
-		return fmt.Errorf("expander returned unknown action: %q", action)
-	}
-}
-
-// --- Phase 3: completion-report tracking ---
-
-// trackInject records that we just sent text to target's live pane (via tmux
-// or direct-write). The polling goroutine watches the JSONL for completion
-// and speaks a Haiku summary when the chain quiesces. Headless inject path
-// doesn't call this — completion is synchronous there, no follow-up needed.
-//
-// Re-tracking the same session overwrites the prior record. This is the
-// right behavior for "user injected B before A finished": A's report is
-// dropped (the user has moved on), and we now wait for B's completion.
-func (m *Mayor) trackInject(target watcherclient.SessionEntry, text, narrate string) {
-	if target.State.SessionID == "" || target.JSONLPath == "" {
-		return
-	}
-	sz, _ := settle.FileSize(target.JSONLPath)
-	now := time.Now()
-	m.pendingMu.Lock()
-	defer m.pendingMu.Unlock()
-	if m.pendingInjects == nil {
-		m.pendingInjects = make(map[string]*pendingInject)
-	}
-	m.pendingInjects[target.State.SessionID] = &pendingInject{
-		sessionID:          target.State.SessionID,
-		project:            target.State.Project,
-		jsonlPath:          target.JSONLPath,
-		injectText:         text,
-		injectTime:         now,
-		sizeAtInject:       sz,
-		lastSize:           sz,
-		lastSizeChangeTime: now,
-		narrate:            narrate,
-	}
-	m.recordRecentInject(target.State.SessionID, target.State.Project, text)
-	go m.publishState()
-}
-
-// removePending deletes a pending inject under lock. Safe to call for a
-// sessionID that's not present.
-func (m *Mayor) removePending(sessionID string) {
-	m.pendingMu.Lock()
-	proj := ""
-	if p := m.pendingInjects[sessionID]; p != nil {
-		proj = p.project
-	}
-	delete(m.pendingInjects, sessionID)
-	m.pendingMu.Unlock()
-	// De-emphasize the addressed window on any teardown (completion, TTL
-	// expiry, interruption). No-op in stage for sessions it never highlighted.
-	m.stageWrite(map[string]any{"type": "restore", "session_id": sessionID, "project": proj})
-	go m.publishState()
-}
-
-// pollCompletions runs forever, ticking every 3 s and checking each pending
-// inject for completion. Started in runAudioSock; not started in stdin mode
-// (headless inject is synchronous, nothing to track).
-func (m *Mayor) pollCompletions() {
-	tick := time.NewTicker(3 * time.Second)
-	defer tick.Stop()
-	for range tick.C {
-		m.checkPendingInjects()
-	}
-}
-
-func (m *Mayor) checkPendingInjects() {
-	m.pendingMu.Lock()
-	pending := make([]*pendingInject, 0, len(m.pendingInjects))
-	for _, p := range m.pendingInjects {
-		pending = append(pending, p)
-	}
-	m.pendingMu.Unlock()
-	for _, p := range pending {
-		m.checkOneInject(p)
-	}
-}
-
-// checkOneInject is the per-session completion-detection state machine.
-//
-// Drop on TTL expiry — long-running tasks shouldn't block the slot forever
-// in case our detector misses the completion signal.
-//
-// Drop on trivial growth — small tasks (one-line bash, status check) don't
-// need a spoken report; the user heard the stock ack and that's enough.
-//
-// The completion signal: latest assistant block in the JSONL is `text`
-// (no tool_use / thinking / tool_result trailing it) AND the JSONL has been
-// size-stable for stabilityWindow. While a tool chain is running, the
-// latest block is `tool_use` waiting for `tool_result` — this signal is
-// genuinely off until the chain ends with an assistant text turn.
-func (m *Mayor) checkOneInject(p *pendingInject) {
-	now := time.Now()
-	if now.Sub(p.injectTime) > m.completionTTL {
-		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: TTL expired for %s, dropping\n", p.project)
-		m.stopBlink(p, "", "", 0)
-		m.removePending(p.sessionID)
-		return
-	}
-	sz, err := settle.FileSize(p.jsonlPath)
-	if err != nil {
-		return
-	}
-	if sz != p.lastSize {
-		// JSONL grew — chain is still active. Reset the stability clock.
-		m.pendingMu.Lock()
-		p.lastSize = sz
-		p.lastSizeChangeTime = now
-		p.candidateFired = false
-		m.pendingMu.Unlock()
-		return
-	}
-	if p.candidateFired {
-		return
-	}
-	if now.Sub(p.lastSizeChangeTime) < m.stabilityWindow {
-		return
-	}
-	if now.Sub(p.injectTime) < m.minElapsed {
-		return
-	}
-	if sz-p.sizeAtInject < m.minGrowthBytes && p.narrate != "force" {
-		// Trivial — task barely produced output. Drop silently.
-		// "force" narrate (user said "tell me…") bypasses this filter.
-		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: trivial inject for %s (Δ%d bytes), dropping\n",
-			p.project, sz-p.sizeAtInject)
-		m.stopBlink(p, "", "", 0)
-		m.removePending(p.sessionID)
-		return
-	}
-	text, ready, err := settle.AssistantTextAfterInject(p.jsonlPath, p.sizeAtInject, p.injectText)
-	if err != nil || !ready {
-		return
-	}
-	m.pendingMu.Lock()
-	p.candidateFired = true
-	p.candidateText = text
-	m.pendingMu.Unlock()
-	go m.publishState()
-	go m.fireCompletion(p)
-}
-
-// fireCompletion produces and speaks the completion report. Runs in its own
-// goroutine so the Haiku call doesn't block the polling loop. The candidate
-// text was captured by checkOneInject from the assistant block that
-// followed our inject's echoed user-message in the JSONL — so it's
-// definitely the answer to OUR inject, not whatever was at the JSONL tail
-// when an inject queued behind unrelated work.
-func (m *Mayor) fireCompletion(p *pendingInject) {
-	defer m.removePending(p.sessionID)
-	defer m.stopBlink(p, inject.DoneTag(p.project), "colour46", 2*time.Second)
-	lastText := strings.TrimSpace(p.candidateText)
-	if lastText == "" {
-		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: empty candidate text for %s, skipping\n", p.project)
-		return
-	}
-	summary, err := llm.RunSummarize(m.apiKey, m.cacheDir, p.injectText, lastText)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: summarize failed for %s: %v\n", p.project, err)
-		return
-	}
-	if strings.TrimSpace(summary) == "" {
-		return
-	}
-	// V0.2.6: respect narrate policy. "silent" = log but don't speak.
-	if p.narrate == "silent" {
-		fmt.Fprintf(os.Stderr, "\033[2;32m✓ completion report\033[0m \033[2m(%s, silent)\033[0m: \033[2m%q\033[0m\n", p.project, summary)
-		return
-	}
-	if err := m.audioWrite(map[string]any{"type": "speak", "text": summary}); err != nil {
-		fmt.Fprintf(os.Stderr, "  ↳ completion-tracker: speak send failed: %v\n", err)
-		return
-	}
-	fmt.Fprintf(os.Stderr, "\033[1;32m✓ completion report\033[0m \033[2m(%s)\033[0m: \033[32m%q\033[0m\n", p.project, summary)
-}
-
 func defaultRuntimeDir() string {
 	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		return d
@@ -1216,86 +549,6 @@ func (m *Mayor) runClientWatchdog(pidfile string) {
 			muted = false // reset so a future detach re-arms the SIGUSR1 send
 		}
 	}
-}
-
-// runArcRefresher is V0.2.7's slow-loop session-arc summarizer. Every
-// arcInterval, fetches the watcher state, and for each active session with
-// substantive content (LastUserTurn or LastAssistantText non-empty) calls
-// llm.RunArc and stores the result in arcSummaries.
-//
-// Failures are logged dim and skipped — arc is best-effort context, never
-// blocks expansion. Sessions that have aged out of the watcher (no longer in
-// the snapshot) get their arc removed to bound map growth.
-func (m *Mayor) runArcRefresher() {
-	tick := time.NewTicker(m.arcInterval)
-	defer tick.Stop()
-	// Run once immediately on startup so a fresh mayor has arcs within
-	// seconds rather than after the first interval. Sleep briefly first to
-	// let the initial state-sock + audio-sock setup settle.
-	time.Sleep(2 * time.Second)
-	m.refreshArcs()
-	for range tick.C {
-		m.refreshArcs()
-	}
-}
-
-func (m *Mayor) refreshArcs() {
-	sessions, err := watcherclient.FetchSessions(m.sockPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\033[2m  arc-refresher: watcher fetch failed: %v\033[0m\n", err)
-		return
-	}
-	live := map[string]struct{}{}
-	for _, s := range sessions {
-		if s.State.SessionID == "" {
-			continue
-		}
-		live[s.State.SessionID] = struct{}{}
-		summary, err := llm.RunArc(m.apiKey, m.cacheDir, s.State)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\033[2m  arc-refresher: %s: %v\033[0m\n", s.State.Project, err)
-			continue
-		}
-		if summary == "" {
-			continue
-		}
-		m.arcMu.Lock()
-		prev := m.arcSummaries[s.State.SessionID]
-		m.arcSummaries[s.State.SessionID] = summary
-		m.arcMu.Unlock()
-		if prev != summary {
-			fmt.Fprintf(os.Stderr, "\033[2m  arc · %s · %s\033[0m\n", s.State.Project, summary)
-		}
-	}
-	// Drop arcs for sessions no longer live so the map is bounded by
-	// active-session count, not lifetime utterance count.
-	m.arcMu.Lock()
-	for sid := range m.arcSummaries {
-		if _, ok := live[sid]; !ok {
-			delete(m.arcSummaries, sid)
-		}
-	}
-	m.arcMu.Unlock()
-}
-
-// enrichWithArc fills in s.SessionArc from the cached arc map before s is
-// passed to the expander. No-op if no arc has been computed yet for this
-// session — the expander's prompt makes the field optional.
-func (m *Mayor) enrichWithArc(s *llm.State) {
-	if s == nil || s.SessionID == "" {
-		return
-	}
-	m.arcMu.Lock()
-	defer m.arcMu.Unlock()
-	if arc, ok := m.arcSummaries[s.SessionID]; ok && arc != "" {
-		s.SessionArc = arc
-	}
-}
-
-// --- helpers ---
-
-func oneLine(s string) string {
-	return strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
 }
 
 // --- main ---
@@ -1406,27 +659,32 @@ func main() {
 	}
 
 	m := &Mayor{
-		apiKey:             apiKey,
-		sockPath:           *sock,
-		cacheDir:           *cacheDir,
-		dryRun:             *dryRun,
-		collisionWait:      *collisionWait,
-		collisionMax:       *collisionMax,
-		confThreshold:      *confThreshold,
-		askConf:            *askConf,
-		injectDirectTokens: *injectDirectTokens,
-		stabilityWindow:    *stabilityWindow,
-		completionTTL:      *completionTTL,
-		minGrowthBytes:     *minGrowthBytes,
-		minElapsed:         *minElapsed,
-		startedAt:          time.Now(),
-		state:              "idle",
-		noBlink:            *noBlink,
-		arcSummaries:       map[string]string{},
-		arcInterval:        *arcInterval,
-		stageZoom:          *stageZoom,
-		stageTile:          *stageTile,
+		startedAt: time.Now(),
+		state:     "idle",
 	}
+
+	m.orch = orchestrator.New(orchestrator.Config{
+		APIKey:             apiKey,
+		CacheDir:           *cacheDir,
+		WatcherSock:        *sock,
+		ConfThreshold:      *confThreshold,
+		AskConf:            *askConf,
+		CollisionWait:      *collisionWait,
+		CollisionMax:       *collisionMax,
+		InjectDirectTokens: *injectDirectTokens,
+		StabilityWindow:    *stabilityWindow,
+		CompletionTTL:      *completionTTL,
+		MinGrowthBytes:     *minGrowthBytes,
+		MinElapsed:         *minElapsed,
+		ArcInterval:        *arcInterval,
+		NoBlink:            *noBlink,
+		StageZoom:          *stageZoom,
+		StageTile:          *stageTile,
+		StageSock:          *stageSock,
+		DryRun:             *dryRun,
+		Speak:              m.speak,
+		EmitState:          m.emitState,
+	})
 
 	fmt.Fprintf(os.Stderr, "saturday-mayor — sock=%s dry-run=%v\n", *sock, *dryRun)
 
@@ -1438,17 +696,9 @@ func main() {
 		go m.serveHookSock(*hookSock)
 	}
 
-	if m.arcInterval > 0 {
-		go m.runArcRefresher()
-	}
-
 	// V0.3.1 safety belt — force-mute audio if no tmux client is attached.
 	// Self-disables when mayor isn't inside tmux or when --audio-pidfile="".
 	go m.runClientWatchdog(*audioPidfile)
-
-	if *stageSock != "" {
-		go m.runStageClient(*stageSock)
-	}
 
 	if *audioSock != "" {
 		runAudioSock(m, *audioSock)
@@ -1466,7 +716,7 @@ func runStdin(m *Mayor) {
 		if line == "" {
 			continue
 		}
-		if err := m.handle(line, "expand", "auto"); err != nil {
+		if err := m.dispatch(line, "expand", "auto"); err != nil {
 			fmt.Fprintf(os.Stderr, "\033[1;31m× %v\033[0m\n", err)
 		}
 	}
@@ -1493,7 +743,7 @@ func runAudioSock(m *Mayor, sockPath string) {
 		os.Exit(0)
 	}()
 
-	go m.pollCompletions()
+	m.orch.StartCompletionPolling()
 
 	fmt.Fprintf(os.Stderr, "\033[1;32m[ready] saturday-mayor — listening on %s for audio sidecar\033[0m\n", sockPath)
 	for {
@@ -1560,7 +810,7 @@ func handleAudioConn(m *Mayor, conn net.Conn) {
 		// need to flip to the audio pane to see what was heard.
 		fmt.Fprintf(os.Stderr, "\033[1;36m← utt\033[0m \033[2m(%s, narrate=%s)\033[0m %s\n",
 			mode, narrate, text)
-		if err := m.handle(text, mode, narrate); err != nil {
+		if err := m.dispatch(text, mode, narrate); err != nil {
 			fmt.Fprintf(os.Stderr, "\033[1;31m× %v\033[0m\n", err)
 		}
 	}
