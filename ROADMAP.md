@@ -116,16 +116,27 @@ tool's hook subcommands (`display`/`writecheck`/`hook`) were reusable
 directly — all three are bound to a real, validated Claude Code
 `session_id` — so this uses each tool's one session-independent
 surface (`cope-gate --check`, basanite's plain tic-list file) instead.
-**Not done:** the actual prose-level persona tweaking this item
-originally meant — no `saturday.effigy` VOICE/TRAITS/NEVER content has
-been edited. Two live findings to weigh before doing that: (1)
-`cope-gate --check` flags `saturday.effigy`'s `NEVER[]` block as 2
-rules over its own 10-rule budget (rules past #10 never reach cope's
-own card-injection path — a content call: cut two, merge two, or
-promote to `CRITICAL`); (2) now that violations are actually logged,
-the next real tweaking pass should read
-`cope-violations.jsonl` from live usage first rather than guessing —
-the same lesson the V0.2.7 expander-prompt regression already taught
+**`NEVER[]` rule-budget fix shipped 2026-08-26** — `8cc9b27`. The 2
+rules `cope-gate --check` flagged as past its 10-rule budget ("never
+read the project name back", "never repeat the user's words back")
+turned out to be restatements of the existing "never re-confirm what
+was just said" rule, not distinct ones — merged into one rule that
+keeps both concrete examples. 12 → 10, no content lost, `cope-gate
+--check` no longer warns. Caveat found while verifying: `--check`'s
+single-text mode scored the merged rule's own example violations
+("you want me to run git status?" in isolation) as clean — this rule
+category needs the paired user/assistant turns cope's real Stop hook
+sees to judge an echo-back; a bare `--check` can't compare a reply
+against what the user actually said. Not a regression from this fix,
+just a limit of `--check` mode worth knowing before trusting it to
+catch this category of violation.
+
+**Still not done:** the actual prose-level persona tweaking this item
+originally meant — no `saturday.effigy` VOICE/TRAITS/NEVER content
+beyond the rule-count merge above has changed. Once violations
+accumulate in `cope-violations.jsonl` from live usage, the next
+tweaking pass should read that log first rather than guessing — the
+same lesson the V0.2.7 expander-prompt regression already taught
 (appending rules to a tuned prompt dropped its eval pass rate
 77%→57%) argues for evidence-driven, structural edits over blind
 additions here too.
