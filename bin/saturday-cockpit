@@ -317,22 +317,45 @@ add_pane_pellicle() {
 bind_hotkeys() {
     tmux set-option -g pane-base-index 1
     ensure_pane_slots
+    # bind-key -n is server-global, not session-scoped — a hardcoded session
+    # name baked in here at bind time would let whichever session last ran
+    # this (including a throwaway test session) hijack every other session's
+    # hotkeys on the same tmux server. #{session_name} is tmux's own format
+    # syntax (no leading $, so bash leaves it alone) — run-shell expands it
+    # at keypress time using the firing client's own current pane, so each
+    # session's Alt+N always targets that session, however many are running.
+    #
+    # run-shell format-expands its ENTIRE command string once, up front,
+    # before handing it to the shell — so a #{...} meant for the *nested*
+    # list-panes call (its own -f/-F, evaluated once per candidate pane)
+    # would otherwise get collapsed early against the single firing pane,
+    # turning a per-pane filter into a firing-pane-only constant. ##{...}
+    # (tmux's escape for a literal #) defers those tokens so list-panes
+    # itself expands them per row; only #{session_name} — meant to resolve
+    # once, for list-panes' own -t — stays single-escaped. Confirmed live:
+    # without the doubling, -F '#{pane_id}' returned the firing pane's own
+    # id on every row instead of each candidate's.
     for n in 1 2 3 4 5 6 7 8 9; do
-        tmux bind-key -n "M-$n" run-shell "p=\$(tmux list-panes -t $SESSION -f '#{==:#{@cockpit_slot},$n}' -F '#{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
+        tmux bind-key -n "M-$n" run-shell "p=\$(tmux list-panes -t '#{session_name}' -f '##{==:##{@cockpit_slot},$n}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
     done
     # Alt+letter: same scheme, panes 10+, once a session outgrows the nine
     # digits (M-0 is the overview reset above, not a tenth pane). See
     # COCKPIT_HOTKEY_LETTERS above for why these letters and not others.
     local pane=10
     for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        tmux bind-key -n "M-$l" run-shell "p=\$(tmux list-panes -t $SESSION -f '#{==:#{@cockpit_slot},$pane}' -F '#{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
+        tmux bind-key -n "M-$l" run-shell "p=\$(tmux list-panes -t '#{session_name}' -f '##{==:##{@cockpit_slot},$pane}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
         pane=$((pane + 1))
     done
     # Un-zoom if zoomed, then always re-tile to even shares — stage's
     # proportionalTile leaves panes at an emphasis skew (resize-pane -x) that
     # zoom-checking alone doesn't touch, so without this second command M-0
     # only fixed the zoom case and left a tile-skewed layout untouched.
-    tmux bind-key -n M-0 run-shell "tmux if-shell -F '#{window_zoomed_flag}' 'resize-pane -Z' ; tmux select-layout -t $SESSION $LAYOUT"
+    # window_zoomed_flag is if-shell's OWN condition (evaluated against the
+    # firing pane, which is what we want) — double-escaped for the same
+    # deferral reason, so if-shell itself resolves it rather than run-shell
+    # collapsing it first (the exact failure this session hit: run-shell had
+    # already flattened it to a literal '0'/'1' before if-shell ever ran).
+    tmux bind-key -n M-0 run-shell "tmux if-shell -F '##{window_zoomed_flag}' 'resize-pane -Z' ; tmux select-layout -t '#{session_name}' $LAYOUT"
 
     # kill-pane (e.g. clearing a dead remain-on-exit pane) doesn't re-tile on
     # its own — tmux just hands the freed space to a neighbor, leaving an
