@@ -99,6 +99,37 @@ Tier A has no open items as of this ship.
 
 Federated state · Roaming voice · Breakroom / long-arc · 3D substrate — long horizon, no near-term trigger. See "Speculative / later" below.
 
+**Register tuning — infrastructure half shipped 2026-08-26** —
+`6515eaf`, `b26df3f`. Two gaps closed: `EffigyForPrompt()` now appends
+a `VOCABULARY[]` block sourced from basanite's live
+`~/.config/basanite/known-tics.txt` (input-side awareness, the same
+shape as basanite's own `UserPromptSubmit` hook for Claude Code); and
+every spoken reply now gets scored post-generation against
+`saturday.effigy` by the real `cope-gate --check` engine — wired once
+at `Mayor.speak()`, the single point every generator's spoken output
+already funnels through, not scattered per-caller. Fire-and-forget,
+warn-only, matching cope-gate's own live Stop-hook wiring for this
+session exactly (no `-block`): nothing here blocks or rewrites
+speech, violations just land in
+`~/.local/state/saturday/cope-violations.jsonl` for review. Neither
+tool's hook subcommands (`display`/`writecheck`/`hook`) were reusable
+directly — all three are bound to a real, validated Claude Code
+`session_id` — so this uses each tool's one session-independent
+surface (`cope-gate --check`, basanite's plain tic-list file) instead.
+**Not done:** the actual prose-level persona tweaking this item
+originally meant — no `saturday.effigy` VOICE/TRAITS/NEVER content has
+been edited. Two live findings to weigh before doing that: (1)
+`cope-gate --check` flags `saturday.effigy`'s `NEVER[]` block as 2
+rules over its own 10-rule budget (rules past #10 never reach cope's
+own card-injection path — a content call: cut two, merge two, or
+promote to `CRITICAL`); (2) now that violations are actually logged,
+the next real tweaking pass should read
+`cope-violations.jsonl` from live usage first rather than guessing —
+the same lesson the V0.2.7 expander-prompt regression already taught
+(appending rules to a tuned prompt dropped its eval pass rate
+77%→57%) argues for evidence-driven, structural edits over blind
+additions here too.
+
 **Steel Battalion cockpit boot sequence — bash-only v1 shipped
 2026-08-26** — `afdea24`. `saturday-cockpit --boot` gives a
 freshly launched cockpit a staggered, themed reveal instead of instant
