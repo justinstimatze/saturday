@@ -23,6 +23,20 @@ deleted all of it, so the stage code was hand-spliced onto current
 main instead. The origin branch itself is safe to delete now; not done
 here.
 
+**Interest re-rank, 2026-08-26 — cuts across tiers, doesn't change any
+trigger/blocking status below.** Current pull, ranked by what's actually
+wanted next rather than by readiness: voice usage ramping up (tier D,
+"Roaming voice" and the wider voice stack generally) → focus-driven
+window repositioning (the flat-screen half of this already shipped as
+`saturday-stage` tile emphasis, `548d012`; the VR/3D-desktop-substrate
+half stays gated on lucida's WebXR mode landing and the Linux XR stack
+settling, unaffected by this reorder) → Steel Battalion boot sequence
+(tier D, bash-only v1 shipped same day) → register tuning (tier D, effigy
+persona from V0.2.7 as the existing base) → dialog clarifier (tier B
+rank 7) → callsigns half-2 (tier B rank 5). Everything else in tiers
+B/C/D keeps its prior rank; this is a cross-cut of interest, not a
+readiness change for anything not named above.
+
 ### A. Bounded, high-leverage, no waiting for a signal
 
 **A1 (`saturday-stack doctor` hook/pidfile check) and A2 (onboarding
@@ -85,30 +99,31 @@ Tier A has no open items as of this ship.
 
 Federated state · Roaming voice · Breakroom / long-arc · 3D substrate — long horizon, no near-term trigger. See "Speculative / later" below.
 
-**Steel Battalion cockpit boot sequence** — opt-in easter egg, not a
-default path: `saturday-cockpit`/`saturday-stage` assembles its panes
-with a deliberately theatrical startup ritual instead of an instant tile.
-Design reference gathered 2026-08-26, refined via a claude-video-vision
-frame pass the same day: every unit variant runs the same four-stage
-order — dark → diagnostic checklist (bars fill either as a fast ~1s snap
-or, in Line-of-Contact-era footage specifically, a visible ~3s stagger)
-→ two zones light (center display + small corner digital readouts —
-the analog dashboard dials are lit continuously and were never part of
-the blackout) → main/focused display lights last. The initial claim that
-this was also confirmed by the pilot's physical switch order did not
-survive the closer pass — the hardware-cam footage never actually shows
-that sequencing — so that detail is dropped; kept instead is a real
-red→blue (test→confirmed) per-panel color language from the same
-footage. Maps onto `saturday-stage`'s existing smoothdamp tween
-(`548d012`) as pure sequencing/staggering of already-shipped resize
-calls, not new animation work: stage pane opens in a fixed order with
-per-pane start offsets, the addressed/focused pane settles last, a
-single generic content-free "assembling..." stub can front any project's
-boot. Later phases floated but unscoped: driving real RGB hardware (a
-Novation Launchpad X, a chording keyboard) once the software ritual
-exists to trigger, and a VR version in `station`. No trigger, no build —
-the design work is done so it won't need re-deriving when this gets
-picked up.
+**Steel Battalion cockpit boot sequence — bash-only v1 shipped
+2026-08-26** — `afdea24`. `saturday-cockpit --boot` gives a
+freshly launched cockpit a staggered, themed reveal instead of instant
+tiling: every pane opens showing `bin/saturday-cockpit-boot-stub`'s
+checklist animation (red TESTING rows flipping to blue OK) instead of
+its real command, then `tmux respawn-pane -k` swaps in the real command
+per pane in order — non-addressed panes first, the addressed pane
+(first argv dir) last — each respawn gated on the existing
+`wait_pane_settled` race guard (shorter 5s timeout) so real `claude`
+respawns keep the same startup-identity protection `add_pane` callers
+already rely on. Shipped bash-only, not the stage-driven version the
+original design sketched: `saturday-cockpit` never talks to
+`saturday-stage`'s socket and stage has no pane-creation hook to attach
+to, so the size-choreography half (per-pane resize offsets riding
+`saturday-stage`'s smoothdamp tween, `548d012`) stays a disclosed,
+deferred phase 2 — touch points identified (`saturday-stage/main.go`'s
+`dispatch()`, `WindowSource`, `paneTween`) but not built. Live-verified
+against an isolated `COCKPIT=cc-cockpit-boot-test` session, never the
+real `cc-cockpit`: correct final geometry and no pane loss, no
+content-bleed between panes, and the `remain-on-exit`-set-before-
+first-split fix confirmed load-bearing (all panes survive an
+instant-exit placeholder with it in place). Still speculative and
+unscoped: driving real RGB hardware (a Novation Launchpad X, a chording
+keyboard) once the software ritual exists to trigger, and a VR version
+in `station`. No trigger for either.
 
 ## Built (V0 substrate)
 
