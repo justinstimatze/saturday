@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# saturday-cockpit-boot-stub — placeholder pane content for `saturday-cockpit
+# --boot`'s staggered reveal. Prints a themed "assembling" checklist (red
+# TESTING rows flipping to blue OK, staggered), then execs into an idle wait
+# so `respawn-pane` can cleanly swap in the real command later. Not meant to
+# be run standalone for any real purpose.
+set -eu
+
+label="${1:-session}"
+rows=(REACTOR SERVOS OPTICS COMMS MANIPULATOR)
+
+dim=$'\033[2m'
+red=$'\033[31m'
+blue=$'\033[34m'
+bold=$'\033[1m'
+reset=$'\033[0m'
+
+clear
+printf '\n  %s\n\n' "${bold}SATURDAY COCKPIT — ASSEMBLING${reset}"
+printf '  %s\n\n' "${dim}${label}${reset}"
+
+for row in "${rows[@]}"; do
+    printf '  [ ] %-12s %sTESTING%s\n' "$row" "$red" "$reset"
+done
+
+sleep 0.15
+
+# Jump back to the first checklist row, then reprint each one top-to-bottom
+# as OK with a stagger between rows — newlines advance the cursor for us, so
+# this needs no per-row up/down math, just one jump back to the top.
+printf '\033[%dA' "${#rows[@]}"
+for row in "${rows[@]}"; do
+    printf '  [%sOK%s] %-12s %sOK%s\033[K\n' "$blue" "$reset" "$row" "$blue" "$reset"
+    sleep 0.15
+done
+
+printf '\n  %sSTANDBY%s\n' "$dim" "$reset"
+
+exec sleep infinity

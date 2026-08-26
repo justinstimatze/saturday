@@ -15,6 +15,16 @@
 #                                   # pane in this initial batch (see below —
 #                                   # same flags, same meaning, as on `add`).
 #                                   # --pellicle is add-only; see below.
+#   saturday-cockpit --boot <dir> [<dir> ...]
+#                                   # opt-in staggered reveal: every pane
+#                                   # shows a themed placeholder first, then
+#                                   # real commands pop in one at a time —
+#                                   # the addressed pane (first dir) settles
+#                                   # last. Composes with --resume/
+#                                   # --resume-last/--dangerously-skip-
+#                                   # permissions/--remote-control; not
+#                                   # available with --pellicle (initial-
+#                                   # launch-only restriction, see below).
 #   saturday-cockpit add <dir> [<dir> ...]   # add pane(s) to a running cockpit
 #   saturday-cockpit add --pellicle <dir> [<dir> ...]
 #                                   # add pane(s) as a pellicle status+claude
@@ -82,6 +92,9 @@
 #                terminal width each). A genuinely dynamic/weighted layout
 #                remains a separate, deferred piece of work — this is a
 #                better static default in the meantime, not that rewrite.
+#   COCKPIT_BOOT_STUB  command run in each pane during --boot's placeholder
+#                phase (default: saturday-cockpit-boot-stub). Only read when
+#                --boot is passed.
 #
 # Pair with stage zoom/tile on mayor:
 #   saturday-mayor ... --stage-sock /tmp/saturday-stage.sock --stage-zoom
@@ -184,6 +197,14 @@ resolved_cmd_for() {
         echo "saturday-cockpit: no prior session found for $dir, starting fresh" >&2
     fi
     echo "$CLAUDE_CMD"
+}
+
+# stub_cmd_for prints the placeholder command for $1's pane during --boot's
+# assembly phase — the dir's basename as the label, so each placeholder is
+# distinguishable rather than all panes showing an identical generic stub.
+stub_cmd_for() {
+    local dir="$1"
+    echo "${COCKPIT_BOOT_STUB:-saturday-cockpit-boot-stub} '$(basename "$dir")'"
 }
 
 # Same as add_pane, but the new slot is itself a nested pellicle pair — a
@@ -424,12 +445,14 @@ resume=0
 resume_last=0
 yolo=0
 rc=0
+boot=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume) resume=1; shift ;;
         --resume-last) resume_last=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
         --remote-control|--rc) rc=1; shift ;;
+        --boot) boot=1; shift ;;
         --pellicle)
             echo "saturday-cockpit: --pellicle only works with 'add' — launch plain, then: saturday-cockpit add --pellicle <dir>" >&2
             exit 2
@@ -471,11 +494,24 @@ for d in "$@"; do
     fi
 done
 
-# First pane = first dir.
+# First pane = first dir. This is also the "addressed" pane in --boot mode —
+# the only existing signal for primary in this script (structurally distinct
+# via new-session, tmux's default-focused pane after it).
 first="$1"; shift
 firstcmd="$(resolved_cmd_for "$first")"
-tmux new-session -d -s "$SESSION" -n "cockpit" \
-    "cd '$first' && exec $firstcmd"
+
+if [ "$boot" -eq 1 ]; then
+    # remain-on-exit must be set BEFORE the first placeholder exists, not
+    # after (apply_border_format sets it later, at the very end) — if the
+    # stub script exits early for any reason before this lands, tmux would
+    # otherwise close the pane immediately and invalidate its captured id.
+    firstpane="$(tmux new-session -d -s "$SESSION" -n "cockpit" -P -F '#{pane_id}' \
+        "cd '$first' && exec $(stub_cmd_for "$first")")"
+    tmux set-option -t "$SESSION" remain-on-exit on
+else
+    tmux new-session -d -s "$SESSION" -n "cockpit" \
+        "cd '$first' && exec $firstcmd"
+fi
 bind_hotkeys
 
 # Remaining dirs → one split each. Re-balance after every split so tmux always
@@ -484,19 +520,38 @@ bind_hotkeys
 # startup too, so if there's at least one more dir queued, wait on it before
 # the first split — otherwise that split races the exact same way a second
 # add_pane call would.
-if [ "$#" -gt 0 ]; then
+#
+# --boot mode skips every wait_pane_settled call in this section: that race
+# is specifically about two real `claude` processes racing each other's
+# startup identity bookkeeping (see wait_pane_settled's comment above), and
+# these placeholder panes run the boot-stub script, not claude, so the race
+# can't occur — placeholders assemble back-to-back instead, matching the
+# "dark cockpit assembles fast" beat of the ritual. Real commands were
+# already resolved above/below via resolved_cmd_for and are only exec'd
+# later, in the respawn-stagger loop, where the real settle-wait protection
+# is still very much needed and still applied (with a shorter timeout).
+if [ "$boot" -eq 0 ] && [ "$#" -gt 0 ]; then
     firstpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
     wait_pane_settled "$firstpane" 10 ||
         echo "saturday-cockpit: warning: $first's pane didn't settle within 10s, continuing anyway" >&2
 fi
 n="$#"; i=0
+boot_dirs=(); boot_cmds=(); boot_pane_ids=()
 for d in "$@"; do
     i=$((i + 1))
-    add_pane "$d" "$(resolved_cmd_for "$d")"
-    if [ "$i" -lt "$n" ]; then
+    if [ "$boot" -eq 1 ]; then
+        add_pane "$d" "$(stub_cmd_for "$d")"
         newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
-        wait_pane_settled "$newpane" 10 ||
-            echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
+        boot_dirs+=("$d")
+        boot_cmds+=("$(resolved_cmd_for "$d")")
+        boot_pane_ids+=("$newpane")
+    else
+        add_pane "$d" "$(resolved_cmd_for "$d")"
+        if [ "$i" -lt "$n" ]; then
+            newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+            wait_pane_settled "$newpane" 10 ||
+                echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
+        fi
     fi
 done
 
@@ -505,6 +560,26 @@ done
 # marker has a home.
 apply_border_format
 tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+
+# --boot's reveal: layout is already settled above, so nothing resizes during
+# this loop — respawn-pane swaps a pane's running command in place. Order:
+# non-addressed panes first (argv order), the addressed pane (first dir)
+# last, each gated on wait_pane_settled so a real `claude` respawn still gets
+# the same startup-identity protection add_pane's callers get — just with a
+# shorter timeout than the default 10s, since N non-addressed panes each
+# capable of timing out before the addressed pane's respawn even starts
+# would otherwise risk 30-50s before the "primary settles last" payoff.
+if [ "$boot" -eq 1 ]; then
+    for idx in "${!boot_dirs[@]}"; do
+        d="${boot_dirs[$idx]}"; cmd="${boot_cmds[$idx]}"; pane="${boot_pane_ids[$idx]}"
+        tmux respawn-pane -k -t "$pane" "cd '$d' && exec $cmd"
+        wait_pane_settled "$pane" 5 ||
+            echo "saturday-cockpit: warning: $d's pane didn't settle within 5s, continuing anyway" >&2
+    done
+    tmux respawn-pane -k -t "$firstpane" "cd '$first' && exec $firstcmd"
+    wait_pane_settled "$firstpane" 5 ||
+        echo "saturday-cockpit: warning: $first's pane didn't settle within 5s, continuing anyway" >&2
+fi
 
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
 echo "  Alt+1..9 jump-and-zoom to a pane (press again to un-zoom), Alt+0 forces the overview."
