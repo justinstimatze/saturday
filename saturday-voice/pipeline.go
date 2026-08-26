@@ -34,6 +34,27 @@ const dialTimeout = 60 * time.Second
 // too tight.
 const ttsDialTimeout = 60 * time.Second
 
+// sttConn and ttsConn narrow *moshiclient.STTClient/*moshiclient.TTSClient
+// down to the methods session actually calls. session depends on these
+// interfaces, not the concrete moshiclient types, purely so tests can
+// substitute a fake connection for the dial/reconnect/control-message
+// logic below — real moshi-server's own wire protocol is moshiclient's
+// concern and already has its own fixture-driven tests; session's job is
+// what it does once dialing succeeds or fails, which a live msgpack/WS
+// server isn't needed to exercise.
+type sttConn interface {
+	SendAudio(pcm []float32) error
+	Recv() (any, error)
+	Close() error
+}
+
+type ttsConn interface {
+	SendText(text string) error
+	SendEOS() error
+	Recv() (any, error)
+	Close() error
+}
+
 // session owns one client connection's lifecycle: dial STT/TTS, run the
 // turn-taking loop, call the orchestrator, stream audio both ways. One
 // session per connected client — saturday-voice itself is otherwise
@@ -56,8 +77,15 @@ type session struct {
 	// goroutine that just set them, sequenced after that write by Go's
 	// memory model, with no other writer active while it runs — see run().
 	connMu sync.Mutex
-	stt    *moshiclient.STTClient
+	stt    sttConn
 	tt     *moshiclient.TurnTaking
+
+	// dialSTT/dialTTS default to moshiclient.DialSTT/DialTTS (see
+	// newSession) — overridden in tests with a fake dialer so the
+	// dial/reconnect/state-message logic in run() and speak() can be
+	// exercised without a live moshi-server.
+	dialSTT func(baseURL, apiKey string, timeout time.Duration) (sttConn, error)
+	dialTTS func(baseURL, apiKey string, voice moshiclient.TTSVoice, cfgAlpha float64, timeout time.Duration) (ttsConn, error)
 
 	// clientDone is closed exactly once, by forwardClientAudio, when the
 	// client WebSocket itself dies — the one reliable signal for "stop
@@ -86,7 +114,7 @@ type session struct {
 	// call, only discard its result and stop it from being spoken).
 	genMu      sync.Mutex
 	generation int
-	activeTTS  *moshiclient.TTSClient
+	activeTTS  ttsConn
 }
 
 func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL, ttsURL, moshiAPIKey string, voice moshiclient.TTSVoice) *session {
@@ -98,6 +126,20 @@ func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL,
 		moshiAPIKey: moshiAPIKey,
 		voice:       voice,
 		tt:          moshiclient.NewTurnTaking(),
+		dialSTT: func(baseURL, apiKey string, timeout time.Duration) (sttConn, error) {
+			c, err := moshiclient.DialSTT(baseURL, apiKey, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+		dialTTS: func(baseURL, apiKey string, voice moshiclient.TTSVoice, cfgAlpha float64, timeout time.Duration) (ttsConn, error) {
+			c, err := moshiclient.DialTTS(baseURL, apiKey, voice, cfgAlpha, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
 	}
 }
 
@@ -142,7 +184,7 @@ func (s *session) run() error {
 		// hang (confirmed live, 2026-08-25: a 31s cold STT dial read as
 		// "stuck on connected — listening").
 		s.sendControl(map[string]any{"type": "state", "value": "connecting to speech recognition (cold start can take up to a minute)"})
-		stt, err := moshiclient.DialSTT(s.sttURL, s.moshiAPIKey, dialTimeout)
+		stt, err := s.dialSTT(s.sttURL, s.moshiAPIKey, dialTimeout)
 		if err != nil {
 			log.Printf("dial STT failed: %v", err)
 			s.sendControl(map[string]any{"type": "error", "message": "can't reach moshi-server STT, retrying"})
@@ -407,6 +449,26 @@ func (s *session) cancelActive() {
 	s.sendControl(map[string]any{"type": "interrupted"})
 }
 
+// beginGeneration bumps the generation counter and returns the new value
+// plus a cancelled closure that reports whether a later call has since
+// bumped generation again — the mechanism behind both interrupt-cancellation
+// (see cancelActive) and speculative-reply staleness (see runReply's doc
+// comment). Only the most recently begun generation's cancelled() stays
+// false; every earlier one flips true as soon as a newer one starts,
+// independent of call order or timing.
+func (s *session) beginGeneration() (myGen int, cancelled func() bool) {
+	s.genMu.Lock()
+	s.generation++
+	myGen = s.generation
+	s.genMu.Unlock()
+	cancelled = func() bool {
+		s.genMu.Lock()
+		defer s.genMu.Unlock()
+		return s.generation != myGen
+	}
+	return myGen, cancelled
+}
+
 // respond calls the orchestrator for one utterance whose pause has been
 // confirmed (ActionResponseReady already fired). See runReply.
 func (s *session) respond(utterance string) {
@@ -444,15 +506,7 @@ func (s *session) runReply(utterance string, speculative bool) {
 		return
 	}
 
-	s.genMu.Lock()
-	s.generation++
-	myGen := s.generation
-	s.genMu.Unlock()
-	cancelled := func() bool {
-		s.genMu.Lock()
-		defer s.genMu.Unlock()
-		return s.generation != myGen
-	}
+	_, cancelled := s.beginGeneration()
 
 	tag := "respond"
 	if speculative {
@@ -491,7 +545,7 @@ func (s *session) speak(text string) error {
 	// reachable (container scheduling + moshi-server startup + checkpoint
 	// load) — "thinking" undersells that wait, so give it its own signal.
 	s.sendControl(map[string]any{"type": "state", "value": "warming up voice (cold start can take up to a minute)"})
-	tts, err := moshiclient.DialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
+	tts, err := s.dialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
 	if err != nil {
 		log.Printf("speak: dial TTS failed: %v", err)
 		return fmt.Errorf("dial TTS: %w", err)
