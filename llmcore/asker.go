@@ -65,20 +65,45 @@ type AskContext struct {
 	TrackedInjects []string `json:"tracked_injects,omitempty"`
 }
 
-// RunAsk produces a spoken answer for an ask-mode utterance.
+// buildAskRequest builds the system prompt, user text, and cache id shared
+// by RunAsk and RunAskStreaming, so the two can't drift apart.
 //
 // Cache-key contract: cid = CacheKey("ask-v1", utterance, json.Marshal(ctx)).
 // The reply depends on both the question and the cross-session state.
 // Cache hits should be rare (state changes rapidly) but the cache still
 // dedupes burst-typed identical asks within a short window.
-func RunAsk(apiKey, cacheDir, utterance string, ctx AskContext) (string, error) {
+func buildAskRequest(utterance string, ctx AskContext) (sys, userText, cid string) {
 	ctxJSON, _ := json.MarshalIndent(ctx, "", "  ")
-	userText := fmt.Sprintf("user asked saturday:\n%s\n\nsaturday's bird's-eye state:\n%s",
+	userText = fmt.Sprintf("user asked saturday:\n%s\n\nsaturday's bird's-eye state:\n%s",
 		utterance, string(ctxJSON))
-	sys := AskerSystem + "\n\n--- voice register (saturday.effigy) ---\n\n" + EffigyForPrompt()
+	sys = AskerSystem + "\n\n--- voice register (saturday.effigy) ---\n\n" + EffigyForPrompt()
 	ctxKey, _ := json.Marshal(ctx)
-	cid := CacheKey("ask-v1", utterance, string(ctxKey))
+	cid = CacheKey("ask-v1", utterance, string(ctxKey))
+	return sys, userText, cid
+}
+
+// RunAsk produces a spoken answer for an ask-mode utterance.
+func RunAsk(apiKey, cacheDir, utterance string, ctx AskContext) (string, error) {
+	sys, userText, cid := buildAskRequest(utterance, ctx)
 	out, err := CachedCall(apiKey, SummarizerModel, sys, userText, AskerTool, cacheDir, cid)
+	if err != nil {
+		return "", err
+	}
+	r, _ := out["reply"].(string)
+	r = strings.TrimSpace(r)
+	if r == "" {
+		return "", fmt.Errorf("asker returned empty reply")
+	}
+	return r, nil
+}
+
+// RunAskStreaming is RunAsk's streaming sibling (see CachedCallStreaming):
+// onDelta is called with each incrementally decoded piece of the reply as
+// the model generates it. The full, final reply is still returned once
+// generation completes — or ErrCancelled if cancelled() stopped it early.
+func RunAskStreaming(apiKey, cacheDir, utterance string, ctx AskContext, cancelled func() bool, onDelta func(string)) (string, error) {
+	sys, userText, cid := buildAskRequest(utterance, ctx)
+	out, err := CachedCallStreaming(apiKey, SummarizerModel, sys, userText, AskerTool, cacheDir, cid, "reply", cancelled, onDelta)
 	if err != nil {
 		return "", err
 	}

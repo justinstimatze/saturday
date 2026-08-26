@@ -221,6 +221,7 @@ func (srv *server) serveWS(w http.ResponseWriter, r *http.Request) {
 	sess := newSession(nil, conn, srv.sttURL, srv.ttsURL, srv.moshiAPIKey, srv.voice)
 	cfg := srv.orchTemplate
 	cfg.Speak = sess.speak
+	cfg.SpeakStream = sess.speakStream
 	sess.orch = orchestrator.New(cfg)
 	sess.orch.StartCompletionPolling()
 

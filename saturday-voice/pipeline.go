@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +17,49 @@ import (
 	"saturday/moshiclient"
 	"saturday/orchestrator"
 )
+
+// ttsWAVDebugDir, if set via SATURDAY_TTS_WAV_DEBUG, makes drainTTSAudio
+// dump every reply's raw TTS output as a WAV file — a throwaway diagnostic
+// added 2026-08-25 to get an actual recording of the onset-distortion
+// reports ("emphasizing the first syllable... clipping like a real mic")
+// instead of guessing further from client-reported descriptions alone. No
+// effect when unset (the default).
+var ttsWAVDebugDir = os.Getenv("SATURDAY_TTS_WAV_DEBUG")
+
+// writeDebugWAV writes samples (expected roughly in [-1, 1], same scale as
+// the peak-amplitude logging below) as a 16-bit PCM mono WAV at
+// moshiclient's 24kHz. Returns the path written.
+func writeDebugWAV(dir string, samples []float64) (string, error) {
+	const sampleRate = 24000
+	path := filepath.Join(dir, fmt.Sprintf("tts-debug-%d.wav", time.Now().UnixNano()))
+	var buf bytes.Buffer
+	dataSize := len(samples) * 2
+	buf.WriteString("RIFF")
+	binary.Write(&buf, binary.LittleEndian, uint32(36+dataSize))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	binary.Write(&buf, binary.LittleEndian, uint32(16))
+	binary.Write(&buf, binary.LittleEndian, uint16(1))
+	binary.Write(&buf, binary.LittleEndian, uint16(1))
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2))
+	binary.Write(&buf, binary.LittleEndian, uint16(2))
+	binary.Write(&buf, binary.LittleEndian, uint16(16))
+	buf.WriteString("data")
+	binary.Write(&buf, binary.LittleEndian, uint32(dataSize))
+	for _, s := range samples {
+		if s > 1 {
+			s = 1
+		} else if s < -1 {
+			s = -1
+		}
+		binary.Write(&buf, binary.LittleEndian, int16(math.Round(s*32767)))
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
 
 // dialTimeout bounds how long dialing moshi-server's STT endpoint may
 // take. Used to be 10s, sized for a warm Runpod tunnel (Phase 0.5 measured
@@ -115,6 +163,18 @@ type session struct {
 	genMu      sync.Mutex
 	generation int
 	activeTTS  ttsConn
+
+	// warmTTS holds a TTS connection dialed speculatively at session
+	// start (see prewarmTTS) — a freshly opened voice session is about
+	// to be spoken to with good odds, and TTS's own cold start (up to
+	// ~40s measured) is exactly the kind of wait worth starting early,
+	// in parallel with STT's own dial, rather than paying it only once a
+	// reply is actually ready to speak. speakStream claims (and clears)
+	// this via claimWarmTTS if it's still here by the time it needs one;
+	// unclaimed on session teardown, run() closes it via closeWarmTTS so
+	// a session that never spoke doesn't leak the connection.
+	warmTTSMu sync.Mutex
+	warmTTS   ttsConn
 }
 
 func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL, ttsURL, moshiAPIKey string, voice moshiclient.TTSVoice) *session {
@@ -174,6 +234,8 @@ func (s *session) run() error {
 
 	s.clientDone = make(chan struct{})
 	go s.forwardClientAudio()
+	go s.prewarmTTS()
+	defer s.closeWarmTTS()
 
 	for {
 		// STT's container scales to zero on the same idle window as TTS's
@@ -221,6 +283,55 @@ func (s *session) run() error {
 			return loopErr
 		}
 		backoff = nextBackoff(backoff, maxBackoff)
+	}
+}
+
+// prewarmTTS speculatively dials a TTS connection once, right when the
+// session starts — see warmTTS's doc comment on session for why. Runs on
+// its own goroutine so it doesn't delay STT's own dial (both cold-starts
+// overlap instead of stacking); best-effort, not fatal on failure — a
+// speakStream call with no pre-warmed connection to claim just dials
+// fresh, exactly as it did before this existed.
+func (s *session) prewarmTTS() {
+	tts, err := s.dialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
+	if err != nil {
+		log.Printf("prewarmTTS: dial failed (not fatal — speakStream will dial fresh when needed): %v", err)
+		return
+	}
+	select {
+	case <-s.clientDone:
+		// The client is already gone by the time this slow cold dial
+		// finished — nobody will ever claim it, so close it now instead
+		// of leaking a live connection past closeWarmTTS's own deferred
+		// call, which already ran (or never will, if run() itself is
+		// what's blocked here — either way this check is what catches
+		// it).
+		_ = tts.Close()
+		return
+	default:
+	}
+	s.warmTTSMu.Lock()
+	s.warmTTS = tts
+	s.warmTTSMu.Unlock()
+}
+
+// claimWarmTTS returns and clears the pre-warmed TTS connection if one is
+// ready, or nil if none is available (still dialing, already claimed, or
+// the dial failed) — speakStream falls back to dialing fresh in that case.
+func (s *session) claimWarmTTS() ttsConn {
+	s.warmTTSMu.Lock()
+	defer s.warmTTSMu.Unlock()
+	tts := s.warmTTS
+	s.warmTTS = nil
+	return tts
+}
+
+// closeWarmTTS closes an unclaimed pre-warmed connection on session
+// teardown, so a session that connects and never actually speaks doesn't
+// leak one.
+func (s *session) closeWarmTTS() {
+	if tts := s.claimWarmTTS(); tts != nil {
+		_ = tts.Close()
 	}
 }
 
@@ -374,13 +485,32 @@ func (s *session) runSTTLoop() error {
 				}
 				if specFired {
 					log.Printf("turn-taking: response ready, utterance grew past speculative snapshot (%q -> %q); invalidating and re-firing", specSnap, utterance)
-					// Bumps generation (so the speculative call's
-					// orchestrator.Handle sees cancelled()==true at its
-					// next checkpoint and stops short of speaking/
-					// injecting) and closes activeTTS in case the
-					// speculative call was fast enough to already be
-					// mid-speech on the stale, incomplete input.
-					s.cancelActive()
+					// No explicit cancelActive() here as of 2026-08-25 —
+					// go s.respond(utterance) below calls beginGeneration()
+					// itself moments later, which is sufficient to
+					// invalidate the speculative call's cancelled() (that
+					// was always the actual point of bumping here; nothing
+					// else in this branch depended on the bump happening
+					// earlier). This branch used to also call
+					// cancelActive() specifically to close the speculative
+					// call's TTS connection immediately, in case it was
+					// already mid-speech on the stale, incomplete input —
+					// but that's not the user interrupting Saturday (this
+					// is the same utterance still being said, not a real
+					// barge-in), and closing one TTS connection right as a
+					// fresh one dials for the replacement reply collided
+					// with the exact server-side race DialTTS's own doc
+					// comment already warns about (a previous session's
+					// stray packets arriving on the next one). Confirmed
+					// live: the replacement reply's fresh dial completed
+					// and sent its full text + EOS with no errors, then
+					// received zero audio back before a clean close.
+					// speakStream's own claim-and-swap (see beginGeneration
+					// and speakStream's doc comments) now evicts the
+					// speculative call's connection at the moment the real
+					// reply is actually ready to speak, not the instant its
+					// input is discovered stale — same outcome, without the
+					// tight close-then-immediately-redial collision.
 				}
 				log.Printf("turn-taking: response ready, utterance=%q", utterance)
 				go s.respond(utterance)
@@ -433,29 +563,62 @@ func (s *session) peekUtterance() string {
 	return s.utteranceBuf.String()
 }
 
-// cancelActive bumps the generation counter (so any in-flight respond()
-// call knows its result is now stale) and closes the current turn's TTS
-// connection if one is open, which stops moshi-server mid-synthesis and
-// unblocks speak()'s receive loop.
-func (s *session) cancelActive() {
+// bumpGeneration increments the generation counter and closes+clears
+// whatever TTS connection is currently active, returning the new
+// generation value. Used only by cancelActive (an explicit user
+// interrupt), which needs the current reply silenced immediately — see
+// beginGeneration's doc comment for why automatic supersession no longer
+// shares this eager close.
+func (s *session) bumpGeneration() int {
 	s.genMu.Lock()
 	s.generation++
+	myGen := s.generation
 	tts := s.activeTTS
 	s.activeTTS = nil
 	s.genMu.Unlock()
 	if tts != nil {
 		_ = tts.Close()
 	}
+	return myGen
+}
+
+// cancelActive bumps the generation counter and closes the current turn's
+// TTS connection immediately, which stops moshi-server mid-synthesis and
+// unblocks speak()'s receive loop — for an explicit interrupt (the user
+// talked over Saturday), where cutting audio right away is the correct,
+// intended behavior.
+func (s *session) cancelActive() {
+	s.bumpGeneration()
 	s.sendControl(map[string]any{"type": "interrupted"})
 }
 
 // beginGeneration bumps the generation counter and returns the new value
 // plus a cancelled closure that reports whether a later call has since
-// bumped generation again — the mechanism behind both interrupt-cancellation
-// (see cancelActive) and speculative-reply staleness (see runReply's doc
-// comment). Only the most recently begun generation's cancelled() stays
-// false; every earlier one flips true as soon as a newer one starts,
-// independent of call order or timing.
+// bumped generation again — the mechanism behind speculative-reply
+// staleness (see runReply's doc comment). Only the most recently begun
+// generation's cancelled() stays false; every earlier one flips true as
+// soon as a newer one starts, independent of call order or timing.
+// Unlike cancelActive, this does NOT send {"type":"interrupted"} to the
+// client (starting a new reply attempt isn't the user talking over
+// Saturday) — and, as of 2026-08-25, does NOT close the previous
+// generation's activeTTS either. It used to (via bumpGeneration): every
+// respond()/respondSpeculative() call closed whatever TTS was active the
+// instant it *started*, before it had anything to say. Streaming means a
+// call's TTS dial begins concurrently with its LLM call — so the very
+// next call's begin (turn-taking's own speculative→real promotion fires
+// within about a second of the first, routinely, on ordinary sentences,
+// not just fast speech) reliably killed the previous connection before
+// even one frame reached the client. Confirmed live, 2026-08-25: three
+// internal calls for a single normally-spoken utterance ("What are we
+// working on?", split by turn-taking into fragments) each closed the
+// previous one's TTS mid-dial or mid-send, and the entire utterance
+// produced zero audio despite its own reply text being generated and
+// logged correctly. The fix: automatic supersession now only bumps the
+// counter here; the actual close-and-replace happens atomically in
+// speakStream, at the moment a new call is ready to speak (has a
+// connection and is still current), not the moment it starts existing.
+// A reply that's already sending audio is no longer killed by a sibling
+// call that hasn't produced anything yet.
 func (s *session) beginGeneration() (myGen int, cancelled func() bool) {
 	s.genMu.Lock()
 	s.generation++
@@ -529,49 +692,15 @@ func (s *session) runReply(utterance string, speculative bool) {
 	}
 }
 
-// speak wires orchestrator.Config.Speak: dial a fresh TTS connection,
-// send the text, and stream the resulting audio to the client. Runs
-// synchronously on whatever goroutine called orchestrator.Handle (per
-// Phase 1a's design, Handle itself is synchronous/single-flight — see
-// orchestrator's own doc comment).
-func (s *session) speak(text string) error {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		log.Printf("speak: empty text, skipping")
-		return nil
-	}
-	log.Printf("speak: dialing TTS for %q", text)
-	// A cold TTS container has been measured taking up to ~40s to become
-	// reachable (container scheduling + moshi-server startup + checkpoint
-	// load) — "thinking" undersells that wait, so give it its own signal.
-	s.sendControl(map[string]any{"type": "state", "value": "warming up voice (cold start can take up to a minute)"})
-	tts, err := s.dialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
-	if err != nil {
-		log.Printf("speak: dial TTS failed: %v", err)
-		return fmt.Errorf("dial TTS: %w", err)
-	}
-
-	s.genMu.Lock()
-	s.activeTTS = tts
-	s.genMu.Unlock()
-	defer func() {
-		s.genMu.Lock()
-		if s.activeTTS == tts {
-			s.activeTTS = nil
-		}
-		s.genMu.Unlock()
-		_ = tts.Close()
-	}()
-
-	if err := tts.SendText(text); err != nil {
-		return fmt.Errorf("send TTS text: %w", err)
-	}
-	if err := tts.SendEOS(); err != nil {
-		return fmt.Errorf("send TTS EOS: %w", err)
-	}
-
-	s.sendControl(map[string]any{"type": "state", "value": "speaking"})
-
+// drainTTSAudio reads audio frames from tts until the stream ends and
+// forwards each to the client via sendAudio, with the same peak-amplitude/
+// clipping instrumentation regardless of caller — shared by speak (via
+// speakStream) and speakStream itself so the two don't carry two copies of
+// this logic to keep in sync by hand. Returns once the stream ends; a
+// closed connection (our own cancelActive, or a normal server-side close
+// after Eos) ends the stream and returns nil, not an error worth
+// surfacing.
+func drainTTSAudio(tts ttsConn, sendAudio func(pcm []float64) error) error {
 	frames := 0
 	maxAbs := 0.0
 	clippedFrames := 0
@@ -583,14 +712,19 @@ func (s *session) speak(text string) error {
 	// another blind guess.
 	const onsetFrameCount = 3
 	onsetMaxAbs := 0.0
+	var wavSamples []float64
 	for {
 		msg, err := tts.Recv()
 		if err != nil {
-			// A closed connection (our own cancelActive, or a normal
-			// server-side close after Eos) ends the stream — not an
-			// error worth surfacing.
 			log.Printf("speak: stream ended after %d audio frames (%v) — peak amplitude %.3f (first %d frames: %.3f), %d/%d frames with a sample >1.0 (true clipping)",
 				frames, err, maxAbs, onsetFrameCount, onsetMaxAbs, clippedFrames, frames)
+			if ttsWAVDebugDir != "" && len(wavSamples) > 0 {
+				if path, werr := writeDebugWAV(ttsWAVDebugDir, wavSamples); werr != nil {
+					log.Printf("speak: failed to write debug WAV: %v", werr)
+				} else {
+					log.Printf("speak: wrote debug WAV to %s (%d samples)", path, len(wavSamples))
+				}
+			}
 			return nil
 		}
 		switch m := msg.(type) {
@@ -615,7 +749,10 @@ func (s *session) speak(text string) error {
 			if clipped {
 				clippedFrames++
 			}
-			if err := s.sendAudio(m.PCM); err != nil {
+			if ttsWAVDebugDir != "" {
+				wavSamples = append(wavSamples, m.PCM...)
+			}
+			if err := sendAudio(m.PCM); err != nil {
 				log.Printf("speak: sendAudio to client failed: %v", err)
 			}
 		case moshiclient.TTSErrorMessage:
@@ -623,6 +760,138 @@ func (s *session) speak(text string) error {
 			return fmt.Errorf("tts error: %s", m.Message)
 		}
 	}
+}
+
+// speakStream wires orchestrator.Config.SpeakStream: dial a fresh TTS
+// connection, claim the shared activeTTS slot (see below), then run two
+// concurrent pieces until both finish — a goroutine draining synthesized
+// audio back to the client (drainTTSAudio, started as soon as the
+// connection is up, since moshi-server can start producing audio before
+// all text has arrived), and the calling goroutine forwarding each chunk
+// from chunks to TTS via SendText as it arrives, then SendEOS once chunks
+// closes. This is the actual streaming part: text reaches moshi-server
+// incrementally as the LLM produces it, not all at once. One goroutine
+// only ever writes to tts (SendText/SendEOS) and the other only ever
+// reads (Recv) — gorilla/websocket's documented concurrency contract (one
+// reader, one writer, concurrently) allows exactly this split with no
+// extra locking.
+//
+// cancelled reports whether this call has already been superseded (see
+// beginGeneration) — checked once, right after a connection is in hand
+// (pre-warmed or freshly dialed), immediately before claiming the shared
+// activeTTS slot. This is where a superseded call actually yields,
+// instead of at the moment a newer sibling call merely *starts* (see
+// beginGeneration's doc comment for why that used to kill replies that
+// hadn't spoken a single frame yet). Claiming the slot closes whatever
+// connection was previously active — so a stale, abandoned connection
+// still can't leak past the call that supersedes it — but only once this
+// call actually has something ready to say, not on every new call's
+// mere existence. speak() has no generation of its own to be stale
+// against, so it passes a cancelled that's always false — its callers
+// (narration, completion reports) are single-shot, non-speculative, and
+// unconditionally proceed exactly as they always have.
+//
+// If a SendText call fails partway through, the loop stops attempting
+// further sends but keeps ranging over (draining, discarding) chunks
+// until it closes, rather than returning immediately: the producer side
+// (orchestrator.answerAskStreaming's goroutine) may still be sending into
+// chunks, and abandoning the read here without draining would block that
+// goroutine on the channel send forever — see its own doc comment on the
+// same hazard.
+func (s *session) speakStream(chunks <-chan string, cancelled func() bool) error {
+	tts := s.claimWarmTTS()
+	if tts != nil {
+		log.Printf("speak: using pre-warmed TTS connection")
+	} else {
+		log.Printf("speak: dialing TTS")
+		// A cold TTS container has been measured taking up to ~40s to
+		// become reachable (container scheduling + moshi-server startup
+		// + checkpoint load) — "thinking" undersells that wait, so give
+		// it its own signal. Skipped on the pre-warmed path above since
+		// there's no such wait to warn about there.
+		s.sendControl(map[string]any{"type": "state", "value": "warming up voice (cold start can take up to a minute)"})
+		var err error
+		tts, err = s.dialTTS(s.ttsURL, s.moshiAPIKey, s.voice, 1.5, ttsDialTimeout)
+		if err != nil {
+			log.Printf("speak: dial TTS failed: %v", err)
+			for range chunks {
+				// Drain so the producer (if any) doesn't block forever
+				// sending into a channel nobody will ever read again.
+			}
+			return fmt.Errorf("dial TTS: %w", err)
+		}
+	}
+
+	if cancelled() {
+		log.Printf("speak: generation superseded before claiming the TTS slot; discarding this reply")
+		_ = tts.Close()
+		for range chunks {
+			// Same drain obligation as the dial-failure path above.
+		}
+		return nil
+	}
+
+	s.genMu.Lock()
+	old := s.activeTTS
+	s.activeTTS = tts
+	s.genMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	defer func() {
+		s.genMu.Lock()
+		if s.activeTTS == tts {
+			s.activeTTS = nil
+		}
+		s.genMu.Unlock()
+		_ = tts.Close()
+	}()
+
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- drainTTSAudio(tts, s.sendAudio) }()
+
+	s.sendControl(map[string]any{"type": "state", "value": "speaking"})
+
+	var sendErr error
+	chunkCount, chunkBytes := 0, 0
+	for chunk := range chunks {
+		chunkCount++
+		chunkBytes += len(chunk)
+		if sendErr != nil {
+			continue
+		}
+		if err := tts.SendText(chunk); err != nil {
+			sendErr = fmt.Errorf("send TTS text: %w", err)
+		}
+	}
+	log.Printf("speak: chunks channel closed after %d chunks, %d bytes total", chunkCount, chunkBytes)
+	if sendErr == nil {
+		if err := tts.SendEOS(); err != nil {
+			sendErr = fmt.Errorf("send TTS EOS: %w", err)
+		}
+	}
+
+	drainErr := <-drainDone
+	if sendErr != nil {
+		return sendErr
+	}
+	return drainErr
+}
+
+// speak wires orchestrator.Config.Speak: the single-reply, non-streaming
+// case. Runs synchronously on whatever goroutine called
+// orchestrator.Handle (per Phase 1a's design, Handle itself is
+// synchronous/single-flight — see orchestrator's own doc comment).
+func (s *session) speak(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		log.Printf("speak: empty text, skipping")
+		return nil
+	}
+	chunks := make(chan string, 1)
+	chunks <- text
+	close(chunks)
+	return s.speakStream(chunks, func() bool { return false })
 }
 
 // sendAudio writes one frame of synthesized PCM to the client as a binary

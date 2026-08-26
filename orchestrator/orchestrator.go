@@ -63,6 +63,24 @@ type Config struct {
 	// a real deployment.
 	Speak func(text string) error
 
+	// SpeakStream, if set, lets answerAsk speak an ask-mode reply
+	// incrementally as the LLM generates it instead of waiting for the
+	// whole reply and calling Speak once — see answerAsk's doc comment.
+	// chunks is closed once the reply is complete (or the call failed/was
+	// superseded); SpeakStream should range over it, sending each chunk to
+	// TTS as it arrives, and return once playback of everything sent is
+	// done. Nil (the default — saturday-mayor never sets this) falls back
+	// to the blocking RunAsk + Speak path exactly as before this field
+	// existed.
+	//
+	// cancelled is the same closure passed to Handle for this call —
+	// SpeakStream should check it once it has a connection in hand and
+	// before treating itself as the active speaker, so a call superseded
+	// after answerAskStreaming's own entry check (a real race: staleness
+	// can arrive while SpeakStream is still dialing) still yields instead
+	// of cutting off a sibling reply that's already speaking.
+	SpeakStream func(chunks <-chan string, cancelled func() bool) error
+
 	// EmitState mirrors mayor's activity-spinner events ("routing",
 	// "asking", "expanding", "injecting → <project>", "" = idle). Nil is a
 	// safe no-op — a caller with no equivalent UI just leaves it unset.
@@ -391,8 +409,19 @@ func (o *Orchestrator) answerAsk(utterance string, cancelled func() bool) (*Deci
 	}
 	o.pendingMu.Unlock()
 
-	reply, err := llm.RunAsk(o.cfg.APIKey, o.cfg.CacheDir, utterance, ctx)
+	streaming := o.cfg.SpeakStream != nil
+	var reply string
+	var err error
+	if streaming {
+		reply, err = o.answerAskStreaming(utterance, ctx, cancelled)
+	} else {
+		reply, err = llm.RunAsk(o.cfg.APIKey, o.cfg.CacheDir, utterance, ctx)
+	}
 	if err != nil {
+		if errors.Is(err, llm.ErrCancelled) {
+			fmt.Fprintln(os.Stderr, "  ↳ ask reply superseded mid-generation; discarding")
+			return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
+		}
 		fmt.Fprintf(os.Stderr, "\033[31m× ask:\033[0m %v\n", err)
 		return nil, err
 	}
@@ -400,12 +429,73 @@ func (o *Orchestrator) answerAsk(utterance string, cancelled func() bool) (*Deci
 		oneLine(utterance), reply)
 
 	o.recordRecentUtterance(fmt.Sprintf("%s → saturday (ask)", oneLine(utterance)))
+	if streaming {
+		// Already spoken incrementally inside answerAskStreaming (which
+		// blocked on SpeakStream until playback finished) — don't call
+		// Speak again. Still check cancelled() for the same stderr
+		// logging symmetry the non-streaming path below has.
+		if cancelled() {
+			fmt.Fprintln(os.Stderr, "  ↳ ask reply superseded after speaking")
+		}
+		return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
+	}
 	if cancelled() {
 		fmt.Fprintln(os.Stderr, "  ↳ ask reply superseded before speaking; discarding")
 		return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
 	}
 	o.speak(reply)
 	return &Decision{Mode: "ask", Route: "saturday", Conf: 1.0}, nil
+}
+
+// answerAskStreaming runs llm.RunAskStreaming and o.cfg.SpeakStream
+// concurrently — speaking starts as soon as the first word is available
+// instead of waiting for the whole reply. Returns the final reply text
+// once both the LLM call and TTS playback are done, or llm.ErrCancelled
+// if cancelled() stopped the LLM stream mid-generation.
+//
+// The producer goroutine's sends to chunks are the one place a naive
+// implementation could leak: if SpeakStream stops draining chunks early
+// (e.g. a TTS send error), an unbuffered-beyond-its-cap send here would
+// block forever with nothing left to read it, stalling the SSE read loop
+// inside RunAskStreaming indefinitely. speakStream's contract (see
+// saturday-voice/pipeline.go) is to always drain chunks to closure even
+// after its own send errors, specifically to make that impossible.
+func (o *Orchestrator) answerAskStreaming(utterance string, ctx llm.AskContext, cancelled func() bool) (string, error) {
+	if cancelled() {
+		// Don't pay for a TTS dial (SpeakStream, below) for a call
+		// that's already known to be superseded before it even starts —
+		// a real, observed cost: a fast-following turn-taking split can
+		// fire a second respond()/respondSpeculative() call within the
+		// same second, which supersedes this one via the shared
+		// generation counter before this goroutine even runs. The
+		// narrower race this check can't catch — cancellation arriving
+		// while SpeakStream is still dialing — is handled downstream:
+		// SpeakStream re-checks cancelled once it has a connection in
+		// hand, right before claiming the shared speaker slot (see
+		// saturday-voice/pipeline.go's speakStream), so a call superseded
+		// mid-dial still yields instead of cutting off a sibling reply
+		// that's already speaking.
+		return "", llm.ErrCancelled
+	}
+	chunks := make(chan string, 8)
+	var reply string
+	var runErr error
+	go func() {
+		defer close(chunks)
+		var batch wordBatcher
+		reply, runErr = llm.RunAskStreaming(o.cfg.APIKey, o.cfg.CacheDir, utterance, ctx, cancelled, func(delta string) {
+			if flushed, ok := batch.Feed(delta); ok {
+				chunks <- flushed
+			}
+		})
+		if last := batch.Flush(); last != "" {
+			chunks <- last
+		}
+	}()
+	if err := o.cfg.SpeakStream(chunks, cancelled); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31m× ask (speak):\033[0m %v\n", err)
+	}
+	return reply, runErr
 }
 
 // commitInject runs the inject-execution path: collision-wait, optional

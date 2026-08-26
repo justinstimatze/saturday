@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"saturday/moshiclient"
 )
 
 // This file covers the dial/reconnect/control-message layer named as a
@@ -113,10 +115,19 @@ func readControl(t *testing.T, conn *websocket.Conn) map[string]any {
 	return msg
 }
 
+// stubDialTTS lets run()-driven tests that don't care about TTS at all
+// (prewarmTTS now fires on every run(), see pipeline.go) supply
+// something non-nil — a nil dialTTS field would panic on the first call,
+// same as a nil dialSTT would.
+func stubDialTTS(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+	return nil, errors.New("stub: no TTS in this test")
+}
+
 func TestRunSendsListeningAfterSuccessfulDial(t *testing.T) {
 	serverConn, clientConn := newWSPair(t)
 	s := &session{
-		client: serverConn,
+		client:  serverConn,
+		dialTTS: stubDialTTS,
 		dialSTT: (&dialScript{fn: func(int) (sttConn, error) {
 			return newFakeSTTConn(), nil
 		}}).dial,
@@ -138,7 +149,8 @@ func TestRunSendsListeningAfterSuccessfulDial(t *testing.T) {
 func TestRunRetriesOnDialFailureThenSucceeds(t *testing.T) {
 	serverConn, clientConn := newWSPair(t)
 	s := &session{
-		client: serverConn,
+		client:  serverConn,
+		dialTTS: stubDialTTS,
 		dialSTT: (&dialScript{fn: func(call int) (sttConn, error) {
 			if call == 0 {
 				return nil, errors.New("dial failed")
@@ -179,7 +191,7 @@ func TestRunReconnectsOnSTTLoopError(t *testing.T) {
 		c.Close()
 		return c, nil
 	}}
-	s := &session{client: serverConn, dialSTT: script.dial}
+	s := &session{client: serverConn, dialTTS: stubDialTTS, dialSTT: script.dial}
 	go s.run()
 
 	readControl(t, clientConn) // connecting (1st dial)
@@ -206,7 +218,7 @@ func TestRunStopsReconnectingWhenClientGone(t *testing.T) {
 	script := &dialScript{fn: func(int) (sttConn, error) {
 		return nil, errors.New("moshi-server unreachable")
 	}}
-	s := &session{client: serverConn, dialSTT: script.dial}
+	s := &session{client: serverConn, dialTTS: stubDialTTS, dialSTT: script.dial}
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.run() }()
@@ -240,18 +252,87 @@ func TestBeginGenerationStaleness(t *testing.T) {
 	}
 }
 
+// fakeTTSConn records SendText calls and, optionally, emits one scripted
+// audio frame from Recv once SendText has been called firstFrameAfter
+// times — used to prove speakStream's send and drain sides run
+// concurrently (see TestSpeakStreamSendsChunksWhileDraining), not just to
+// assert final call counts. Recv otherwise blocks until Close, mirroring
+// fakeSTTConn's pattern above.
 type fakeTTSConn struct {
-	closed atomic.Bool
+	closed    atomic.Bool
+	closeCh   chan struct{}
+	closeOnce sync.Once
+
+	mu              sync.Mutex
+	sendTextCalls   []string
+	eosCalled       bool
+	firstFrameAfter int // emit one audio frame once len(sendTextCalls) reaches this; 0 = never
+	frameSent       bool
+	frameCh         chan struct{}
 }
 
-func (f *fakeTTSConn) SendText(string) error { return nil }
-func (f *fakeTTSConn) SendEOS() error        { return nil }
-func (f *fakeTTSConn) Recv() (any, error)    { return nil, errors.New("fake tts: not scripted") }
-func (f *fakeTTSConn) Close() error          { f.closed.Store(true); return nil }
+func newFakeTTSConn() *fakeTTSConn {
+	return &fakeTTSConn{
+		closeCh: make(chan struct{}),
+		frameCh: make(chan struct{}, 1),
+	}
+}
+
+func (f *fakeTTSConn) SendText(text string) error {
+	f.mu.Lock()
+	f.sendTextCalls = append(f.sendTextCalls, text)
+	n, threshold := len(f.sendTextCalls), f.firstFrameAfter
+	f.mu.Unlock()
+	if threshold > 0 && n == threshold {
+		select {
+		case f.frameCh <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (f *fakeTTSConn) SendEOS() error {
+	f.mu.Lock()
+	f.eosCalled = true
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeTTSConn) Recv() (any, error) {
+	f.mu.Lock()
+	threshold, alreadySent := f.firstFrameAfter, f.frameSent
+	f.mu.Unlock()
+	if threshold > 0 && !alreadySent {
+		select {
+		case <-f.frameCh:
+			f.mu.Lock()
+			f.frameSent = true
+			f.mu.Unlock()
+			return moshiclient.TTSAudioMessage{PCM: []float64{0.1, 0.2}}, nil
+		case <-f.closeCh:
+			return nil, errors.New("fake tts: closed")
+		}
+	}
+	<-f.closeCh
+	return nil, errors.New("fake tts: closed")
+}
+
+func (f *fakeTTSConn) Close() error {
+	f.closed.Store(true)
+	f.closeOnce.Do(func() { close(f.closeCh) })
+	return nil
+}
+
+func (f *fakeTTSConn) SendTextCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sendTextCalls...)
+}
 
 func TestCancelActiveClosesTTSAndNotifiesClient(t *testing.T) {
 	serverConn, clientConn := newWSPair(t)
-	tts := &fakeTTSConn{}
+	tts := newFakeTTSConn()
 	s := &session{client: serverConn, activeTTS: tts}
 
 	s.cancelActive()
@@ -264,5 +345,317 @@ func TestCancelActiveClosesTTSAndNotifiesClient(t *testing.T) {
 	}
 	if got := readControl(t, clientConn)["type"]; got != "interrupted" {
 		t.Fatalf("control message type = %v, want %q", got, "interrupted")
+	}
+}
+
+// TestBeginGenerationDoesNotCloseActiveTTS is the corrected regression
+// test for the live 2026-08-25 bug — see beginGeneration's doc comment
+// for the full trace. An earlier fix made beginGeneration close the
+// previous generation's activeTTS immediately on every new call's start,
+// which fixed the original leak but introduced a worse one: with
+// streaming, a call's TTS dial begins concurrently with its LLM call, and
+// turn-taking's own speculative→real promotion fires a new call within
+// about a second of the last — reliably faster than a TTS dial can
+// produce a single frame. That closed replies that hadn't spoken a word
+// yet, on ordinary sentences, not just fast speech (confirmed live: a
+// single normally-spoken utterance produced zero audio across three
+// internal calls). beginGeneration must only bump the counter now — the
+// actual close-and-replace happens in speakStream, atomically, at the
+// moment a new call is ready to speak (see
+// TestSpeakStreamClaimsSlotAndClosesPreviousConnection).
+func TestBeginGenerationDoesNotCloseActiveTTS(t *testing.T) {
+	tts := newFakeTTSConn()
+	s := &session{activeTTS: tts}
+
+	s.beginGeneration()
+
+	if tts.closed.Load() {
+		t.Error("beginGeneration closed the active TTS connection — that's the 2026-08-25 regression this test guards against; the close belongs in speakStream's claim step, not here")
+	}
+	if s.activeTTS != tts {
+		t.Error("beginGeneration touched activeTTS — it should leave whatever's currently speaking alone")
+	}
+}
+
+func TestBeginGenerationDoesNotSendInterruptedMessage(t *testing.T) {
+	serverConn, clientConn := newWSPair(t)
+	s := &session{client: serverConn, activeTTS: newFakeTTSConn()}
+
+	s.beginGeneration()
+
+	// beginGeneration closes the previous TTS connection (see the test
+	// above) but must not tell the client "interrupted" — that message
+	// specifically means the user talked over Saturday, which starting a
+	// new reply attempt on its own doesn't. cancelActive still sends it
+	// (TestCancelActiveClosesTTSAndNotifiesClient above already covers
+	// that). Confirm nothing arrives on this connection at all.
+	clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, _, err := clientConn.ReadMessage(); err == nil {
+		t.Error("beginGeneration sent a control message to the client; it shouldn't send anything")
+	}
+}
+
+func newSessionWithFakeTTS(serverConn *websocket.Conn, tts *fakeTTSConn) *session {
+	return &session{
+		client: serverConn,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			return tts, nil
+		},
+	}
+}
+
+func TestSpeakStreamSendsTextPerChunkThenOneEOS(t *testing.T) {
+	serverConn, clientConn := newWSPair(t)
+	tts := newFakeTTSConn()
+	s := newSessionWithFakeTTS(serverConn, tts)
+
+	chunks := make(chan string, 3)
+	chunks <- "hello "
+	chunks <- "there, "
+	chunks <- "world"
+	close(chunks)
+
+	done := make(chan error, 1)
+	go func() { done <- s.speakStream(chunks, func() bool { return false }) }()
+
+	readControl(t, clientConn) // warming up
+	readControl(t, clientConn) // speaking
+	tts.Close()                // end the fake audio stream so speakStream returns
+
+	if err := <-done; err != nil {
+		t.Fatalf("speakStream: %v", err)
+	}
+
+	want := []string{"hello ", "there, ", "world"}
+	got := tts.SendTextCalls()
+	if len(got) != len(want) {
+		t.Fatalf("SendText calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SendText call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	tts.mu.Lock()
+	eosCalled := tts.eosCalled
+	tts.mu.Unlock()
+	if !eosCalled {
+		t.Error("SendEOS was never called")
+	}
+}
+
+// TestSpeakStreamSendsChunksWhileDraining proves speakStream's send and
+// drain sides run concurrently, not send-then-drain serialized — the
+// actual claim the whole streaming feature rests on. The chunks channel
+// is unbuffered and the test withholds the second/third chunk until it
+// has already received an audio frame produced after the first chunk's
+// SendText: a serialized implementation would deadlock right here, since
+// drainTTSAudio would never start until every chunk had been sent, and
+// the test won't send the remaining chunks until it sees this frame.
+func TestSpeakStreamSendsChunksWhileDraining(t *testing.T) {
+	serverConn, clientConn := newWSPair(t)
+	tts := newFakeTTSConn()
+	tts.firstFrameAfter = 1
+	s := newSessionWithFakeTTS(serverConn, tts)
+
+	chunks := make(chan string)
+	done := make(chan error, 1)
+	go func() { done <- s.speakStream(chunks, func() bool { return false }) }()
+
+	readControl(t, clientConn) // warming up
+	chunks <- "hello "
+	readControl(t, clientConn) // speaking
+
+	clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	mt, _, err := clientConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("reading the first audio frame (would time out under a serialized send-then-drain implementation): %v", err)
+	}
+	if mt != websocket.BinaryMessage {
+		t.Fatalf("message type = %d, want BinaryMessage", mt)
+	}
+
+	chunks <- "there, "
+	chunks <- "world"
+	close(chunks)
+	tts.Close()
+
+	if err := <-done; err != nil {
+		t.Fatalf("speakStream: %v", err)
+	}
+	want := []string{"hello ", "there, ", "world"}
+	got := tts.SendTextCalls()
+	if len(got) != len(want) {
+		t.Fatalf("SendText calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SendText call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSpeakEmptyTextNeverDialsTTS(t *testing.T) {
+	serverConn, _ := newWSPair(t)
+	dialed := false
+	s := &session{
+		client: serverConn,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			dialed = true
+			return nil, errors.New("should never be called")
+		},
+	}
+	if err := s.speak("   "); err != nil {
+		t.Fatalf("speak(whitespace-only) = %v, want nil", err)
+	}
+	if dialed {
+		t.Error("speak(\"\") dialed TTS — the empty-text guard regressed")
+	}
+}
+
+func TestPrewarmTTSMakesConnectionAvailableToClaim(t *testing.T) {
+	warm := newFakeTTSConn()
+	s := &session{
+		clientDone: make(chan struct{}),
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			return warm, nil
+		},
+	}
+	s.prewarmTTS()
+
+	got := s.claimWarmTTS()
+	if got != warm {
+		t.Fatalf("claimWarmTTS() = %v, want the pre-warmed connection", got)
+	}
+	if got := s.claimWarmTTS(); got != nil {
+		t.Errorf("second claimWarmTTS() = %v, want nil — already claimed once", got)
+	}
+	if warm.closed.Load() {
+		t.Error("a claimed connection should not have been closed by prewarmTTS/claimWarmTTS")
+	}
+}
+
+func TestPrewarmTTSClosesConnectionIfClientAlreadyGone(t *testing.T) {
+	clientDone := make(chan struct{})
+	close(clientDone) // client gone before the (slow, cold) dial even finishes
+	warm := newFakeTTSConn()
+	s := &session{
+		clientDone: clientDone,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			return warm, nil
+		},
+	}
+	s.prewarmTTS()
+
+	if got := s.claimWarmTTS(); got != nil {
+		t.Errorf("claimWarmTTS() = %v, want nil — nobody should claim a connection dialed after the client left", got)
+	}
+	if !warm.closed.Load() {
+		t.Error("prewarmTTS did not close the connection after finding the client already gone")
+	}
+}
+
+func TestSpeakStreamUsesPrewarmedConnectionWithoutDialingFresh(t *testing.T) {
+	serverConn, clientConn := newWSPair(t)
+	warm := newFakeTTSConn()
+	s := &session{
+		client:  serverConn,
+		warmTTS: warm,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			t.Fatal("speakStream dialed fresh instead of using the pre-warmed connection")
+			return nil, nil
+		},
+	}
+
+	chunks := make(chan string, 1)
+	chunks <- "hi"
+	close(chunks)
+	done := make(chan error, 1)
+	go func() { done <- s.speakStream(chunks, func() bool { return false }) }()
+
+	// No "warming up voice" message on the pre-warmed path — there was no
+	// wait to warn about, so the client should go straight to "speaking".
+	if got := readControl(t, clientConn)["value"]; got != "speaking" {
+		t.Fatalf("first control message = %v, want %q", got, "speaking")
+	}
+	warm.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("speakStream: %v", err)
+	}
+	if got := warm.SendTextCalls(); len(got) != 1 || got[0] != "hi" {
+		t.Errorf("SendText calls = %v, want [\"hi\"]", got)
+	}
+}
+
+// TestSpeakStreamClaimsSlotAndClosesPreviousConnection is the direct
+// regression test for the 2026-08-25 evidence: a call that's ready to
+// speak (has a live TTS connection, and isn't cancelled) must evict
+// whatever connection was previously active, exactly as the old
+// beginGeneration-based close used to — just relocated to the point a
+// replacement is actually ready, not the point a sibling call merely
+// started. Without this, the original leak (2nd live failure this
+// session) would return: an abandoned connection never gets closed.
+func TestSpeakStreamClaimsSlotAndClosesPreviousConnection(t *testing.T) {
+	serverConn, _ := newWSPair(t)
+	previous := newFakeTTSConn()
+	next := newFakeTTSConn()
+	s := &session{
+		client:    serverConn,
+		activeTTS: previous,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			return next, nil
+		},
+	}
+
+	chunks := make(chan string, 1)
+	chunks <- "hi"
+	close(chunks)
+	done := make(chan error, 1)
+	go func() { done <- s.speakStream(chunks, func() bool { return false }) }()
+
+	next.Close() // end the fake audio stream so speakStream returns
+	if err := <-done; err != nil {
+		t.Fatalf("speakStream: %v", err)
+	}
+
+	if !previous.closed.Load() {
+		t.Error("speakStream did not close the previously active TTS connection when claiming the slot")
+	}
+}
+
+// TestSpeakStreamSkipsClaimWhenAlreadyCancelled proves the other half of
+// the same fix: a call that turns out to be superseded by the time it has
+// a connection in hand must NOT claim the slot at all — it should close
+// its own (otherwise-unused) connection, drain chunks so the producer
+// goroutine isn't left blocked, and leave whatever's currently active
+// (a sibling reply that's actually still current) untouched.
+func TestSpeakStreamSkipsClaimWhenAlreadyCancelled(t *testing.T) {
+	serverConn, _ := newWSPair(t)
+	active := newFakeTTSConn()
+	skipped := newFakeTTSConn()
+	s := &session{
+		client:    serverConn,
+		activeTTS: active,
+		dialTTS: func(string, string, moshiclient.TTSVoice, float64, time.Duration) (ttsConn, error) {
+			return skipped, nil
+		},
+	}
+
+	chunks := make(chan string, 1)
+	chunks <- "hi"
+	close(chunks)
+	err := s.speakStream(chunks, func() bool { return true })
+	if err != nil {
+		t.Fatalf("speakStream: %v, want nil (a superseded call isn't an error)", err)
+	}
+
+	if !skipped.closed.Load() {
+		t.Error("speakStream did not close its own connection after finding itself already cancelled")
+	}
+	if s.activeTTS != active {
+		t.Error("speakStream touched activeTTS for a call that was already cancelled — it should leave the actually-active reply alone")
+	}
+	if active.closed.Load() {
+		t.Error("speakStream closed the still-current reply's connection — only the cancelled call's own connection should have been closed")
 	}
 }

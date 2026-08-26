@@ -50,6 +50,13 @@ async function connect() {
     return;
   }
 
+  try {
+    await audioCtx.audioWorklet.addModule("mic-worklet.js");
+  } catch (e) {
+    setStatus("failed to load mic capture worklet: " + e, "state-error");
+    return;
+  }
+
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -87,6 +94,28 @@ async function connect() {
   const OUTPUT_GAIN = 0.5;
   const masterGain = audioCtx.createGain();
   masterGain.gain.value = OUTPUT_GAIN;
+
+  // Added 2026-08-25 as a first response to "emphasizing the first
+  // syllable so much it's clipping if it were a real mic" — at the time,
+  // the working theory was a hot onset transient at each streaming-TTS
+  // chunk boundary (see wordBatcher in orchestrator/). That theory didn't
+  // hold up: a server-side WAV capture of the exact TTS output (see
+  // SATURDAY_TTS_WAV_DEBUG in saturday-voice/pipeline.go) showed a clean,
+  // gradual onset with no click or discontinuity, which points at
+  // client-side capture/playback instead (see mic-worklet.js). Left in
+  // as a cheap, harmless safety net against real transients rather than
+  // removed outright — it reacts to the signal itself regardless of
+  // source, so it costs nothing if it's not the fix. Sits ahead of
+  // masterGain so it sees moshi-server's true peak levels (0.9+ is
+  // normal, per OUTPUT_GAIN's own comment above) rather than the
+  // already-attenuated signal.
+  const compressor = audioCtx.createDynamicsCompressor();
+  compressor.threshold.value = -24; // dB — start catching well below 0dBFS
+  compressor.knee.value = 24;       // soft knee, avoids an audible "gear change"
+  compressor.ratio.value = 12;      // near-limiter above threshold
+  compressor.attack.value = 0.003;  // 3ms — fast enough to catch an onset spike
+  compressor.release.value = 0.15;
+  compressor.connect(masterGain);
   masterGain.connect(audioCtx.destination);
 
   // Playback: queue of AudioBufferSourceNodes scheduled back-to-back
@@ -133,9 +162,9 @@ async function connect() {
       fadeGain.gain.setValueAtTime(0, startAt);
       fadeGain.gain.linearRampToValueAtTime(1, startAt + FADE_IN_SEC);
       src.connect(fadeGain);
-      fadeGain.connect(masterGain);
+      fadeGain.connect(compressor);
     } else {
-      src.connect(masterGain);
+      src.connect(compressor);
     }
     src.start(startAt);
     nextPlayTime = startAt + buf.duration;
@@ -154,38 +183,25 @@ async function connect() {
   ws.onopen = () => {
     setStatus("connected — listening", "state-listening");
     const source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessorNode's buffer size must be 0 or a power of two
-    // (256-16384) — SAMPLES_PER_FRAME (1920) isn't one. The re-chunking
-    // loop below already rebuilds exact SAMPLES_PER_FRAME frames from
-    // whatever size the callback actually delivers, so any legal size
-    // works here.
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    let frameBuf = new Float32Array(0);
-
-    processor.onaudioprocess = (evt) => {
+    // Capture runs in mic-worklet.js on the dedicated audio thread — see
+    // that file for why (replaces a ScriptProcessorNode that ran on the
+    // main thread, a documented glitch source under main-thread load).
+    const micNode = new AudioWorkletNode(audioCtx, "mic-capture-processor", {
+      processorOptions: { frameSize: SAMPLES_PER_FRAME },
+    });
+    micNode.port.onmessage = (evt) => {
       if (ws.readyState !== WebSocket.OPEN) return;
-      const input = evt.inputBuffer.getChannelData(0);
-      // ScriptProcessorNode's buffer size may not exactly match
-      // SAMPLES_PER_FRAME on every browser; re-chunk to be safe.
-      const combined = new Float32Array(frameBuf.length + input.length);
-      combined.set(frameBuf);
-      combined.set(input, frameBuf.length);
-      let offset = 0;
-      while (combined.length - offset >= SAMPLES_PER_FRAME) {
-        const frame = combined.slice(offset, offset + SAMPLES_PER_FRAME);
-        ws.send(frame.buffer);
-        offset += SAMPLES_PER_FRAME;
-      }
-      frameBuf = combined.slice(offset);
+      ws.send(evt.data);
     };
 
-    source.connect(processor);
-    // ScriptProcessorNode requires a destination connection to fire even
-    // though we don't want its output audible — route through a
-    // zero-gain node instead of destination directly.
+    source.connect(micNode);
+    // AudioWorkletNode still needs a path to destination to stay in the
+    // active graph and keep getting pulled — same zero-gain trick
+    // ScriptProcessorNode needed, kept for the same reason even though
+    // the processing itself no longer touches the main thread.
     const silentGain = audioCtx.createGain();
     silentGain.gain.value = 0;
-    processor.connect(silentGain);
+    micNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
   };
 
