@@ -148,6 +148,44 @@ wait_pane_settled() {
     return 1
 }
 
+# next_free_slot prints the smallest positive integer not currently held by
+# any live pane's @cockpit_slot user option in $SESSION. Slots are assigned
+# once, at pane creation, and never reassigned (see bind_hotkeys/
+# pane_hotkey_label below) — a killed pane's slot just stops showing up in
+# this scan (tmux drops pane user options with the pane), so reuse happens
+# automatically without a free-list to maintain, and only ever for a slot
+# whose session is actually gone.
+next_free_slot() {
+    local used n=1
+    used="$(tmux list-panes -t "$SESSION" -F '#{@cockpit_slot}' 2>/dev/null | grep -E '^[0-9]+$' | sort -n)"
+    for u in $used; do
+        if [ "$u" -eq "$n" ]; then
+            n=$((n + 1))
+        elif [ "$u" -gt "$n" ]; then
+            break
+        fi
+    done
+    echo "$n"
+}
+
+# ensure_pane_slots backfills @cockpit_slot on any pane in $SESSION that
+# doesn't have one yet — a session started before slot-based hotkeys existed
+# (or by an older script version). Assigns in #{pane_id} listing order, which
+# tmux hands back in pane-index order, so an already-running cockpit's
+# current Alt+N muscle memory survives the upgrade unchanged. Called from
+# bind_hotkeys, which already runs before any new pane gets created in both
+# the initial-launch and `add` paths, so backfilled slots are claimed before
+# next_free_slot is asked for a fresh one.
+ensure_pane_slots() {
+    local pane_id existing
+    while IFS= read -r pane_id; do
+        [ -z "$pane_id" ] && continue
+        existing="$(tmux show-options -pqv -t "$pane_id" @cockpit_slot 2>/dev/null || true)"
+        [ -n "$existing" ] && continue
+        tmux set-option -p -t "$pane_id" @cockpit_slot "$(next_free_slot)"
+    done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+}
+
 # Split a new pane for $1 into the running session and re-balance. Shared by
 # the initial build loop and `add`, so a running cockpit and a fresh one grow
 # panes the same way. Callers that launch more than one pane in a batch are
@@ -159,6 +197,7 @@ add_pane() {
     local pane_id
     pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
     [ -n "$title" ] && tmux set-option -p -t "$pane_id" @cockpit_title "$title"
+    tmux set-option -p -t "$pane_id" @cockpit_slot "$(next_free_slot)"
     tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 }
 
@@ -236,6 +275,7 @@ add_pane_pellicle() {
     local claude_pane_id
     claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
     [ -n "$title" ] && tmux set-option -p -t "$claude_pane_id" @cockpit_title "$title"
+    tmux set-option -p -t "$claude_pane_id" @cockpit_slot "$(next_free_slot)"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
@@ -248,26 +288,38 @@ add_pane_pellicle() {
     tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 }
 
-# Alt+1..9: jump straight to pane N, zoomed full-screen — press the same
-# number again to toggle back to the tiled overview (tmux auto-unzooms on
-# select-pane to a *different* pane, so re-selecting the one you're already
-# on is the only case that needs the explicit resize-pane -Z toggle; verified
-# live against tmux 3.6, not assumed from docs). Alt+0 always forces the
-# overview. Root-table (-n, no prefix) and global to the tmux server, so
-# these also work as a plain pane-jump facility outside the cockpit — they
-# don't collide with anything: stock tmux only binds M-1..M-9 in the prefix
-# and copy-mode tables, never in root.
+# Alt+1..9: jump straight to the pane holding @cockpit_slot N, zoomed
+# full-screen — press the same number again to toggle back to the tiled
+# overview (tmux auto-unzooms on select-pane to a *different* pane, so
+# re-selecting the one you're already on is the only case that needs the
+# explicit resize-pane -Z toggle; verified live against tmux 3.6, not
+# assumed from docs). Alt+0 always forces the overview. Root-table (-n, no
+# prefix) and global to the tmux server, so these also work as a plain
+# pane-jump facility outside the cockpit — they don't collide with anything:
+# stock tmux only binds M-1..M-9 in the prefix and copy-mode tables, never
+# in root.
+#
+# Targets a pane by @cockpit_slot, not #{pane_index} — tmux renumbers
+# pane_index every time a pane is added or killed, which used to mean Alt+9
+# could silently point at a different session than the one you last saw
+# there. @cockpit_slot is assigned once at pane creation (add_pane/
+# add_pane_pellicle) and never reassigned, so the lookup below is resolved
+# fresh at *keypress* time via a run-shell filter — `p=$(...)` and `"$p"`
+# are left unescaped-by-bash (backslash-escaped $ below) so they're
+# evaluated by tmux's run-shell subshell when the key is pressed, not by
+# this script at bind time.
 bind_hotkeys() {
     tmux set-option -g pane-base-index 1
+    ensure_pane_slots
     for n in 1 2 3 4 5 6 7 8 9; do
-        tmux bind-key -n "M-$n" run-shell "tmux select-pane -t $n ; tmux resize-pane -Z"
+        tmux bind-key -n "M-$n" run-shell "p=\$(tmux list-panes -t $SESSION -f '#{==:#{@cockpit_slot},$n}' -F '#{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
     done
     # Alt+letter: same scheme, panes 10+, once a session outgrows the nine
     # digits (M-0 is the overview reset above, not a tenth pane). See
     # COCKPIT_HOTKEY_LETTERS above for why these letters and not others.
     local pane=10
     for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        tmux bind-key -n "M-$l" run-shell "tmux select-pane -t $pane ; tmux resize-pane -Z"
+        tmux bind-key -n "M-$l" run-shell "p=\$(tmux list-panes -t $SESSION -f '#{==:#{@cockpit_slot},$pane}' -F '#{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
         pane=$((pane + 1))
     done
     # Un-zoom if zoomed, then always re-tile to even shares — stage's
@@ -285,20 +337,24 @@ bind_hotkeys() {
 }
 
 # pane_hotkey_label builds the tmux format expression for the pane-border
-# label: #{pane_index} is already the right label for panes 1-9 (that
-# number IS the Alt+N key), but for pane 10+ the border must show the
-# actual Alt+letter from COCKPIT_HOTKEY_LETTERS instead of the raw index,
-# or the label lies about which key selects that pane. A chain of
+# label: #{@cockpit_slot} is already the right label for panes 1-9 (that
+# number IS the Alt+N key — see bind_hotkeys for why this is the sticky
+# slot, not #{pane_index}), but for pane 10+ the border must show the
+# actual Alt+letter from COCKPIT_HOTKEY_LETTERS instead of the raw slot
+# number, or the label lies about which key selects that pane. A chain of
 # #{?#{==:...}} ternaries, built from the same array bind_hotkeys uses, so
 # label and binding can't drift apart. NOT #{if:...} — that reads as a
 # literal, unrecognized format function on tmux 3.6 (verified live: it
 # just dumps "if:1,YES,NO" instead of evaluating) — #{?cond,true,false} is
-# the real ternary, confirmed live nested 8 deep.
+# the real ternary, confirmed live nested 8 deep. A pane with no slot yet
+# (the pellicle render strip, which never gets one — see add_pane_pellicle)
+# falls through to an empty #{@cockpit_slot}, which is correct: it isn't a
+# hotkey target.
 pane_hotkey_label() {
-    local expr='#{pane_index}'
+    local expr='#{@cockpit_slot}'
     local pane=10
     for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        expr="#{?#{==:#{pane_index},$pane},$l,$expr}"
+        expr="#{?#{==:#{@cockpit_slot},$pane},$l,$expr}"
         pane=$((pane + 1))
     done
     echo "$expr"
