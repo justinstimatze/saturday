@@ -33,11 +33,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -129,8 +131,10 @@ type savedStyle struct {
 }
 
 type tmuxSource struct {
-	noRelocate   bool
-	tileEmphasis float64
+	noRelocate    bool
+	tileEmphasis  float64
+	tweenDuration time.Duration
+	tweenTauMs    float64 // tweenTau pre-converted to ms, what smoothdampStep wants
 
 	mu sync.Mutex
 	// touched maps CC session_id → the tmux window we restyled, plus the
@@ -148,8 +152,14 @@ type touchedWindow struct {
 	zoomed      bool // stage zoomed this pane → unzoom on restore
 }
 
-func newTmuxSource(noRelocate bool, tileEmphasis float64) *tmuxSource {
-	return &tmuxSource{noRelocate: noRelocate, tileEmphasis: tileEmphasis, touched: map[string]touchedWindow{}}
+func newTmuxSource(noRelocate bool, tileEmphasis float64, tweenDuration, tweenTau time.Duration) *tmuxSource {
+	return &tmuxSource{
+		noRelocate:    noRelocate,
+		tileEmphasis:  tileEmphasis,
+		tweenDuration: tweenDuration,
+		tweenTauMs:    float64(tweenTau.Milliseconds()),
+		touched:       map[string]touchedWindow{},
+	}
 }
 
 func (t *tmuxSource) Name() string { return "tmux" }
@@ -224,50 +234,258 @@ func (t *tmuxSource) zoomPane(sessionID, paneID string) error {
 	return nil
 }
 
-// proportionalTile lays the pane's window out as a single even-horizontal row
-// and gives the addressed pane a larger share (tileEmphasis : 1 vs each
-// sibling), so widths track salience without reordering panes. Two-tier for
-// now (addressed vs rest); a full per-session weight vector can drive this
-// later when mayor pushes one.
+// paneGeom is one pane's absolute position/size within its window, as
+// reported by list-panes. tmux doesn't expose its split tree as pane
+// geometry directly, so proportionalTile infers split-family membership
+// from this instead of parsing tmux's own layout-string grammar.
+type paneGeom struct {
+	id            string
+	left, top     int
+	width, height int
+}
+
+// parsePaneGeom parses list-panes -F "#{pane_id} #{pane_left} #{pane_top}
+// #{pane_width} #{pane_height}" output (one pane per line) into paneGeom
+// values, skipping any malformed line rather than erroring the whole call.
+func parsePaneGeom(out string) []paneGeom {
+	var panes []paneGeom
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 5 {
+			continue
+		}
+		left, err1 := strconv.Atoi(f[1])
+		top, err2 := strconv.Atoi(f[2])
+		width, err3 := strconv.Atoi(f[3])
+		height, err4 := strconv.Atoi(f[4])
+		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+			continue
+		}
+		panes = append(panes, paneGeom{id: f[0], left: left, top: top, width: width, height: height})
+	}
+	return panes
+}
+
+func paneByID(panes []paneGeom, id string) (paneGeom, bool) {
+	for _, p := range panes {
+		if p.id == id {
+			return p, true
+		}
+	}
+	return paneGeom{}, false
+}
+
+// siblingGroups finds the addressed pane's row-mates (panes sharing its
+// top+height — the horizontal split-family a -x resize would move) and
+// column-mates (panes sharing its left+width — the vertical split-family a
+// -y resize would move). Pure: works entirely off already-parsed geometry,
+// no tmux calls, so it's directly fixture-testable. Each group includes the
+// addressed pane itself. Either group can come back with just the addressed
+// pane alone (e.g. a full-width footer pane has no row-mates) — that's a
+// legitimate per-axis "nothing to tile against", not an error.
+func siblingGroups(panes []paneGeom, addressedID string) (rowMates, colMates []paneGeom) {
+	addressed, ok := paneByID(panes, addressedID)
+	if !ok {
+		return nil, nil
+	}
+	for _, p := range panes {
+		if p.top == addressed.top && p.height == addressed.height {
+			rowMates = append(rowMates, p)
+		}
+		if p.left == addressed.left && p.width == addressed.width {
+			colMates = append(colMates, p)
+		}
+	}
+	return rowMates, colMates
+}
+
+// tileAxisTargets computes each non-skipped pane's target size along one
+// axis: the addressed pane gets a tileEmphasis:1 share against every other
+// pane in group, the remainder split evenly among the rest — same math as
+// the original two-tier proportionalTile, now scoped to a real
+// split-family group instead of the whole window, and fed the group's own
+// summed size rather than the raw window dimension (numerically the same
+// on a group that spans the full window, correct in general — e.g. a
+// future sidebar-plus-grid layout where a row only spans part of the
+// window). One pane is always left unresized so tmux absorbs the
+// integer-division remainder into it — never the addressed pane, so its
+// emphasis always lands explicitly. nil (not an empty map) means "nothing
+// to tile on this axis" (fewer than 2 panes, or zero total size).
+func tileAxisTargets(group []paneGeom, addressedID string, tileEmphasis float64, sizeOf func(paneGeom) int) map[string]int {
+	if len(group) < 2 {
+		return nil
+	}
+	total := 0
+	for _, p := range group {
+		total += sizeOf(p)
+	}
+	if total <= 0 {
+		return nil
+	}
+	skip := len(group) - 1
+	if group[skip].id == addressedID {
+		skip = len(group) - 2
+	}
+	denom := tileEmphasis + float64(len(group)-1)
+	target := int(tileEmphasis / denom * float64(total))
+	rest := (total - target) / (len(group) - 1)
+	targets := make(map[string]int, len(group)-1)
+	for i, p := range group {
+		if i == skip {
+			continue
+		}
+		if p.id == addressedID {
+			targets[p.id] = target
+		} else {
+			targets[p.id] = rest
+		}
+	}
+	return targets
+}
+
+// proportionalTile emphasizes the addressed pane within its real row and
+// column split-families instead of forcing the window into a single row.
+// tmux resize-pane already only redistributes space among a pane's
+// immediate split-family siblings — that's the mechanism the old
+// even-horizontal-forcing code was fighting — so once the layout isn't
+// flattened first, resize-pane naturally respects whatever real grid or
+// nested arrangement (e.g. a pellicle status-strip pair) is already there.
+// A full per-session weight vector can drive this later when mayor pushes
+// one; two-tier (addressed vs. its own siblings) for now.
 func (t *tmuxSource) proportionalTile(paneID string) error {
 	win, err := windowOf(paneID)
 	if err != nil {
 		return err
 	}
-	out, err := tmuxOut("list-panes", "-t", win, "-F", "#{pane_id}")
+	// Don't fight a user's manual zoom: list-panes reports a zoomed pane at
+	// full-window geometry while every other pane keeps its pre-zoom
+	// logical position (confirmed live — a real cockpit session had a pane
+	// mid-zoom while this was being designed), which would corrupt the
+	// grouping below and make resizing the other panes unreliable. Same
+	// zoomed-flag check zoomPane/Restore already use.
+	if z, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_zoomed_flag}"); z == "1" {
+		return nil
+	}
+	out, err := tmuxOut("list-panes", "-t", win, "-F",
+		"#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}")
 	if err != nil {
 		return err
 	}
-	panes := strings.Fields(out)
-	if len(panes) < 2 {
-		return nil // nothing to tile against
+	panes := parsePaneGeom(out)
+	rowMates, colMates := siblingGroups(panes, paneID)
+
+	var tweens []paneTween
+	addTweens := func(group []paneGeom, axis string, sizeOf func(paneGeom) int) {
+		for id, target := range tileAxisTargets(group, paneID, t.tileEmphasis, sizeOf) {
+			p, ok := paneByID(panes, id)
+			if !ok {
+				continue
+			}
+			tweens = append(tweens, paneTween{pane: id, axis: axis, cur: float64(sizeOf(p)), target: float64(target)})
+		}
 	}
-	if err := tmuxRun("select-layout", "-t", win, "even-horizontal"); err != nil {
-		fmt.Fprintf(os.Stderr, "\033[2m  tile: select-layout -t %s even-horizontal: %v\033[0m\n", win, err)
+	addTweens(rowMates, "x", func(p paneGeom) int { return p.width })
+	addTweens(colMates, "y", func(p paneGeom) int { return p.height })
+
+	if len(tweens) == 0 {
+		return nil // nothing to tile against on either axis
 	}
-	wStr, _ := tmuxOut("display-message", "-p", "-t", win, "#{window_width}")
-	var cols int
-	fmt.Sscanf(wStr, "%d", &cols)
-	if cols <= 0 {
+	fmt.Fprintf(os.Stderr, "\033[2m  tile: win=%s addressed=%s axes=%d emphasis=%.1f\033[0m\n",
+		win, paneID, len(tweens), t.tileEmphasis)
+	return t.animateResizes(tweens)
+}
+
+// paneTween is one pane-axis's animated resize: its current size sliding
+// toward its target.
+type paneTween struct {
+	pane   string
+	axis   string // "x" or "y" — which resize-pane flag drives this
+	cur    float64
+	target float64
+}
+
+// smoothdampStep is jonaburg/tmux-animated's own pane-resize formula
+// (animation.c:212-224 on its `animations` branch — fetched and verified
+// against the real source, not recalled from memory), ported to Go rather
+// than invented fresh: pure exponential decay toward target. It never
+// exactly reaches target in finite time — animateResizes hard-snaps on its
+// own duration budget rather than looping on convergence.
+func smoothdampStep(pos, target, tauMs, dtMs float64) float64 {
+	if tauMs <= 0 {
+		tauMs = 1 // matches the real source's own guard
+	}
+	alpha := 1 - math.Exp(-dtMs/tauMs)
+	return pos + alpha*(target-pos)
+}
+
+// tileTweenFrameInterval bounds how often animateResizes can spawn a
+// resize-pane subprocess. Not a flag: nothing in this design needs it
+// operator-tunable, and exposing it would grow the flag surface for its
+// own sake.
+const tileTweenFrameInterval = 30 * time.Millisecond
+
+// tmuxRunFn is the seam animateResizes calls through instead of tmuxRun
+// directly, so tests can substitute a recording fake and assert call
+// counts/order without shelling to a real tmux.
+var tmuxRunFn = tmuxRun
+
+// animateResizes steps every tween's current size toward its target via
+// smoothdampStep on one shared ticker (not one goroutine per pane — keeps
+// subprocess spawns bounded and batched per tick rather than staggered),
+// issuing resize-pane only when a pane's rounded size actually changes
+// since the last tick (skips a spawn when sub-cell motion hasn't crossed
+// an integer boundary yet). Runs for a fixed wall-clock budget
+// (t.tweenDuration), then force-snaps every pane to its exact integer
+// target — smoothdamp is asymptotic and never arrives on its own.
+func (t *tmuxSource) animateResizes(tweens []paneTween) error {
+	if t.tweenDuration <= 0 {
+		// Explicit fast path, not an implicit degenerate case: smoothdamp
+		// has no convergence point to fall back on, so a zero-duration tick
+		// loop wouldn't do the right thing on its own. Matches the old
+		// instant-jump behavior exactly.
+		for _, tw := range tweens {
+			target := int(math.Round(tw.target))
+			if err := tmuxRunFn("resize-pane", "-t", tw.pane, "-"+tw.axis, strconv.Itoa(target)); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[2m  tile: resize-pane -t %s -%s %d: %v\033[0m\n", tw.pane, tw.axis, target, err)
+			}
+		}
 		return nil
 	}
-	total := t.tileEmphasis + float64(len(panes)-1) // emphasis for target, 1 each for the rest
-	target := int(t.tileEmphasis / total * float64(cols))
-	// Resize every pane but the last (tmux balances the remainder into it),
-	// giving the addressed pane the emphasis share and the rest an even split.
-	rest := (cols - target) / (len(panes) - 1)
-	fmt.Fprintf(os.Stderr, "\033[2m  tile: win=%s panes=%v target=%s→%dcol rest=%dcol cols=%d emphasis=%.1f\033[0m\n",
-		win, panes, paneID, target, rest, cols, t.tileEmphasis)
-	for i, p := range panes {
-		if i == len(panes)-1 {
+
+	last := make([]int, len(tweens))
+	for i, tw := range tweens {
+		last[i] = int(math.Round(tw.cur))
+	}
+
+	deadline := time.Now().Add(t.tweenDuration)
+	tick := time.NewTicker(tileTweenFrameInterval)
+	defer tick.Stop()
+	prev := time.Now()
+	for now := range tick.C {
+		dtMs := float64(now.Sub(prev).Milliseconds())
+		prev = now
+		for i := range tweens {
+			tweens[i].cur = smoothdampStep(tweens[i].cur, tweens[i].target, t.tweenTauMs, dtMs)
+			rounded := int(math.Round(tweens[i].cur))
+			if rounded == last[i] {
+				continue
+			}
+			last[i] = rounded
+			if err := tmuxRunFn("resize-pane", "-t", tweens[i].pane, "-"+tweens[i].axis, strconv.Itoa(rounded)); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[2m  tile: resize-pane -t %s -%s %d: %v\033[0m\n", tweens[i].pane, tweens[i].axis, rounded, err)
+			}
+		}
+		if !now.Before(deadline) {
 			break
 		}
-		w := rest
-		if p == paneID {
-			w = target
+	}
+	for i, tw := range tweens {
+		target := int(math.Round(tw.target))
+		if last[i] == target {
+			continue
 		}
-		if err := tmuxRun("resize-pane", "-t", p, "-x", fmt.Sprintf("%d", w)); err != nil {
-			fmt.Fprintf(os.Stderr, "\033[2m  tile: resize-pane -t %s -x %d: %v\033[0m\n", p, w, err)
+		if err := tmuxRunFn("resize-pane", "-t", tw.pane, "-"+tw.axis, strconv.Itoa(target)); err != nil {
+			fmt.Fprintf(os.Stderr, "\033[2m  tile: resize-pane -t %s -%s %d: %v\033[0m\n", tw.pane, tw.axis, target, err)
 		}
 	}
 	return nil
@@ -518,13 +736,15 @@ func main() {
 	allowRe := flag.String("allow", "^cc-", "regex over tmux session names — only matching sessions are observed in the activity stream. Default ^cc- = CC sessions only (privacy-safe by construction). Empty = observe all.")
 	poll := flag.Duration("poll", time.Second, "tmux activity poll interval")
 	noRelocate := flag.Bool("no-relocate", false, "highlight only — never select-window/select-pane (no focus motion, just border tint)")
-	tileEmphasis := flag.Float64("tile-emphasis", 3.0, "Posture A: on a tile focus, the addressed pane's width share relative to each sibling (3 = ~3× wider). 1 = even.")
+	tileEmphasis := flag.Float64("tile-emphasis", 3.0, "Posture A: on a tile focus, the addressed pane's width/height share relative to each sibling in its own row/column (3 = ~3x larger). 1 = even.")
+	tileTweenDuration := flag.Duration("tile-tween-duration", 180*time.Millisecond, "Posture A: total animation budget for a tile-focus resize (smoothdamp easing, ported from jonaburg/tmux-animated). 0 disables tweening (instant resize).")
+	tileTweenTau := flag.Duration("tile-tween-tau", 50*time.Millisecond, "Posture A: smoothdamp time constant for tile-focus resizes — shapes the curve's inertia.")
 	flag.Parse()
 
 	var src WindowSource
 	switch *backend {
 	case "tmux":
-		src = newTmuxSource(*noRelocate, *tileEmphasis)
+		src = newTmuxSource(*noRelocate, *tileEmphasis, *tileTweenDuration, *tileTweenTau)
 	case "hyprland":
 		src = &hyprlandSource{}
 	default:
