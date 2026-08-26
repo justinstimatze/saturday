@@ -66,7 +66,13 @@
 #   COCKPIT      tmux session name (default: cc-cockpit — matches stage's ^cc-
 #                activity allowlist). Set a different name to run a second
 #                cockpit on another monitor.
-#   COCKPIT_TILE even-horizontal | even-vertical | tiled (default even-horizontal)
+#   COCKPIT_TILE even-horizontal | even-vertical | tiled (default tiled — a
+#                grid scales far better than a single row/column once more
+#                than 3-4 panes are open; even-horizontal was the default
+#                until 2026-08-25, when 9 panes made it unusable (~1/9
+#                terminal width each). A genuinely dynamic/weighted layout
+#                remains a separate, deferred piece of work — this is a
+#                better static default in the meantime, not that rewrite.
 #
 # Pair with stage zoom/tile on mayor:
 #   saturday-mayor ... --stage-sock /tmp/saturday-stage.sock --stage-zoom
@@ -76,7 +82,7 @@ set -euo pipefail
 
 SESSION="${COCKPIT:-cc-cockpit}"
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
-LAYOUT="${COCKPIT_TILE:-even-horizontal}"
+LAYOUT="${COCKPIT_TILE:-tiled}"
 
 # Alt+letter pane-jump keys for panes 10+ (Alt+1..9 covers panes 1-9, Alt+0
 # is the overview reset — see bind_hotkeys). Ordered by physical proximity
