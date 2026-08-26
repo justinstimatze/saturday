@@ -34,23 +34,30 @@ binaries, the CC hook wiring, first-run download size, pointers to the
 two optional legs) instead of requiring a new user to open six
 per-module READMEs to find every step.
 
-1. **`saturday-stage` tile scaling + resize tweener** — `proportionalTile`
-   is two-tier only (addressed pane vs. one even row-split of the rest),
-   so it doesn't scale past a handful of concurrent sessions into
-   anything resembling a real grid. Same code path also wants a stepped/
-   interpolated resize instead of one instant jump on focus transitions —
-   feasibility isn't in question (pellicle's mouse-drag pane resize
-   already proves tmux resize+redraw is fast/clean enough to read as
-   smooth), only the step-count/delay/easing tuning is open. [jonaburg/
-   tmux-animated](https://github.com/jonaburg/tmux-animated) is relevant
-   prior art here — a tmux patch with real interpolated pane-resize
-   animation (configurable duration + easing) already exists; worth
-   evaluating as an adopt-don't-build option before hand-rolling a
-   tweener, though it means running a patched tmux binary and its
-   "control-mode clients don't animate" caveat needs checking against
-   how `saturday-stage` issues `resize-pane` before relying on it.
-   Trigger: once you're routinely running enough concurrent sessions
-   that a single thinning row stops being legible.
+**`saturday-stage` tile scaling + resize tweener shipped 2026-08-26** —
+`548d012`. `proportionalTile` no longer forces `select-layout
+even-horizontal` before every tile-focus (which flattened any real grid or
+nested arrangement, e.g. a pellicle status-strip pair, into one row and
+destroyed it every time); `resize-pane` already only redistributes space
+within a pane's own split-family, so emphasizing the addressed pane within
+its real row (`list-panes` geometry sharing top+height) and column (sharing
+left+width) siblings just works once that flattening isn't forced. A
+`window_zoomed_flag` guard skips the whole operation when a pane is
+manually zoomed (its geometry is corrupted for this purpose while zoomed).
+Live-verified against the real running `cc-cockpit` 10-pane grid:
+hand-computed targets matched measured geometry exactly, an unrelated
+footer pane was untouched, and `restore` still reverted cleanly.
+
+The `jonaburg/tmux-animated` adopt-vs-build question is resolved:
+hand-rolled a Go port of its actual `animation_step_smoothdamp` formula
+(fetched via `curl` and verified against its real `animation.c`, ISC
+license, ported not vendored) driving stock `resize-pane` calls, not a
+patched tmux binary — sidesteps its "control-mode clients don't animate"
+caveat entirely, since that's specific to their patched rendering pipeline
+and `saturday-stage` only shells `resize-pane` against a normal
+tty-attached session.
+
+Tier A has no open items as of this ship.
 
 ### B. Trigger-gated (roadmap explicitly says wait)
 
@@ -71,6 +78,7 @@ per-module READMEs to find every step.
 | 11 | Drivermap integration | Blocked on drivermap's state export |
 | 12 | Effigy-driven verifier (elaboration) | V0.2.7 has a lexical stub; roadmap wants small-LLM version |
 | 13 | FUI Go TUI library spin-out | Creative work, not blocking |
+| 14 | lucida terminal-mode pane trigger | A CC session triggers lucida to open a transient viz pane via `saturday-cockpit`/`saturday-stage`'s pane machinery, pause, then auto-close. Blocked on lucida's own terminal-only mode existing (see `~/Documents/lucida/idea.md`) and on this roadmap's tile-scaling item landing (the pane open/close primitive this would ride on). |
 
 ### D. Speculative
 
