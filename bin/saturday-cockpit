@@ -11,6 +11,9 @@
 # Usage:
 #   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
 #   saturday-cockpit [--resume] [--dangerously-skip-permissions] [--remote-control] <dir> [<dir> ...]
+#                                   # --resume is non-interactive by default
+#                                   # (see add --resume below); --resume-picker
+#                                   # opts into claude's own interactive picker.
 #                                   # all flags apply to CLAUDE_CMD for every
 #                                   # pane in this initial batch (see below —
 #                                   # same flags, same meaning, as on `add`).
@@ -21,7 +24,7 @@
 #                                   # real commands pop in one at a time —
 #                                   # the addressed pane (first dir) settles
 #                                   # last. Composes with --resume/
-#                                   # --resume-last/--dangerously-skip-
+#                                   # --resume-picker/--dangerously-skip-
 #                                   # permissions/--remote-control; not
 #                                   # available with --pellicle (initial-
 #                                   # launch-only restriction, see below).
@@ -34,33 +37,36 @@
 #                                   # via new-session, not split-window, so it
 #                                   # has no pellicle path of its own yet.
 #   saturday-cockpit add --resume <dir> [<dir> ...]
+#                                   # non-interactive: resolve each dir's
+#                                   # most-recently-modified session file
+#                                   # under ~/.claude/projects/<encoded-dir>/
+#                                   # and pass it straight through as
+#                                   # `claude --resume <id>` — no picker, so
+#                                   # no pane sits stuck waiting on a human
+#                                   # in an otherwise-scriptable cockpit. A
+#                                   # dir with no prior session starts fresh
+#                                   # instead of failing the batch.
+#                                   # --resume-last is a recognized synonym.
+#                                   # Mutually exclusive with --resume-picker.
+#   saturday-cockpit add --resume-picker <dir> [<dir> ...]
 #                                   # run `claude --resume` instead of a
 #                                   # fresh session — drops into Claude's own
 #                                   # interactive picker per pane, scoped to
 #                                   # that dir's own past sessions. Composes
 #                                   # with --pellicle. For a known session id
-#                                   # instead of the picker, still use
+#                                   # instead of either, still use
 #                                   # CLAUDE_CMD='claude --resume <id>' add.
-#   saturday-cockpit add --resume-last <dir> [<dir> ...]
-#                                   # non-interactive: resolve each dir's
-#                                   # most-recently-modified session file
-#                                   # under ~/.claude/projects/<encoded-dir>/
-#                                   # and pass it straight through as
-#                                   # `claude --resume <id>` — no picker.
-#                                   # A dir with no prior session starts
-#                                   # fresh instead of failing the batch.
-#                                   # Mutually exclusive with --resume.
 #   saturday-cockpit add --dangerously-skip-permissions <dir> [<dir> ...]
 #                                   # pass the flag straight through to claude
 #                                   # for that pane. Composes with --pellicle
-#                                   # and --resume.
+#                                   # and --resume/--resume-picker.
 #   saturday-cockpit add --remote-control <dir> [<dir> ...]
 #                                   # (alias --rc) pass claude's own
 #                                   # --remote-control straight through, so
 #                                   # that pane's session is bridged and
 #                                   # reachable from another device (phone,
 #                                   # claude.ai) as soon as it starts.
-#                                   # Composes with --resume/--resume-last —
+#                                   # Composes with --resume/--resume-picker —
 #                                   # useful together: resume a session here
 #                                   # and immediately make it phone-reachable.
 #   saturday-cockpit add --title "Name" <dir>
@@ -222,13 +228,13 @@ resolve_last_session() {
 }
 
 # resolved_cmd_for prints the command to launch for $1, given the caller's
-# already-parsed $resume_last flag and (possibly yolo-suffixed) $CLAUDE_CMD.
+# already-parsed $resume flag and (possibly yolo-suffixed) $CLAUDE_CMD.
 # A dir with no resolvable prior session warns and falls back to a fresh
 # session rather than failing the whole batch — matches wait_pane_settled's
 # own warn-and-continue convention above.
 resolved_cmd_for() {
     local dir="$1" sid
-    if [ "$resume_last" -eq 1 ]; then
+    if [ "$resume" -eq 1 ]; then
         if sid="$(resolve_last_session "$dir")" && [ -n "$sid" ]; then
             echo "$CLAUDE_CMD --resume $sid"
             return
@@ -403,15 +409,15 @@ case "${1:-}" in
         apply_border_format
         pellicle=0
         resume=0
-        resume_last=0
+        resume_picker=0
         yolo=0
         rc=0
         title=""
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --pellicle) pellicle=1; shift ;;
-                --resume) resume=1; shift ;;
-                --resume-last) resume_last=1; shift ;;
+                --resume|--resume-last) resume=1; shift ;;
+                --resume-picker) resume_picker=1; shift ;;
                 --dangerously-skip-permissions) yolo=1; shift ;;
                 --remote-control|--rc) rc=1; shift ;;
                 --title)
@@ -428,11 +434,11 @@ case "${1:-}" in
                 *) break ;;
             esac
         done
-        if [ "$resume" -eq 1 ] && [ "$resume_last" -eq 1 ]; then
-            echo "saturday-cockpit: --resume and --resume-last are mutually exclusive" >&2
+        if [ "$resume" -eq 1 ] && [ "$resume_picker" -eq 1 ]; then
+            echo "saturday-cockpit: --resume and --resume-picker are mutually exclusive" >&2
             exit 2
         fi
-        if [ "$resume" -eq 1 ]; then
+        if [ "$resume_picker" -eq 1 ]; then
             CLAUDE_CMD="$CLAUDE_CMD --resume"
         fi
         if [ "$yolo" -eq 1 ]; then
@@ -442,7 +448,7 @@ case "${1:-}" in
             CLAUDE_CMD="$CLAUDE_CMD --remote-control"
         fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
             exit 2
         fi
         if [ -n "$title" ] && [ "$#" -gt 1 ]; then
@@ -492,20 +498,21 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 fi
 
-# --resume/--dangerously-skip-permissions apply to CLAUDE_CMD for the whole
-# initial batch, same as they do in `add`. --pellicle isn't accepted here:
+# --resume/--resume-picker/--dangerously-skip-permissions apply to CLAUDE_CMD
+# for the whole initial batch, same as they do in `add`. --pellicle isn't
+# accepted here:
 # the first pane is built via `new-session`, not `split-window`, so it needs
 # its own pane-creation path that doesn't exist yet — launch plain, then
 # `add --pellicle` once the session is up.
 resume=0
-resume_last=0
+resume_picker=0
 yolo=0
 rc=0
 boot=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --resume) resume=1; shift ;;
-        --resume-last) resume_last=1; shift ;;
+        --resume|--resume-last) resume=1; shift ;;
+        --resume-picker) resume_picker=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
         --remote-control|--rc) rc=1; shift ;;
         --boot) boot=1; shift ;;
@@ -521,11 +528,11 @@ while [ "$#" -gt 0 ]; do
         *) break ;;
     esac
 done
-if [ "$resume" -eq 1 ] && [ "$resume_last" -eq 1 ]; then
-    echo "saturday-cockpit: --resume and --resume-last are mutually exclusive" >&2
+if [ "$resume" -eq 1 ] && [ "$resume_picker" -eq 1 ]; then
+    echo "saturday-cockpit: --resume and --resume-picker are mutually exclusive" >&2
     exit 2
 fi
-if [ "$resume" -eq 1 ]; then
+if [ "$resume_picker" -eq 1 ]; then
     CLAUDE_CMD="$CLAUDE_CMD --resume"
 fi
 if [ "$yolo" -eq 1 ]; then
@@ -536,8 +543,8 @@ if [ "$rc" -eq 1 ]; then
 fi
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: saturday-cockpit [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
-    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
+    echo "usage: saturday-cockpit [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
+    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
     exit 2
 fi
