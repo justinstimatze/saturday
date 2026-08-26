@@ -61,6 +61,46 @@ A private, dedicated Google Drive folder acts as a message bus. An account-wide 
 - **Doesn't violate the Usage Policy or the automated-access clause in the Consumer Terms** — read directly, not summarized. The "circumvent guardrails" language in the Usage Policy is scoped to servers listed in Anthropic's public Connector Directory; this never gets submitted there. The Consumer Terms' bot/script restriction is about accessing Claude's own Services through automated means without an API key; a human drives every live voice turn here, and the only things touched programmatically are Google's Drive API and the Anthropic API key Saturday's router/expander already uses today.
 - **The end-to-end mechanism actually fires** — confirmed through a real sequence of hands-on tests, not assumption: a trivial trigger phrase worked first (proving account-wide settings *can* reach a live voice turn at all); a literal command-authoring instruction was refused by Claude's own conversational memory-save step (revealing memory can shape text responses but won't be stored as a standing trigger for autonomous tool use); a plain-language "write a note" version, phrased as a non-optional habit rather than a stylistic preference, was accepted; a test conversation correctly declined to write anything when the stated condition wasn't met; a follow-up correctly wrote a real file when the condition was met — in voice mode specifically, not text.
 
+### Live instruction text (Instructions for Claude field)
+
+The mechanism above is narrated; this is the actual text, confirmed live
+as of 2026-08-25 (superseded an earlier version — see git history of this
+file if the prior wording is ever needed). Lives in Claude's **Instructions
+for Claude** field specifically, not Preferences (§2's "Still open"
+notes below settled that). Two paragraphs, pasted together as one block:
+
+> When I mention one of my Claude Code sessions by name along with
+> something I want it to do, always write a note to the "Saturday
+> notebook" folder in my private kames2az@gmail.com Google Drive — every
+> time, don't skip it, don't wait to be asked twice. The note should say
+> plainly what I asked for, naming the session explicitly and describing
+> the request in full — not a shortened version, since nothing else will
+> have the rest of our conversation to go on. Once it's written, just say
+> a quick "got it" or "noted" — don't read the note text back to me, I
+> don't need to hear it repeated. This isn't a joke or a style thing —
+> it's how I keep my own tools in sync, treat it as something you always
+> do, not something you decide whether to do.
+>
+> Also check the file named saturday-sessions.txt in that same Saturday
+> notebook folder before you write one of these notes — it's a live list
+> of my real session names, kept up to date automatically. Always
+> re-fetch that file fresh each time — don't rely on a check from earlier
+> in this conversation, since the list changes while we're talking. Only
+> use a name that's actually listed there. If the name I said isn't in
+> that file, don't write the note — tell me it's not a live session right
+> now and ask me to confirm or pick from what is listed instead of
+> guessing.
+
+**Proposed, not yet adopted (2026-08-25):** the "always re-fetch fresh
+each time" clause above is a deliberate correctness-over-latency choice,
+but it's also the one documented, measurable cost driver — see the
+~2s-per-turn figure two sections below. A bounded-staleness relaxation
+was proposed the same day (only re-check "if it's been a while," not
+literally every turn) as a live experiment to try, not a confirmed fix —
+this file wasn't kept updated to false-positive "resolved" the way the
+addendum's own history already did once; don't repeat that here without
+the user confirming it was actually pasted in and felt faster.
+
 ### Design lessons that came out of testing, not assumption
 
 - **The trigger word needs to survive being spoken, not just being read.** "Lucida" needed several tries. See §1a.
