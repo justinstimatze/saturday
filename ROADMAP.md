@@ -25,14 +25,16 @@ here.
 
 ### A. Bounded, high-leverage, no waiting for a signal
 
-1. **Extend `saturday-stack doctor`** — check that the tmux
-   `client-detached` hook is actually set and that the audio pidfile
-   is being written. ~10 min. Closes the loop on today's safety belt:
-   a silently unset hook reopens the open-mic-on-detach risk.
-2. **Onboarding/install consolidation** — apt + pip + Go + tool
-   downloads are scattered across README, per-module READMEs, and
-   scripts. 1-2 hr. Blocks the first non-author user.
-3. **`saturday-stage` tile scaling + resize tweener** — `proportionalTile`
+**A1 (`saturday-stack doctor` hook/pidfile check) and A2 (onboarding
+consolidation) shipped 2026-08-25** — `202e476` and a rewrite of
+`README.md`'s Install section. `doctor` now checks a live session's
+`client-detached` hook and audio pidfile directly; the root README's
+Install section is a single ordered walkthrough (apt deps, all launcher
+binaries, the CC hook wiring, first-run download size, pointers to the
+two optional legs) instead of requiring a new user to open six
+per-module READMEs to find every step.
+
+1. **`saturday-stage` tile scaling + resize tweener** — `proportionalTile`
    is two-tier only (addressed pane vs. one even row-split of the rest),
    so it doesn't scale past a handful of concurrent sessions into
    anything resembling a real grid. Same code path also wants a stepped/

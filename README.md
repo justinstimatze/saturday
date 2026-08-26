@@ -136,16 +136,31 @@ What does not currently work, even on the supported stack:
 
 ## Install
 
-Requires Go 1.26+, Python 3.12+, `tmux`, `portaudio` headers, an
-Anthropic API key, and a working microphone.
+Requires Go 1.26+, Python 3.12+, `tmux`, `libportaudio2`, `jq`, an
+Anthropic API key, and a working microphone. This walks the full path
+from clone to a working stack — no other doc needs opening for a first
+run; the per-module `README.md`s (`saturday-mayor/`, `saturday-audio/`,
+etc.) are deeper reference for flags and design, not additional setup
+steps.
 
 ```bash
 git clone https://github.com/justinstimatze/saturday
 cd saturday
 
+# System deps (Ubuntu/Debian). libportaudio2 is PortAudio's runtime,
+# needed by the audio sidecar's `sounddevice` dep.
+sudo apt install libportaudio2 tmux jq
+
 # Go binaries: saturday-mayor, saturday-watcher, saturday-hook,
-# saturday-thinking, saturday-sync. Installs to $(go env GOPATH)/bin.
+# saturday-stage, saturday-thinking, saturday-sync, saturday-backend,
+# saturday-voice. Installs to $(go env GOPATH)/bin.
 make install
+
+# Helper launchers (bash scripts, ship separately from the Go build).
+cp bin/saturday-stack bin/saturday-claude bin/saturday-cockpit "$(go env GOPATH)/bin"
+chmod +x "$(go env GOPATH)/bin/saturday-stack" \
+         "$(go env GOPATH)/bin/saturday-claude" \
+         "$(go env GOPATH)/bin/saturday-cockpit"
 
 # Python audio sidecar.
 python -m venv saturday-audio/.venv
@@ -153,15 +168,33 @@ source saturday-audio/.venv/bin/activate
 pip install -r saturday-audio/requirements.txt
 deactivate
 
-# Helper launchers (saturday-stack, saturday-claude).
-cp bin/saturday-stack bin/saturday-claude "$(go env GOPATH)/bin"
-
 # Anthropic API key — written to XDG config (or eval/.env for dev).
 mkdir -p ~/.config/saturday
 cat > ~/.config/saturday/config <<'EOF'
 ANTHROPIC_API_KEY=sk-ant-...
 EOF
+
+# Claude Code hook: lets saturday-sync re-inject context after an
+# out-of-band (autocompact-divert) write. Without this, that one
+# recovery path silently no-ops — everything else still works.
+jq --arg sync "$(go env GOPATH)/bin/saturday-sync" \
+  '.hooks.UserPromptSubmit += [{"matcher":"","hooks":[{"type":"command","command":$sync}]}]' \
+  ~/.claude/settings.json > /tmp/s.new && mv /tmp/s.new ~/.claude/settings.json
 ```
+
+First run downloads STT/TTS models on demand (~330 MB total: Whisper
+`small.en`, Silero VAD, Kokoro) into `~/.cache/huggingface/` and
+`~/.cache/saturday-audio/`; expect a slower first `saturday-stack` start.
+
+Two legs are optional, off by default, and each needs its own one-time
+setup — skip both for the core mic-to-tmux-pane loop:
+
+- **Phone voice mode** (`saturday-backend`) relays voice notes from a
+  Google Drive folder. Needs a one-time Google Cloud OAuth grant — see
+  [`saturday-backend/README.md`](saturday-backend/README.md).
+- **Rented-GPU voice mode** (`saturday-voice`) talks to a `moshi-server`
+  STT/TTS pod (Runpod, Modal, etc.) instead of the local Whisper/Kokoro
+  sidecar. See [`saturday-voice/README.md`](saturday-voice/README.md).
 
 ## Run
 
