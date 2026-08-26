@@ -10,8 +10,8 @@
 #
 # Usage:
 #   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
-#   saturday-cockpit [--resume] [--dangerously-skip-permissions] <dir> [<dir> ...]
-#                                   # both flags apply to CLAUDE_CMD for every
+#   saturday-cockpit [--resume] [--dangerously-skip-permissions] [--remote-control] <dir> [<dir> ...]
+#                                   # all flags apply to CLAUDE_CMD for every
 #                                   # pane in this initial batch (see below —
 #                                   # same flags, same meaning, as on `add`).
 #                                   # --pellicle is add-only; see below.
@@ -44,6 +44,15 @@
 #                                   # pass the flag straight through to claude
 #                                   # for that pane. Composes with --pellicle
 #                                   # and --resume.
+#   saturday-cockpit add --remote-control <dir> [<dir> ...]
+#                                   # (alias --rc) pass claude's own
+#                                   # --remote-control straight through, so
+#                                   # that pane's session is bridged and
+#                                   # reachable from another device (phone,
+#                                   # claude.ai) as soon as it starts.
+#                                   # Composes with --resume/--resume-last —
+#                                   # useful together: resume a session here
+#                                   # and immediately make it phone-reachable.
 #   saturday-cockpit add --title "Name" <dir>
 #                                   # label the pane border with "Name"
 #                                   # instead of the dir basename — for when
@@ -319,6 +328,7 @@ case "${1:-}" in
         resume=0
         resume_last=0
         yolo=0
+        rc=0
         title=""
         while [ "$#" -gt 0 ]; do
             case "$1" in
@@ -326,6 +336,7 @@ case "${1:-}" in
                 --resume) resume=1; shift ;;
                 --resume-last) resume_last=1; shift ;;
                 --dangerously-skip-permissions) yolo=1; shift ;;
+                --remote-control|--rc) rc=1; shift ;;
                 --title)
                     if [ "$#" -lt 2 ]; then
                         echo "saturday-cockpit: --title needs a value" >&2
@@ -350,8 +361,11 @@ case "${1:-}" in
         if [ "$yolo" -eq 1 ]; then
             CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
         fi
+        if [ "$rc" -eq 1 ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --remote-control"
+        fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--title <name>] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
             exit 2
         fi
         if [ -n "$title" ] && [ "$#" -gt 1 ]; then
@@ -409,11 +423,13 @@ fi
 resume=0
 resume_last=0
 yolo=0
+rc=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume) resume=1; shift ;;
         --resume-last) resume_last=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
+        --remote-control|--rc) rc=1; shift ;;
         --pellicle)
             echo "saturday-cockpit: --pellicle only works with 'add' — launch plain, then: saturday-cockpit add --pellicle <dir>" >&2
             exit 2
@@ -436,10 +452,13 @@ fi
 if [ "$yolo" -eq 1 ]; then
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
 fi
+if [ "$rc" -eq 1 ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --remote-control"
+fi
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: saturday-cockpit [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
-    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] <dir> [<dir> ...]" >&2
+    echo "usage: saturday-cockpit [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
+    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-last] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
     exit 2
 fi
