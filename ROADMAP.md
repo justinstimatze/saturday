@@ -79,10 +79,36 @@ Tier A has no open items as of this ship.
 | 12 | Effigy-driven verifier (elaboration) | V0.2.7 has a lexical stub; roadmap wants small-LLM version |
 | 13 | FUI Go TUI library spin-out | Creative work, not blocking |
 | 14 | lucida terminal-mode pane trigger | A CC session triggers lucida to open a transient viz pane via `saturday-cockpit`/`saturday-stage`'s pane machinery, pause, then auto-close. Blocked on lucida's own terminal-only mode existing (see `~/Documents/lucida/idea.md`) and on this roadmap's tile-scaling item landing (the pane open/close primitive this would ride on). |
+| 15 | Multicockpit (one cockpit per monitor) | A `saturday-cockpit` per physical monitor, window placement left to the WM — no auto-layout/geometry logic needed. Session-per-monitor is already free: `saturday-cockpit` takes its tmux session name from `$COCKPIT` (`bin/saturday-cockpit:92`), `saturday-stage` already takes `--sock` per instance. The one real gap: `saturday-mayor` is a single daemon with one `StageSock` string (`saturday-mayor/main.go:635`, `:683`) used for every focus/restore call regardless of which cockpit a pane lives in — breaks the moment a second cockpit exists. Fix stays small and mayor stays one brain: `StageSock` becomes a map keyed by pane/session, filled in at add-time by whichever `saturday-cockpit add` created the pane (it already knows its own socket). No registry daemon, no WM-geometry query — most of Saturday doesn't care what cockpit a pane is in, so none of this needs to. No near-term trigger; design is scoped whenever a second monitor pair is worth building for. |
 
 ### D. Speculative
 
 Federated state · Roaming voice · Breakroom / long-arc · 3D substrate — long horizon, no near-term trigger. See "Speculative / later" below.
+
+**Steel Battalion cockpit boot sequence** — opt-in easter egg, not a
+default path: `saturday-cockpit`/`saturday-stage` assembles its panes
+with a deliberately theatrical startup ritual instead of an instant tile.
+Design reference gathered 2026-08-26, refined via a claude-video-vision
+frame pass the same day: every unit variant runs the same four-stage
+order — dark → diagnostic checklist (bars fill either as a fast ~1s snap
+or, in Line-of-Contact-era footage specifically, a visible ~3s stagger)
+→ two zones light (center display + small corner digital readouts —
+the analog dashboard dials are lit continuously and were never part of
+the blackout) → main/focused display lights last. The initial claim that
+this was also confirmed by the pilot's physical switch order did not
+survive the closer pass — the hardware-cam footage never actually shows
+that sequencing — so that detail is dropped; kept instead is a real
+red→blue (test→confirmed) per-panel color language from the same
+footage. Maps onto `saturday-stage`'s existing smoothdamp tween
+(`548d012`) as pure sequencing/staggering of already-shipped resize
+calls, not new animation work: stage pane opens in a fixed order with
+per-pane start offsets, the addressed/focused pane settles last, a
+single generic content-free "assembling..." stub can front any project's
+boot. Later phases floated but unscoped: driving real RGB hardware (a
+Novation Launchpad X, a chording keyboard) once the software ritual
+exists to trigger, and a VR version in `station`. No trigger, no build —
+the design work is done so it won't need re-deriving when this gets
+picked up.
 
 ## Built (V0 substrate)
 
