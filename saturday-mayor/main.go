@@ -131,7 +131,13 @@ func (m *Mayor) audioWrite(evt map[string]any) error {
 // speak wires orchestrator.Config.Speak — a spoken reply from the
 // decision core becomes a {"type":"speak",...} event on the audio
 // sidecar, exactly as the pre-extraction code wrote it inline.
+//
+// Every spoken reply, regardless of source (summarizer, ask-mode, expander
+// confirmation), funnels through here — the single choke point to score
+// against the voice register rather than wiring cope-gate into each
+// llmcore generator separately. See llm.CheckVoiceRegister.
 func (m *Mayor) speak(text string) error {
+	go llm.CheckVoiceRegister(text)
 	return m.audioWrite(map[string]any{"type": "speak", "text": text})
 }
 
