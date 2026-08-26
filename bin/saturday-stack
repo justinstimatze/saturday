@@ -160,6 +160,21 @@ case "${1:-}" in
         else
             check_audio_venv || rc=1
         fi
+        # Live-session checks: the client-detached hook is only installed at
+        # launch time (see the tmux set-hook call near the bottom of this
+        # script), so there's nothing to verify before saturday-stack has
+        # ever been started this boot. Skip silently rather than failing a
+        # pre-launch doctor run for a hook that hasn't been armed yet.
+        if tmux has-session -t "$SESSION" 2>/dev/null; then
+            if ! tmux show-hooks -t "$SESSION" 2>/dev/null | grep -q '^client-detached'; then
+                echo "saturday-stack: client-detached hook not set on running session $SESSION — SIGUSR1 force-mute won't fire on a stealth tmux disconnect (kill and relaunch saturday-stack to re-arm it)" >&2
+                rc=1
+            fi
+            if ! [ -f "$AUDIO_PIDFILE" ] || ! kill -0 "$(cat "$AUDIO_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+                echo "saturday-stack: audio pidfile missing or stale at $AUDIO_PIDFILE — mayor's watchdog and the client-detached hook can't force-mute without it" >&2
+                rc=1
+            fi
+        fi
         [ $rc -eq 0 ] && echo "saturday-stack: doctor OK."
         exit $rc
         ;;
