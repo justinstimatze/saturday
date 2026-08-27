@@ -167,7 +167,7 @@ unscoped: driving real RGB hardware (a Novation Launchpad X, a chording
 keyboard) once the software ritual exists to trigger, and a VR version
 in `station`. No trigger for either.
 
-**v3 per-role instrument redesign shipped 2026-08-26** — `<pending>`.
+**v3 per-role instrument redesign shipped 2026-08-26** — `60e63a5`.
 User verdict on v1 after live use: "pretty light, no real animation" —
 and side-by-side panes exposed that N copies of one checklist reads as
 repetition Steel Battalion itself never risks (it never shows two
