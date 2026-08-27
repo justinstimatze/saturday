@@ -167,6 +167,47 @@ unscoped: driving real RGB hardware (a Novation Launchpad X, a chording
 keyboard) once the software ritual exists to trigger, and a VR version
 in `station`. No trigger for either.
 
+**v3 per-role instrument redesign shipped 2026-08-26** — `<pending>`.
+User verdict on v1 after live use: "pretty light, no real animation" —
+and side-by-side panes exposed that N copies of one checklist reads as
+repetition Steel Battalion itself never risks (it never shows two
+cockpits at once). Rebuilt from a video-vision re-pass of the source
+footage (in-game 1st-gen VT startup + a 6fps re-extraction of the
+controller cam) plus lucida's FUI reference notes: the boot is now ONE
+cockpit of different instruments. `bin/saturday-cockpit-boot-stub` gains
+roles — `main` (the center display's frame-verified arc: dark →
+progressive 5-bar systems check with the manual's 70% START gate →
+VT-OS text boot + scrolling INPUT/OUTPUT log → live-feed frame with
+corner readouts and WORK-100% confirm; the respawned claude IS the live
+feed), `gauge`/`scope`/`strip`/`radar` peripherals (lit from frame one
+per footage — only the center blackout-stages), one reverse-video
+confirm flash per instrument, ambient idle motion everywhere, palette
+held to red-testing/blue-confirmed. `saturday-cockpit --boot` assigns
+roles by peripheral index, slides peripherals in from window edges
+(eased sliver grows, stage's 180ms/50ms-tau envelope, no stage socket)
+into a hero-ring layout — center pane largest and edge-free, small
+instrument ring around it, per the user's own 3x3-with-shrunk-border
+direction — held through the reveal, handed back to `COCKPIT_TILE`
+after the addressed respawn. `--boot fast` = ~1s snap pacing. Hard
+invariant enforced after live tearing was diagnosed: pane content and
+pane boundary never animate simultaneously (WINCH doubles as a pause
+signal with a 250ms settle debounce; SIGWINCH provably coalesces — 6
+resize steps delivered 2 signals — so the debounce is time-based, not
+per-signal). Measured: 132 draws landed during active resizes without
+the gate, 0 with it. Also fixed en route: the v1 stub was never on
+PATH, so every placeholder pane died instantly on `exec: not found`
+and remain-on-exit + the respawn loop silently masked it (now falls
+back to the script-sibling path); the addressed respawn now waits
+(bounded 12s, latched pane option) for the center arc to finish, which
+a 3-dir cockpit with fast-settling claudes otherwise cuts mid-
+checklist; detached boot sessions size to the launching terminal
+instead of 80x24. Live-verified against isolated `COCKPIT=` sessions
+only: hero-ring geometry at 3 and 4 peripherals (main largest; edge-
+free with a full ring), full arc → real `claude` respawn end-to-end,
+`--boot fast`, kill-session leaves zero stub processes within 1s.
+START-fail → abort-to-instant-tile stays a sketch in the boot-redesign
+design notes, deliberately unbuilt.
+
 ## Built (V0 substrate)
 
 - **V0.3.1 — post-release hardening (2026-07-14).** `llmcore` `cache_control` markers on the shared system-prompt seam — every LLM call in the fleet (arc/router/expander/summarizer/classifier/asker/judge) now caches its tools+system prefix server-side; ~10% cost on repeat prefixes, disk cache key unchanged so existing `.cache/*.json` still hit. `bin/saturday-stack` gains `doctor` (pre-launch venv health check) and `repair-audio` (one-word rebuild) with a Python-version drift detector — the audio pane no longer dies silently after an OS Python upgrade. `bin/saturday-claude` gains a `cc-<basename>` collision guard: two projects with the same leaf dir (e.g. `.../dogfood/web` and `.../firecrawl/web`) no longer silently hijack each other's tmux session. `watcher/decodeProjectName` handles `~` and `~/Documents` cases that were leaking raw encoded paths into arc labels. Audio safety belt: `saturday-audio` writes a pidfile and installs a SIGUSR1 handler that force-mutes (no unmute pair — operator must SPACEBAR re-arm); `saturday-stack` sets a tmux `client-detached` hook that hits that pid; mayor runs a redundant client-count watchdog (2 consecutive zeros → SIGUSR1) so open-mic can't persist through a stealth tmux disconnect. Sidecar's socket send timeout split from the recv poll (5s send, 0.1s recv) — kills the spurious `[sock] send failed: timed out — reconnecting` spam that made real socket failures harder to notice.

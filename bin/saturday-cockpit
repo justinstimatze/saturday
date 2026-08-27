@@ -18,16 +18,25 @@
 #                                   # pane in this initial batch (see below —
 #                                   # same flags, same meaning, as on `add`).
 #                                   # --pellicle is add-only; see below.
-#   saturday-cockpit --boot <dir> [<dir> ...]
-#                                   # opt-in staggered reveal: every pane
-#                                   # shows a themed placeholder first, then
-#                                   # real commands pop in one at a time —
-#                                   # the addressed pane (first dir) settles
-#                                   # last. Composes with --resume/
-#                                   # --resume-picker/--dangerously-skip-
-#                                   # permissions/--remote-control; not
-#                                   # available with --pellicle (initial-
-#                                   # launch-only restriction, see below).
+#   saturday-cockpit --boot [fast] <dir> [<dir> ...]
+#                                   # opt-in Steel Battalion boot ritual:
+#                                   # the addressed pane (first dir) holds a
+#                                   # dark center display while peripheral
+#                                   # panes slide in from the window edges
+#                                   # as DISTINCT instruments (gauge/scope/
+#                                   # radar/strip; red testing → blue
+#                                   # confirmed), the center runs its
+#                                   # checklist → VT-OS log → live-feed arc,
+#                                   # then real commands respawn in one at a
+#                                   # time — addressed pane last — and the
+#                                   # ritual's hero-ring layout hands back
+#                                   # to COCKPIT_TILE. `--boot fast` picks
+#                                   # ~1s snap pacing over the ~3s fills.
+#                                   # Composes with --resume/--resume-picker/
+#                                   # --dangerously-skip-permissions/
+#                                   # --remote-control; not available with
+#                                   # --pellicle (initial-launch-only
+#                                   # restriction, see below).
 #   saturday-cockpit add <dir> [<dir> ...]   # add pane(s) to a running cockpit
 #   saturday-cockpit add --pellicle <dir> [<dir> ...]
 #                                   # add pane(s) as a pellicle status+claude
@@ -98,8 +107,10 @@
 #                terminal width each). A genuinely dynamic/weighted layout
 #                remains a separate, deferred piece of work — this is a
 #                better static default in the meantime, not that rewrite.
-#   COCKPIT_BOOT_STUB  command run in each pane during --boot's placeholder
-#                phase (default: saturday-cockpit-boot-stub). Only read when
+#   COCKPIT_BOOT_STUB  instrument-pane script for --boot's assembly phase
+#                (default: saturday-cockpit-boot-stub). Invoked per pane as
+#                <stub> <label> --role <main|gauge|scope|radar|strip>
+#                [--inst <SUBSYSTEM>] --delay <ms> [--fast]. Only read when
 #                --boot is passed.
 #
 # Pair with stage zoom/tile on mayor:
@@ -244,12 +255,97 @@ resolved_cmd_for() {
     echo "$CLAUDE_CMD"
 }
 
-# stub_cmd_for prints the placeholder command for $1's pane during --boot's
-# assembly phase — the dir's basename as the label, so each placeholder is
-# distinguishable rather than all panes showing an identical generic stub.
+# stub_cmd_for <dir> <role> <inst> <delay_ms> prints the placeholder command
+# for a --boot pane: the dir's basename as the label, plus the instrument
+# role/subsystem and start delay that make each pane a DIFFERENT instrument
+# (one cockpit of varied instruments, not N copies of one animation — see
+# the stub's own header for the roster and its provenance). Roles and
+# subsystems cycle by peripheral index from the two arrays below; when the
+# cycles drift out of phase past 4 peripherals (a COMMS nav display), that
+# reads as variety, not error.
+BOOT_ROLES=(gauge scope radar strip)
+BOOT_INSTS=(SERVOS COMMS OPTICS REACTOR MANIPULATOR)
 stub_cmd_for() {
-    local dir="$1"
-    echo "${COCKPIT_BOOT_STUB:-saturday-cockpit-boot-stub} '$(basename "$dir")'"
+    local dir="$1" role="$2" instname="$3" delay="$4"
+    local stub="${COCKPIT_BOOT_STUB:-}"
+    if [ -z "$stub" ]; then
+        if command -v saturday-cockpit-boot-stub >/dev/null 2>&1; then
+            stub=saturday-cockpit-boot-stub
+        else
+            # not on PATH (this script is usually run by full path, and the
+            # stub isn't symlinked into any bin dir) — fall back to the
+            # sibling file next to this script. Without this fallback every
+            # placeholder pane died instantly on `exec: not found` and
+            # remain-on-exit + the respawn loop silently papered over it.
+            stub="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/saturday-cockpit-boot-stub"
+        fi
+    fi
+    local cmd="'$stub' '$(basename "$dir")' --role $role --delay $delay"
+    if [ -n "$instname" ]; then cmd="$cmd --inst $instname"; fi
+    if [ "$boot_fast" -eq 1 ]; then cmd="$cmd --fast"; fi
+    echo "$cmd"
+}
+
+# boot_edge_split <dir> <stub-cmd> <peripheral-index>: --boot's peripheral
+# entry. The pane arrives as a sliver ANCHORED TO A WINDOW EDGE
+# (split-window -f/-b, cycling bottom → right → top → left) and grows
+# inward through eased resize steps — the terminal analog of the hatch
+# closing in from the screen edges — then STAYS PUT as part of the ritual's
+# hero-ring layout: center pane large, small instrument panes ringing it (a
+# 3x3 with the border rows/columns shrunk). No tiled snap here; the working
+# layout returns only after the reveal. Growth pacing matches stage's
+# shipped smoothdamp envelope (saturday-stage/main.go, 180ms/50ms tau). A
+# 5th+ peripheral subdivides the ring pane already holding its edge, so the
+# ring grows toward the full 8-slot border instead of stacking strips.
+# Echoes the new pane id — creation order != pane-index order once -b
+# splits exist, so callers must NOT re-derive it via list-panes|tail.
+BOOT_GROW_STEPS=(190 360 600 780 910 1000)  # eased growth curve, permille
+boot_edge_split() {
+    local dir="$1" cmd="$2" edge=$(( $3 % 4 ))
+    local pane flags axis whole target pm sz ring gaxis start
+    case "$edge" in
+        0) flags="-f -v";    axis=y ;;   # bottom edge, grows up
+        1) flags="-f -h";    axis=x ;;   # right edge, grows left
+        2) flags="-f -v -b"; axis=y ;;   # top edge, grows down
+        3) flags="-f -h -b"; axis=x ;;   # left edge, grows right
+    esac
+    ring="${boot_ring[$edge]:-}"
+    if [ -n "$ring" ]; then
+        # this edge's ring slot is taken — halve that pane instead
+        if [ "$axis" = y ]; then
+            whole="$(tmux display-message -p -t "$ring" '#{pane_width}')"
+            target=$(( whole / 2 )); [ "$target" -lt 10 ] && target=10
+            pane="$(tmux split-window -h -t "$ring" -l 6 -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+            gaxis=x; start=6
+        else
+            whole="$(tmux display-message -p -t "$ring" '#{pane_height}')"
+            target=$(( whole / 2 )); [ "$target" -lt 4 ] && target=4
+            pane="$(tmux split-window -v -t "$ring" -l 3 -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+            gaxis=y; start=3
+        fi
+    else
+        if [ "$axis" = y ]; then
+            pane="$(tmux split-window -t "$SESSION" $flags -l 3 -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+            whole="$(tmux display-message -p -t "$SESSION" '#{window_height}')"
+            target=$(( whole / 5 ))
+            [ "$target" -lt 6 ] && target=6; [ "$target" -gt 12 ] && target=12
+            gaxis=y; start=3
+        else
+            pane="$(tmux split-window -t "$SESSION" $flags -l 6 -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
+            whole="$(tmux display-message -p -t "$SESSION" '#{window_width}')"
+            target=$(( whole / 5 ))
+            [ "$target" -lt 20 ] && target=20; [ "$target" -gt 44 ] && target=44
+            gaxis=x; start=6
+        fi
+        boot_ring[$edge]="$pane"
+    fi
+    for pm in "${BOOT_GROW_STEPS[@]}"; do
+        sz=$(( start + (target - start) * pm / 1000 ))
+        tmux resize-pane -t "$pane" "-$gaxis" "$sz" 2>/dev/null || true
+        sleep 0.035
+    done
+    tmux set-option -p -t "$pane" @cockpit_slot "$(next_free_slot)"
+    echo "$pane"
 }
 
 # Same as add_pane, but the new slot is itself a nested pellicle pair — a
@@ -532,13 +628,19 @@ resume_picker=0
 yolo=0
 rc=0
 boot=0
+boot_fast=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume|--resume-last) resume=1; shift ;;
         --resume-picker) resume_picker=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
         --remote-control|--rc) rc=1; shift ;;
-        --boot) boot=1; shift ;;
+        --boot)
+            boot=1; shift
+            # `--boot fast` = original-SB ~1s snap pacing (a dir literally
+            # named "fast" would need --boot ./fast, acceptable corner)
+            if [ "${1:-}" = "fast" ]; then boot_fast=1; shift; fi
+            ;;
         --pellicle)
             echo "saturday-cockpit: --pellicle only works with 'add' — launch plain, then: saturday-cockpit add --pellicle <dir>" >&2
             exit 2
@@ -591,8 +693,27 @@ if [ "$boot" -eq 1 ]; then
     # after (apply_border_format sets it later, at the very end) — if the
     # stub script exits early for any reason before this lands, tmux would
     # otherwise close the pane immediately and invalidate its captured id.
-    firstpane="$(tmux new-session -d -s "$SESSION" -n "cockpit" -P -F '#{pane_id}' \
-        "cd '$first' && exec $(stub_cmd_for "$first")")"
+    #
+    # The addressed pane is the center display (--role main) and lights
+    # LAST: its dark hold spans the whole assembly estimate. 810ms/pane =
+    # 350 stagger + 210 grow + ~250 real tmux round-trip overhead
+    # (measured live: nominal 560ms/pane runs ~800ms) — without the
+    # overhead term main's checklist starts before the last peripheral's
+    # test does.
+    prim_delay=$(( $# * 810 + 500 ))
+    # Size the detached session to the launching terminal (fallback for
+    # headless callers) — a detached new-session defaults to 80x24, which
+    # would make the ritual compute its geometry against a window nobody
+    # ever sees; sized to the real terminal, attaching mid-boot from
+    # another pane/terminal is seamless (the stubs re-layout on WINCH).
+    if [ -t 1 ]; then
+        boot_w="$( (tput cols) 2>/dev/null || echo 220 )"
+        boot_h="$( (tput lines) 2>/dev/null || echo 50 )"
+    else
+        boot_w=220; boot_h=50
+    fi
+    firstpane="$(tmux new-session -d -s "$SESSION" -n "cockpit" -x "$boot_w" -y "$boot_h" -P -F '#{pane_id}' \
+        "cd '$first' && exec $(stub_cmd_for "$first" main "" "$prim_delay")")"
     tmux set-option -t "$SESSION" remain-on-exit on
 else
     tmux new-session -d -s "$SESSION" -n "cockpit" \
@@ -611,11 +732,12 @@ bind_hotkeys
 # is specifically about two real `claude` processes racing each other's
 # startup identity bookkeeping (see wait_pane_settled's comment above), and
 # these placeholder panes run the boot-stub script, not claude, so the race
-# can't occur — placeholders assemble back-to-back instead, matching the
-# "dark cockpit assembles fast" beat of the ritual. Real commands were
-# already resolved above/below via resolved_cmd_for and are only exec'd
-# later, in the respawn-stagger loop, where the real settle-wait protection
-# is still very much needed and still applied (with a shorter timeout).
+# can't occur — instrument panels instead assemble on their own ~350ms
+# stagger (boot_edge_split + the sleep below), which is the ritual's
+# panel-by-panel beat, not a settle-wait. Real commands were already
+# resolved above/below via resolved_cmd_for and are only exec'd later, in
+# the respawn-stagger loop, where the real settle-wait protection is still
+# very much needed and still applied (with a shorter timeout).
 if [ "$boot" -eq 0 ] && [ "$#" -gt 0 ]; then
     firstpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
     wait_pane_settled "$firstpane" 10 ||
@@ -623,14 +745,22 @@ if [ "$boot" -eq 0 ] && [ "$#" -gt 0 ]; then
 fi
 n="$#"; i=0
 boot_dirs=(); boot_cmds=(); boot_pane_ids=()
+declare -A boot_ring=()   # edge index → first ring pane holding that edge
 for d in "$@"; do
     i=$((i + 1))
     if [ "$boot" -eq 1 ]; then
-        add_pane "$d" "$(stub_cmd_for "$d")"
-        newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+        idx=$(( i - 1 ))
+        brole="${BOOT_ROLES[$(( idx % ${#BOOT_ROLES[@]} ))]}"
+        binst="${BOOT_INSTS[$(( idx % ${#BOOT_INSTS[@]} ))]}"
+        # 450ms base delay covers the pane's own grow window (content drawn
+        # into a sliver is clipped for good); the jitter keeps sibling
+        # animations off phase-lock.
+        newpane="$(boot_edge_split "$d" \
+            "$(stub_cmd_for "$d" "$brole" "$binst" "$(( 450 + (idx % 3) * 130 ))")" "$idx")"
         boot_dirs+=("$d")
         boot_cmds+=("$(resolved_cmd_for "$d")")
         boot_pane_ids+=("$newpane")
+        if [ "$i" -lt "$n" ]; then sleep 0.35; fi   # panel-by-panel stagger
     else
         add_pane "$d" "$(resolved_cmd_for "$d")"
         if [ "$i" -lt "$n" ]; then
@@ -643,9 +773,13 @@ done
 
 # Keep dead panes readable; show per-pane titles (basenames, or a custom
 # --title) along the top border so the cockpit is legible and stage's title
-# marker has a home.
+# marker has a home. --boot keeps its hero-ring geometry through the reveal
+# (the working layout returns after the addressed pane's respawn below); the
+# normal path balances immediately, as always.
 apply_border_format
-tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+if [ "$boot" -eq 0 ]; then
+    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+fi
 
 # --boot's reveal: layout is already settled above, so nothing resizes during
 # this loop — respawn-pane swaps a pane's running command in place. Order:
@@ -662,9 +796,29 @@ if [ "$boot" -eq 1 ]; then
         wait_pane_settled "$pane" 5 ||
             echo "saturday-cockpit: warning: $d's pane didn't settle within 5s, continuing anyway" >&2
     done
+    # Hold the addressed respawn until the center display's arc finishes
+    # (the stub latches @boot_main_done on its pane at WORK-confirm) — on a
+    # small cockpit with fast-settling claudes the respawn otherwise lands
+    # ~6s into a ~10s arc and cuts it mid-checklist (observed live, 3-dir
+    # run). Bounded: a dead or wedged stub costs at most the deadline. On
+    # big cockpits the non-addressed respawns already outlast the arc, so
+    # the latch is set before we get here and this loop exits immediately.
+    boot_main_deadline=$(( SECONDS + 12 ))
+    while [ "$SECONDS" -lt "$boot_main_deadline" ]; do
+        if [ "$(tmux show-options -pqv -t "$firstpane" @boot_main_done 2>/dev/null)" = "1" ]; then
+            break
+        fi
+        if [ "$(tmux display-message -p -t "$firstpane" '#{pane_dead}' 2>/dev/null)" = "1" ]; then
+            break
+        fi
+        sleep 0.3
+    done
     tmux respawn-pane -k -t "$firstpane" "cd '$first' && exec $firstcmd"
     wait_pane_settled "$firstpane" 5 ||
         echo "saturday-cockpit: warning: $first's pane didn't settle within 5s, continuing anyway" >&2
+    # ritual over: hand the hero-ring back to the working layout the rest
+    # of the tooling (stage tiling, M-0, add's re-balance) assumes.
+    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 fi
 
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
