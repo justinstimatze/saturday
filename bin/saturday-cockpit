@@ -813,12 +813,23 @@ if [ "$boot" -eq 1 ]; then
         fi
         sleep 0.3
     done
+    # ritual over: hand the hero-ring back to the working layout the rest of
+    # the tooling (stage tiling, M-0, add's re-balance) assumes — BEFORE the
+    # addressed respawn, not after. The stub still running in $firstpane is
+    # resize-safe (frame_gate/resize_hold already handle a WINCH mid-draw),
+    # but claude isn't, so respawning it into the ring-shaped slot and only
+    # then flattening the layout would force a real resize on a freshly-
+    # started claude for no reason — this way it only ever renders at its
+    # true final size. Note: an asciinema before/after comparison showed
+    # this reorder does NOT meaningfully change claude's ~1.3s post-respawn
+    # render settle — that appears to be ordinary claude cold-start
+    # rendering (auth/project-load/progressive TUI paint), not a resize
+    # artifact this script can fix. Kept anyway: it removes a genuinely
+    # redundant resize regardless of whether it's visually perceptible.
+    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
     tmux respawn-pane -k -t "$firstpane" "cd '$first' && exec $firstcmd"
     wait_pane_settled "$firstpane" 5 ||
         echo "saturday-cockpit: warning: $first's pane didn't settle within 5s, continuing anyway" >&2
-    # ritual over: hand the hero-ring back to the working layout the rest
-    # of the tooling (stage tiling, M-0, add's re-balance) assumes.
-    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
 fi
 
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
