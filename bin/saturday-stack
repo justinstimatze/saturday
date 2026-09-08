@@ -15,10 +15,14 @@
 #                 saturday-audio/.venv
 #   SOCK          default /tmp/saturday-audio.sock — mayor↔audio Unix socket
 #   AUDIO_VENV    default $SATURDAY_DIR/saturday-audio/.venv
-#   DRIVE_FOLDER_ID       required — the Drive folder Claude's voice-mode
+#   DRIVE_FOLDER_ID       optional — the Drive folder Claude's voice-mode
 #                         connector writes notes to (saturday-backend's
 #                         phone-voice relay leg; see saturday-backend/README.md
-#                         for the one-time Google Cloud / --drive-login setup)
+#                         for the one-time Google Cloud / --drive-login setup).
+#                         Unset skips the backend leg with a log line, same
+#                         as SATURDAY_VOICE_STT_URL below — it's an
+#                         experimental away-from-mic path, not something
+#                         most users of this repo configure.
 #   BACKEND_POLL_INTERVAL default 5s — how often saturday-backend polls Drive
 
 set -euo pipefail
@@ -48,7 +52,10 @@ STAGE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-stage.pid"
 # Headless backend, same shape as watcher/stage — Drive-relay poller for
 # phone voice mode (SATURDAY-VOICE-NATIVE.md §2). No sane default for
 # DRIVE_FOLDER_ID — it's the user's own private Drive folder id, not
-# something to bake into a tracked script. Required, hard-fail if unset.
+# something to bake into a tracked script. Opt-in, same as
+# SATURDAY_VOICE_STT_URL below: unset skips the leg with a log line,
+# it doesn't abort the whole stack (this is an experimental parallel
+# path, not core to most runs of this repo).
 DRIVE_FOLDER_ID="${DRIVE_FOLDER_ID:-}"
 BACKEND_POLL_INTERVAL="${BACKEND_POLL_INTERVAL:-5s}"
 BACKEND_LOG="$XDG_STATE_HOME_RESOLVED/saturday/backend.log"
@@ -282,18 +289,12 @@ fi
 if ! check_audio_venv; then
     exit 1
 fi
-for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking saturday-backend; do
+for bin in saturday-watcher saturday-mayor saturday-stage saturday-thinking; do
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/$bin" ]; then
         echo "saturday-stack: $bin not found on PATH or in ~/go/bin" >&2
         exit 1
     fi
 done
-if [ -z "$DRIVE_FOLDER_ID" ]; then
-    echo "saturday-stack: DRIVE_FOLDER_ID not set." >&2
-    echo "  export DRIVE_FOLDER_ID=<id of the Drive folder Claude's voice-mode connector writes notes to>" >&2
-    echo "  (one-time Google Cloud / --drive-login setup: saturday-backend/README.md)" >&2
-    exit 1
-fi
 
 # V0.2.6 layout: mayor takes the big left column ("most interesting and
 # relevant log"); right column splits into thinking (top, FUI cognitive-state
@@ -328,11 +329,20 @@ echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log 
 
 # Headless backend — phone-voice Drive relay. Same "headless services first"
 # block as watcher/stage; only needs the watcher socket, no ordering
-# dependency on mayor.
-mkdir -p "$(dirname "$BACKEND_LOG")"
-~/go/bin/saturday-backend --drive-folder-id "$DRIVE_FOLDER_ID" --poll-interval "$BACKEND_POLL_INTERVAL" --stage-sock "$STAGE_SOCK" --stage-tile >> "$BACKEND_LOG" 2>&1 &
-echo $! > "$BACKEND_PIDFILE"
-echo "saturday-stack: backend running headless (pid $(cat "$BACKEND_PIDFILE")), log → $BACKEND_LOG"
+# dependency on mayor. Opt-in, same as saturday-voice below: skip with a
+# log line when DRIVE_FOLDER_ID is unset, don't block the rest of the stack.
+if [ -n "$DRIVE_FOLDER_ID" ]; then
+    if ! command -v saturday-backend >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/saturday-backend" ]; then
+        echo "saturday-stack: DRIVE_FOLDER_ID set but saturday-backend not found on PATH or in ~/go/bin — backend leg skipped" >&2
+    else
+        mkdir -p "$(dirname "$BACKEND_LOG")"
+        ~/go/bin/saturday-backend --drive-folder-id "$DRIVE_FOLDER_ID" --poll-interval "$BACKEND_POLL_INTERVAL" --stage-sock "$STAGE_SOCK" --stage-tile >> "$BACKEND_LOG" 2>&1 &
+        echo $! > "$BACKEND_PIDFILE"
+        echo "saturday-stack: backend running headless (pid $(cat "$BACKEND_PIDFILE")), log → $BACKEND_LOG"
+    fi
+else
+    echo "saturday-stack: backend skipped (DRIVE_FOLDER_ID unset — one-time Google Cloud / --drive-login setup: saturday-backend/README.md)"
+fi
 
 # Headless saturday-voice — opt-in (see the var block above for why this
 # is the one leg that doesn't hard-fail the stack when unset).
