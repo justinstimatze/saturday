@@ -153,7 +153,15 @@ async function connect() {
     buf.copyToChannel(floatSamples, 0);
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
-    const isFirstFrame = nextPlayTime === 0;
+    // Was `nextPlayTime === 0` (only the session's literal first frame).
+    // Generalized: "needs the onset lead-time/fade fix" really means "this
+    // frame starts a fresh onset after silence," which is equally true of
+    // the real reply's first frame right after an ack plays — without
+    // this, the ack pool silently steals the fix from the frame it exists
+    // to protect. If the real reply arrives while the ack is still
+    // playing, currentTime < nextPlayTime correctly skips the fade, since
+    // that case is contiguous audio and shouldn't get one.
+    const isFirstFrame = audioCtx.currentTime >= nextPlayTime;
     const startAt = isFirstFrame
       ? audioCtx.currentTime + LEAD_TIME_SEC
       : Math.max(audioCtx.currentTime, nextPlayTime);

@@ -42,6 +42,7 @@ type Config struct {
 	WatcherSock        string
 	ConfThreshold      float64       // skip inject if router/expander confidence <= this; 0 disables
 	AskConf            float64       // classifier conf >= this AND type==ask → ask-mode
+	Clarify            bool          // on a low router-confidence gate, speak one candidate and listen for yes/no instead of silently dropping (state-of-2, see ROADMAP.md)
 	CollisionWait      time.Duration // JSONL must be size-stable this long before injecting
 	CollisionMax       time.Duration // give up waiting and inject anyway after this
 	InjectDirectTokens int           // est. tokens since last compact > this → direct-write skip headless
@@ -115,6 +116,21 @@ type pendingInject struct {
 	blinker            inject.Blinker
 }
 
+// pendingClarify holds state for one outstanding state-of-2 disambiguation
+// question — see ROADMAP.md's "Dialog management (state-of-2 clarifier)"
+// design. Set only by the router confidence gate (v1 is scoped to the
+// router gate only — see beginClarify's doc comment for why); cleared on
+// resolution (yes/no/timeout/anything unrecognized) or found-expired by
+// the next confirmed Handle call.
+type pendingClarify struct {
+	utterance string // the ORIGINAL utterance that hit the gate
+	mode      string // mode Handle was originally called with
+	narrate   string // narrate Handle was originally called with
+	expiresAt time.Time
+}
+
+const clarifyWindow = 3 * time.Second
+
 // RecentInjectRec is one entry in the expansion-feedback ring — see
 // feedback.go. Exported so a caller's own hook handler (e.g. mayor's
 // prompt_submit case) can log the matched record.
@@ -146,6 +162,9 @@ type Orchestrator struct {
 
 	recentInjectsMu sync.Mutex
 	recentInjects   []RecentInjectRec
+
+	clarifyMu sync.Mutex
+	clarify   *pendingClarify
 }
 
 // New constructs an Orchestrator and starts its background goroutines:
@@ -281,11 +300,66 @@ func head(s string, n int) string {
 //
 // Returns a non-nil Decision for any utterance the caller should log to
 // its own presentation layer; nil means nothing to log (e.g. a
-// confidence-gated skip, a cancelled call, or a fetch/router error).
+// confidence-gated skip, a cancelled call, a fetch/router error, or an
+// utterance consumed as a clarify reply — see resolveClarify).
+//
+// Handle is the confirmed-call entrypoint: when Config.Clarify is set, it
+// may open or resolve a state-of-2 clarify window (see beginClarify/
+// resolveClarify). Used by saturday-mayor (always — mayor has no
+// speculative call) and saturday-voice's confirmed (non-speculative)
+// call. See HandleSpeculative for the pre-pause speculative call, which
+// must never touch clarify state.
 func (o *Orchestrator) Handle(utterance, mode, narrate string, cancelled func() bool) (*Decision, error) {
+	return o.handleTop(utterance, mode, narrate, cancelled, true)
+}
+
+// HandleSpeculative is for a caller's pre-pause speculative call only —
+// saturday-voice fires one from ActionBeginFlush, before the pause is
+// even confirmed, to overlap its network round trip with the flush wait.
+// It never opens or resolves a clarify window: doing either on a
+// partial, still-growing transcript would either speak an obsolete
+// clarifying question, or — worse — read the real confirmed continuation
+// of the same utterance as an unrecognized reply to a clarify the
+// speculative call itself opened, and silently drop it. The confirmed
+// call that follows for the same utterance (via Handle) still handles
+// clarify normally. See Handle's doc comment for everything else.
+func (o *Orchestrator) HandleSpeculative(utterance, mode, narrate string, cancelled func() bool) (*Decision, error) {
+	return o.handleTop(utterance, mode, narrate, cancelled, false)
+}
+
+// handleTop normalizes cancelled, then — only when clarifyEnabled — gives
+// any outstanding clarify question first refusal at this utterance before
+// running the real pipeline. See resolveClarify.
+func (o *Orchestrator) handleTop(utterance, mode, narrate string, cancelled func() bool, clarifyEnabled bool) (*Decision, error) {
 	if cancelled == nil {
 		cancelled = func() bool { return false }
 	}
+	if o.cfg.Clarify && clarifyEnabled {
+		if dec, err, handled := o.resolveClarify(utterance, cancelled); handled {
+			return dec, err
+		}
+	}
+	return o.handle(utterance, mode, narrate, cancelled, false, clarifyEnabled)
+}
+
+// handle is Handle's actual pipeline, shared by both entrypoints via
+// handleTop. bypassGates, true only for resolveClarify's single
+// re-invocation of an original held utterance after a recognized "yes",
+// skips the router ConfThreshold gate for this one call — it does NOT
+// touch the classifier's AskConf gate (a routing decision, not a
+// drop-vs-proceed gate) or the expander's ConfThreshold gate (v1 scopes
+// clarify to the router gate only — see beginClarify's doc comment), both
+// of which re-run identically to any other call.
+//
+// clarifyEnabled gates whether the router gate below may call
+// beginClarify at all — false for the speculative path (handleTop passes
+// it straight through from HandleSpeculative). This is the actual fix for
+// the speculative/clarify race a review caught: it's not enough for
+// handleTop to skip resolveClarify on the speculative path, since handle
+// itself is shared code that would otherwise happily open a NEW clarify
+// window from a speculative call's own router-gate hit, on a partial,
+// still-growing transcript.
+func (o *Orchestrator) handle(utterance, mode, narrate string, cancelled func() bool, bypassGates, clarifyEnabled bool) (*Decision, error) {
 	if mode != "verbatim" {
 		if cleaned, isAsk := stripWakeWord(utterance); isAsk {
 			fmt.Fprintf(os.Stderr, "\033[35m? ask\033[0m \033[2m(wake-word)\033[0m\n")
@@ -355,13 +429,110 @@ func (o *Orchestrator) Handle(utterance, mode, narrate string, cancelled func() 
 	target := live[idx]
 	fmt.Fprintf(os.Stderr, "\033[2;36m→ route:\033[0m %s \033[2m(conf=%.2f)\033[0m \033[2m— %s\033[0m\n",
 		target.State.Project, conf, oneLine(getStr(rt, "rationale")))
-	if o.cfg.ConfThreshold > 0 && conf <= o.cfg.ConfThreshold {
+	if o.cfg.ConfThreshold > 0 && conf <= o.cfg.ConfThreshold && !bypassGates {
 		fmt.Fprintf(os.Stderr, "  ↳ router conf below threshold %.2f; skipping inject\n", o.cfg.ConfThreshold)
+		if o.cfg.Clarify && clarifyEnabled {
+			return nil, o.beginClarify(utterance, mode, narrate, target.State.Project, cancelled)
+		}
 		return nil, nil
 	}
 	dec := &Decision{Mode: mode, Route: target.State.Project, Conf: conf}
 	o.recordRecentUtterance(fmt.Sprintf("%s → %s (%s)", oneLine(utterance), dec.Route, dec.Mode))
 	return dec, o.expandAndInject(utterance, target, mode, narrate, cancelled)
+}
+
+// beginClarify speaks one rising-intonation candidate ("<project>?") and
+// stashes minimal pending state so the NEXT confirmed utterance can
+// resolve it — see resolveClarify. Checked against cancelled() first: a
+// stale call asking an obsolete clarifying question would be worse than
+// the silent drop it's replacing — same checkpoint discipline as
+// commitInject/answerAsk. This is a second, belt-and-suspenders layer on
+// top of handle's clarifyEnabled gate, which should already keep a
+// speculative call from ever reaching here at all.
+//
+// v1 is scoped to the router gate only. "<project>?" fits when the
+// project itself is what's uncertain (the router gate); at the expander
+// gate the project is already routed with adequate confidence, and asking
+// it again would be a non-sequitur — the real uncertainty there is the
+// proposed inject text/action, which needs its own phrasing this pass
+// doesn't design. The expander gate keeps today's exact silent-drop
+// behavior unconditionally, matching ROADMAP.md's own worked example
+// ("hindcast?" — a project name).
+func (o *Orchestrator) beginClarify(utterance, mode, narrate, candidateProject string, cancelled func() bool) error {
+	if cancelled() {
+		fmt.Fprintln(os.Stderr, "  ↳ clarify: superseded before asking; skipping")
+		return nil
+	}
+	question := candidateProject + "?"
+	o.clarifyMu.Lock()
+	o.clarify = &pendingClarify{
+		utterance: utterance, mode: mode, narrate: narrate,
+		expiresAt: time.Now().Add(clarifyWindow),
+	}
+	o.clarifyMu.Unlock()
+	o.emitState("clarifying")
+	defer o.emitState("")
+	fmt.Fprintf(os.Stderr, "\033[35m? clarify\033[0m: %q — awaiting yes/no within %s\n", question, clarifyWindow)
+	o.speak(question)
+	return nil
+}
+
+// resolveClarify checks for and, if unexpired, resolves an outstanding
+// clarify question against utterance. handled=false means "no pending
+// clarify, or it just expired — process utterance normally." handled=true
+// means utterance was consumed as the clarify reply and Handle should
+// return (dec, err) as-is without further processing.
+//
+// Only "yes" (a small fixed vocabulary — matching ROADMAP.md's own "fixed
+// answer vocabulary" constraint, deliberately not another LLM call, since
+// the whole point is a same-turn, free resolution) triggers a retry.
+// Anything else — "no", an unrecognized reply, or an entirely unrelated
+// utterance arriving during the window — drops the ORIGINAL held
+// utterance silently, per ROADMAP.md: "anything else → fall back to
+// silent... One round, no recursion." Note this also means the unrelated
+// utterance itself is consumed as the (failed) clarify reply, not
+// processed as its own command — a real, bounded cost of the window,
+// accepted given this path only opens on already-low-confidence input.
+//
+// Deliberately does not support "a project name" as a third resolution
+// path (ROADMAP.md's text mentions it) — scoped out for v1 in favor of
+// yes/no-only; revisit if that proves insufficient in practice.
+func (o *Orchestrator) resolveClarify(utterance string, cancelled func() bool) (dec *Decision, err error, handled bool) {
+	o.clarifyMu.Lock()
+	p := o.clarify
+	if p != nil && time.Now().After(p.expiresAt) {
+		p = nil
+	}
+	o.clarify = nil
+	o.clarifyMu.Unlock()
+	if p == nil {
+		return nil, nil, false
+	}
+	if isAffirmative(utterance) {
+		fmt.Fprintf(os.Stderr, "\033[35m? clarify: yes\033[0m — retrying %q with the router gate bypassed\n", oneLine(p.utterance))
+		// bypassGates=true structurally prevents this retry from opening a
+		// second clarify window on its own router-gate hit — !bypassGates
+		// is false, so that branch is unreachable this call, independent
+		// of the clarifyEnabled=false passed alongside it (belt and
+		// suspenders, matching the same double-guard beginClarify itself
+		// uses).
+		dec, err = o.handle(p.utterance, p.mode, p.narrate, cancelled, true, false)
+		return dec, err, true
+	}
+	fmt.Fprintf(os.Stderr, "  ↳ clarify: no/unrecognized reply (%q); dropping %q\n", oneLine(utterance), oneLine(p.utterance))
+	return nil, nil, true
+}
+
+// isAffirmative reports whether reply looks like "yes" to a spoken
+// clarify question — a fixed small vocabulary, not a classifier call.
+func isAffirmative(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Trim(s, ".!?,;: \t")
+	switch s {
+	case "yes", "yeah", "yep", "yup", "correct", "right", "sure", "affirmative":
+		return true
+	}
+	return false
 }
 
 // answerAsk is the ask-mode path: gather Saturday's bird's-eye state

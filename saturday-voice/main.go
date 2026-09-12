@@ -89,6 +89,7 @@ func main() {
 	stageZoom := flag.Bool("stage-zoom", false, "on inject, ask stage to zoom the addressed pane")
 	stageTile := flag.Bool("stage-tile", false, "on inject, ask stage to salience-tile the addressed pane")
 	dryRun := flag.Bool("dry-run", false, "log proposals but don't actually commit an inject")
+	clarify := flag.Bool("clarify", false, "on a low-confidence router decision, speak one candidate and listen for a yes/no reply instead of silently dropping the utterance (see ROADMAP.md's state-of-2 dialog clarifier)")
 	flag.Parse()
 
 	if *authToken == "" {
@@ -109,12 +110,29 @@ func main() {
 		}
 	}
 
+	// Pre-synthesize the ack pool once, here, at process startup — not
+	// per-connection (see ackpool.go). This does delay ListenAndServe: up
+	// to len(ackPhrases)*ttsDialTimeout worst case on a cold TTS
+	// container (each phrase dials fresh) — logged before it starts so a
+	// slow cold start reads as "working" rather than a silent hang, same
+	// reasoning as pipeline.go's own cold-dial status messages. A failure
+	// (moshi-server unreachable, cold-start too slow) just disables
+	// quick-acks — logged, not fatal, doesn't block the server from
+	// starting.
+	log.Printf("ack pool: synthesizing %d phrases (can take a while on a cold TTS container)...", len(ackPhrases))
+	acks, err := newAckPool(*ttsURL, *moshiAPIKey, moshiclient.TTSVoice(*voice), ttsDialTimeout)
+	if err != nil {
+		log.Printf("ack pool: synthesis failed, disabling quick-acks: %v", err)
+		acks = nil
+	}
+
 	srv := &server{
 		authToken:   *authToken,
 		sttURL:      *sttURL,
 		ttsURL:      *ttsURL,
 		moshiAPIKey: *moshiAPIKey,
 		voice:       moshiclient.TTSVoice(*voice),
+		acks:        acks,
 		orchTemplate: orchestrator.Config{
 			APIKey:             apiKey,
 			CacheDir:           *cacheDir,
@@ -134,6 +152,7 @@ func main() {
 			StageTile:          *stageTile,
 			StageSock:          *stageSock,
 			DryRun:             *dryRun,
+			Clarify:            *clarify,
 			// Speak is deliberately left unset here — it's wired
 			// per-session in serveWS, since each connected client must
 			// hear its own replies through its own TTS connection, not
@@ -192,6 +211,11 @@ type server struct {
 	ttsURL      string
 	moshiAPIKey string
 	voice       moshiclient.TTSVoice
+
+	// acks is synthesized once at process startup (see main) and shared
+	// across every session — nil if synthesis failed, in which case
+	// quick-acks are silently disabled (see ackPool.random).
+	acks *ackPool
 }
 
 var upgrader = websocket.Upgrader{
@@ -218,7 +242,7 @@ func (srv *server) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	sess := newSession(nil, conn, srv.sttURL, srv.ttsURL, srv.moshiAPIKey, srv.voice)
+	sess := newSession(nil, conn, srv.sttURL, srv.ttsURL, srv.moshiAPIKey, srv.voice, srv.acks)
 	cfg := srv.orchTemplate
 	cfg.Speak = sess.speak
 	cfg.SpeakStream = sess.speakStream

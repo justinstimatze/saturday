@@ -175,9 +175,13 @@ type session struct {
 	// a session that never spoke doesn't leak the connection.
 	warmTTSMu sync.Mutex
 	warmTTS   ttsConn
+
+	// acks is shared across every session (see server.acks) — nil-safe,
+	// playAck no-ops if it's nil.
+	acks *ackPool
 }
 
-func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL, ttsURL, moshiAPIKey string, voice moshiclient.TTSVoice) *session {
+func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL, ttsURL, moshiAPIKey string, voice moshiclient.TTSVoice, acks *ackPool) *session {
 	return &session{
 		orch:        orch,
 		client:      client,
@@ -185,6 +189,7 @@ func newSession(orch *orchestrator.Orchestrator, client *websocket.Conn, sttURL,
 		ttsURL:      ttsURL,
 		moshiAPIKey: moshiAPIKey,
 		voice:       voice,
+		acks:        acks,
 		tt:          moshiclient.NewTurnTaking(),
 		dialSTT: func(baseURL, apiKey string, timeout time.Duration) (sttConn, error) {
 			c, err := moshiclient.DialSTT(baseURL, apiKey, timeout)
@@ -459,13 +464,27 @@ func (s *session) runSTTLoop() error {
 				// overlaps its classify/route/expand network calls with
 				// the flush wait instead of paying for both in sequence.
 				// See ActionResponseReady below for the staleness check.
-				if snap := s.peekUtterance(); strings.TrimSpace(snap) != "" {
+				//
+				// Gated on hasMeaningfulContent, not just non-empty: STT
+				// occasionally transcribes a stray non-content token from
+				// background noise (a bare "*" was observed live,
+				// 2026-08-26, with prs2=0.954 — the turn-taking model was
+				// highly confident that was a complete pause) — without
+				// this gate that reaches the classifier, which defaults
+				// ambiguous/near-empty input to ask-mode, and Saturday
+				// speaks an entirely unprompted reply. Also the quick-ack
+				// trigger point: an ack for something with no real content
+				// would be its own false-positive annoyance.
+				if snap := s.peekUtterance(); hasMeaningfulContent(snap) {
 					s.utteranceMu.Lock()
 					s.specFired = true
 					s.specSnapshot = snap
 					s.utteranceMu.Unlock()
 					log.Printf("turn-taking: firing speculative reply on %q", snap)
 					go s.respondSpeculative(snap)
+					go s.playAck()
+				} else if strings.TrimSpace(snap) != "" {
+					log.Printf("turn-taking: begin flush skipped — no meaningful content in %q", snap)
 				}
 				s.flushSTT()
 			case moshiclient.ActionResponseReady:
@@ -474,6 +493,18 @@ func (s *session) runSTTLoop() error {
 				specFired, specSnap := s.specFired, s.specSnapshot
 				s.specFired, s.specSnapshot = false, ""
 				s.utteranceMu.Unlock()
+				if !hasMeaningfulContent(utterance) {
+					// OnStep already transitioned turn-taking state to
+					// StateBotSpeaking before returning ActionResponseReady
+					// (it does that regardless of what the caller does
+					// next) — EndResponse() here is required, not optional,
+					// or that state sticks and the next real word from the
+					// user fires a spurious cancelActive()/interrupted for
+					// a reply that was never actually speaking.
+					log.Printf("turn-taking: response ready, no meaningful content in %q; skipping", utterance)
+					s.turnTaking().EndResponse()
+					continue
+				}
 				if specFired && specSnap == utterance {
 					// Nothing changed since the speculative call fired —
 					// let it run its course; orchestrator.Handle already
@@ -679,7 +710,15 @@ func (s *session) runReply(utterance string, speculative bool) {
 	s.sendControl(map[string]any{"type": "state", "value": "thinking"})
 
 	log.Printf("%s: calling orchestrator.Handle(%q)", tag, utterance)
-	reply, err := s.orch.Handle(utterance, "expand", "auto", cancelled)
+	handle := s.orch.Handle
+	if speculative {
+		// Never HandleSpeculative resolves/opens a clarify window — see
+		// its doc comment. The confirmed call for the same utterance
+		// (this function, called again with speculative=false once the
+		// pause is confirmed) still handles clarify normally.
+		handle = s.orch.HandleSpeculative
+	}
+	reply, err := handle(utterance, "expand", "auto", cancelled)
 	if err != nil {
 		log.Printf("orchestrator.Handle: %v", err)
 	} else {
@@ -892,6 +931,26 @@ func (s *session) speak(text string) error {
 	chunks <- text
 	close(chunks)
 	return s.speakStream(chunks, func() bool { return false })
+}
+
+// playAck plays one random pre-synthesized ack clip, if the pool is
+// available — fired from ActionBeginFlush in its own goroutine so it
+// can't block STT ingestion. Reuses the existing shared playback queue
+// (sendAudio): no new client message type. The ack's WS frame reaches the
+// browser well before the real reply's first audio frame in virtually
+// every case, since playAck pays zero network cost (pre-synthesized, in
+// memory) while the real reply's first frame is gated behind at least one
+// LLM round trip plus TTS synthesis time — not a hard guarantee, but no
+// client-side ordering logic exists or is needed for the common case.
+// s.acks.random() is nil-receiver-safe, so no nil check is needed here.
+func (s *session) playAck() {
+	clip := s.acks.random()
+	if clip == nil {
+		return
+	}
+	if err := s.sendAudio(clip); err != nil {
+		log.Printf("playAck: sendAudio failed: %v", err)
+	}
 }
 
 // sendAudio writes one frame of synthesized PCM to the client as a binary
