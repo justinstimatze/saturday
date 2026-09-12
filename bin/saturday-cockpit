@@ -112,6 +112,13 @@
 #                <stub> <label> --role <main|gauge|scope|radar|strip>
 #                [--inst <SUBSYSTEM>] --delay <ms> [--fast]. Only read when
 #                --boot is passed.
+#   COCKPIT_BACKEND  tmux (default) | ttmux — which multiplexer this cockpit
+#                drives. ttmux (https://github.com/statico/ttmux) is opt-in,
+#                personal-dogfood territory while it's still beta: no
+#                --boot support under it (refuses cleanly), and its own
+#                cockpit-backend-ttmux.sh header documents the mechanisms
+#                that don't map 1:1 from tmux. See
+#                ~/.claude/plans/wobbly-honking-valley.md for the design.
 #
 # Pair with stage zoom/tile on mayor:
 #   saturday-mayor ... --stage-sock /tmp/saturday-stage.sock --stage-zoom
@@ -122,6 +129,18 @@ set -euo pipefail
 SESSION="${COCKPIT:-cc-cockpit}"
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
 LAYOUT="${COCKPIT_TILE:-tiled}"
+COCKPIT_BACKEND="${COCKPIT_BACKEND:-tmux}"
+
+case "$COCKPIT_BACKEND" in
+    tmux|ttmux) ;;
+    *)
+        echo "saturday-cockpit: unknown COCKPIT_BACKEND: $COCKPIT_BACKEND (want tmux or ttmux)" >&2
+        exit 2
+        ;;
+esac
+# shellcheck source=cockpit-backend-tmux.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/cockpit-backend-${COCKPIT_BACKEND}.sh"
+backend_require
 
 # Alt+letter pane-jump keys for panes 10+ (Alt+1..9 covers panes 1-9, Alt+0
 # is the overview reset — see bind_hotkeys). Ordered by physical proximity
@@ -151,7 +170,7 @@ wait_pane_settled() {
     local iters=$(( (max_wait * 10) / 3 ))
     local prev="" cur="" stable=0 i=0
     while [ "$i" -lt "$iters" ]; do
-        cur="$(tmux capture-pane -t "$pane" -p 2>/dev/null || true)"
+        cur="$(backend_capture "$pane" || true)"
         if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
             stable=$((stable + 1))
             [ "$stable" -ge 2 ] && return 0
@@ -174,7 +193,7 @@ wait_pane_settled() {
 # whose session is actually gone.
 next_free_slot() {
     local used n=1
-    used="$(tmux list-panes -t "$SESSION" -F '#{@cockpit_slot}' 2>/dev/null | grep -E '^[0-9]+$' | sort -n)"
+    used="$(backend_used_slots)"
     for u in $used; do
         if [ "$u" -eq "$n" ]; then
             n=$((n + 1))
@@ -197,10 +216,10 @@ ensure_pane_slots() {
     local pane_id existing
     while IFS= read -r pane_id; do
         [ -z "$pane_id" ] && continue
-        existing="$(tmux show-options -pqv -t "$pane_id" @cockpit_slot 2>/dev/null || true)"
+        existing="$(backend_get_slot "$pane_id")"
         [ -n "$existing" ] && continue
-        tmux set-option -p -t "$pane_id" @cockpit_slot "$(next_free_slot)"
-    done < <(tmux list-panes -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+        backend_set_slot "$pane_id" "$(next_free_slot)"
+    done < <(backend_list_pane_ids "$SESSION")
 }
 
 # Split a new pane for $1 into the running session and re-balance. Shared by
@@ -212,10 +231,11 @@ ensure_pane_slots() {
 add_pane() {
     local dir="$1" cmd="${2:-$CLAUDE_CMD}" title="${3:-}"
     local pane_id
-    pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
-    [ -n "$title" ] && tmux set-option -p -t "$pane_id" @cockpit_title "$title"
-    tmux set-option -p -t "$pane_id" @cockpit_slot "$(next_free_slot)"
-    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+    pane_id="$(backend_split "$SESSION" "$dir" "$cmd")"
+    backend_set_dir "$pane_id" "$dir"
+    [ -n "$title" ] && backend_set_title "$pane_id" "$title"
+    backend_set_slot "$pane_id" "$(next_free_slot)"
+    backend_select_layout
 }
 
 # resolve_last_session prints the session id (jsonl basename) of the
@@ -375,134 +395,48 @@ add_pane_pellicle() {
     fi
 
     local claude_pane_id
-    claude_pane_id="$(tmux split-window -t "$SESSION" -P -F '#{pane_id}' "cd '$dir' && exec $cmd")"
-    [ -n "$title" ] && tmux set-option -p -t "$claude_pane_id" @cockpit_title "$title"
-    tmux set-option -p -t "$claude_pane_id" @cockpit_slot "$(next_free_slot)"
+    claude_pane_id="$(backend_split "$SESSION" "$dir" "$cmd")"
+    backend_set_dir "$claude_pane_id" "$dir"
+    [ -n "$title" ] && backend_set_title "$claude_pane_id" "$title"
+    backend_set_slot "$claude_pane_id" "$(next_free_slot)"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
 
     local render_pane_id
-    render_pane_id="$(tmux split-window -v -b -l 3 -t "$claude_pane_id" -c "$dir" -P -F '#{pane_id}' "$watch_cmd")"
+    render_pane_id="$(backend_split_strip "$claude_pane_id" "$dir" "$watch_cmd" 3)"
     echo "$render_pane_id" > "$dir/.pellicle-pane"
 
-    tmux select-pane -t "$claude_pane_id"
-    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+    backend_select_pane "$claude_pane_id"
+    backend_select_layout
 }
 
-# Alt+1..9: jump straight to the pane holding @cockpit_slot N, zoomed
-# full-screen — press the same number again to toggle back to the tiled
-# overview (tmux auto-unzooms on select-pane to a *different* pane, so
-# re-selecting the one you're already on is the only case that needs the
-# explicit resize-pane -Z toggle; verified live against tmux 3.6, not
-# assumed from docs). Alt+0 always forces the overview. Root-table (-n, no
-# prefix) and global to the tmux server, so these also work as a plain
-# pane-jump facility outside the cockpit — they don't collide with anything:
-# stock tmux only binds M-1..M-9 in the prefix and copy-mode tables, never
-# in root.
-#
-# Targets a pane by @cockpit_slot, not #{pane_index} — tmux renumbers
-# pane_index every time a pane is added or killed, which used to mean Alt+9
-# could silently point at a different session than the one you last saw
-# there. @cockpit_slot is assigned once at pane creation (add_pane/
-# add_pane_pellicle) and never reassigned, so the lookup below is resolved
-# fresh at *keypress* time via a run-shell filter — `p=$(...)` and `"$p"`
-# are left unescaped-by-bash (backslash-escaped $ below) so they're
-# evaluated by tmux's run-shell subshell when the key is pressed, not by
-# this script at bind time.
+# Alt+1..9: jump straight to the pane holding slot N, zoomed full-screen —
+# press the same number again to toggle back to the tiled overview. Alt+0
+# always forces the overview. bind_hotkeys/apply_border_format are thin
+# wrappers now — the mechanism (tmux: a run-shell filter resolved fresh at
+# *keypress* time; ttmux: concrete bindings recomputed and pushed by this
+# script every time it's called, since ttmux has no per-keypress shell-out
+# at all) lives in bin/cockpit-backend-${COCKPIT_BACKEND}.sh, whose own
+# header comments carry the full rationale for each. Call sites unchanged
+# from before the backend split: initial launch and every `add`.
 bind_hotkeys() {
-    tmux set-option -g pane-base-index 1
     ensure_pane_slots
-    # bind-key -n is server-global, not session-scoped — a hardcoded session
-    # name baked in here at bind time would let whichever session last ran
-    # this (including a throwaway test session) hijack every other session's
-    # hotkeys on the same tmux server. #{session_name} is tmux's own format
-    # syntax (no leading $, so bash leaves it alone) — run-shell expands it
-    # at keypress time using the firing client's own current pane, so each
-    # session's Alt+N always targets that session, however many are running.
-    #
-    # run-shell format-expands its ENTIRE command string once, up front,
-    # before handing it to the shell — so a #{...} meant for the *nested*
-    # list-panes call (its own -f/-F, evaluated once per candidate pane)
-    # would otherwise get collapsed early against the single firing pane,
-    # turning a per-pane filter into a firing-pane-only constant. ##{...}
-    # (tmux's escape for a literal #) defers those tokens so list-panes
-    # itself expands them per row; only #{session_name} — meant to resolve
-    # once, for list-panes' own -t — stays single-escaped. Confirmed live:
-    # without the doubling, -F '#{pane_id}' returned the firing pane's own
-    # id on every row instead of each candidate's.
-    for n in 1 2 3 4 5 6 7 8 9; do
-        tmux bind-key -n "M-$n" run-shell "p=\$(tmux list-panes -t '#{session_name}' -f '##{==:##{@cockpit_slot},$n}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
-    done
-    # Alt+letter: same scheme, panes 10+, once a session outgrows the nine
-    # digits (M-0 is the overview reset above, not a tenth pane). See
-    # COCKPIT_HOTKEY_LETTERS above for why these letters and not others.
-    local pane=10
-    for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        tmux bind-key -n "M-$l" run-shell "p=\$(tmux list-panes -t '#{session_name}' -f '##{==:##{@cockpit_slot},$pane}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
-        pane=$((pane + 1))
-    done
-    # Un-zoom if zoomed, then always re-tile to even shares — stage's
-    # proportionalTile leaves panes at an emphasis skew (resize-pane -x) that
-    # zoom-checking alone doesn't touch, so without this second command M-0
-    # only fixed the zoom case and left a tile-skewed layout untouched.
-    # window_zoomed_flag is if-shell's OWN condition (evaluated against the
-    # firing pane, which is what we want) — double-escaped for the same
-    # deferral reason, so if-shell itself resolves it rather than run-shell
-    # collapsing it first (the exact failure this session hit: run-shell had
-    # already flattened it to a literal '0'/'1' before if-shell ever ran).
-    tmux bind-key -n M-0 run-shell "tmux if-shell -F '##{window_zoomed_flag}' 'resize-pane -Z' ; tmux select-layout -t '#{session_name}' $LAYOUT"
-
-    # kill-pane (e.g. clearing a dead remain-on-exit pane) doesn't re-tile on
-    # its own — tmux just hands the freed space to a neighbor, leaving an
-    # uneven layout. add_pane/add_pane_pellicle already re-balance after every
-    # split; this is the same fix for the removal side. Verified live: without
-    # it, killing 1 of 3 even-horizontal panes left 33/33/66; with it, 50/50.
-    tmux set-hook -t "$SESSION" after-kill-pane "select-layout -t $SESSION $LAYOUT"
+    backend_bind_hotkeys
 }
 
-# pane_hotkey_label builds the tmux format expression for the pane-border
-# label: #{@cockpit_slot} is already the right label for panes 1-9 (that
-# number IS the Alt+N key — see bind_hotkeys for why this is the sticky
-# slot, not #{pane_index}), but for pane 10+ the border must show the
-# actual Alt+letter from COCKPIT_HOTKEY_LETTERS instead of the raw slot
-# number, or the label lies about which key selects that pane. A chain of
-# #{?#{==:...}} ternaries, built from the same array bind_hotkeys uses, so
-# label and binding can't drift apart. NOT #{if:...} — that reads as a
-# literal, unrecognized format function on tmux 3.6 (verified live: it
-# just dumps "if:1,YES,NO" instead of evaluating) — #{?cond,true,false} is
-# the real ternary, confirmed live nested 8 deep. A pane with no slot yet
-# (the pellicle render strip, which never gets one — see add_pane_pellicle)
-# falls through to an empty #{@cockpit_slot}, which is correct: it isn't a
-# hotkey target.
-pane_hotkey_label() {
-    local expr='#{@cockpit_slot}'
-    local pane=10
-    for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        expr="#{?#{==:#{@cockpit_slot},$pane},$l,$expr}"
-        pane=$((pane + 1))
-    done
-    echo "$expr"
-}
-
-# apply_border_format (re)asserts the pane-border rendering options. Called
-# at initial launch and again from `add`, so a cockpit already running under
-# an older script version picks up border-format changes (e.g. --title
-# support below) live, without a full restart. The label falls back to the
-# dir basename unless the pane carries a @cockpit_title user option, set by
-# `add --title` — a plain #{pane_title} isn't used for this because Claude
-# Code's own terminal-title escape sequences would fight it.
+# apply_border_format (re)asserts the pane-border rendering. Called at
+# initial launch and again from `add`, so a cockpit already running under
+# an older script version picks up border-format changes live, without a
+# full restart.
 apply_border_format() {
-    tmux set-option -t "$SESSION" remain-on-exit on
-    tmux set-window-option -t "$SESSION" pane-border-status top
-    tmux set-window-option -t "$SESSION" pane-border-format \
-        " $(pane_hotkey_label):#{?@cockpit_title,#{@cockpit_title},#{b:pane_current_path}} "
+    backend_apply_border_format
 }
 
 case "${1:-}" in
     stop|down|kill)
-        if tmux has-session -t "$SESSION" 2>/dev/null; then
-            tmux kill-session -t "$SESSION"
+        if backend_has_session; then
+            backend_kill_session
             echo "saturday-cockpit: session killed."
         else
             echo "saturday-cockpit: no session running."
@@ -510,8 +444,10 @@ case "${1:-}" in
         exit 0
         ;;
     status)
-        if tmux has-session -t "$SESSION" 2>/dev/null; then
-            tmux list-panes -t "$SESSION" -F '#{pane_id} #{pane_pid} #{pane_current_path}'
+        if backend_has_session; then
+            # ttmux backend: reduced columns (id + title, no pid/cwd — its
+            # list-panes exposes neither). See cockpit-backend-ttmux.sh.
+            backend_list_panes_status
         else
             echo "saturday-cockpit: not running."
             exit 1
@@ -520,7 +456,7 @@ case "${1:-}" in
         ;;
     add)
         shift
-        if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        if ! backend_has_session; then
             echo "saturday-cockpit: no session running. Start one with: saturday-cockpit <dir> [<dir> ...]" >&2
             exit 1
         fi
@@ -592,29 +528,30 @@ case "${1:-}" in
             # Only wait between launches, not after the last one — see
             # wait_pane_settled's comment for why this matters.
             if [ "$i" -lt "$n" ]; then
-                newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+                newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
                 wait_pane_settled "$newpane" 10 ||
                     echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
             fi
         done
-        total="$(tmux list-panes -t "$SESSION" | wc -l)"
+        # Rebind hotkeys/labels for the topology this batch just created.
+        # tmux's bind_hotkeys is a static, idempotent re-bind either way
+        # (harmless extra call); ttmux's needs this — its bindings are
+        # concrete pane ids computed *now*, not resolved live at keypress
+        # time, so a multi-dir `add` batch needs one more rebind after all
+        # of it lands, not just the one already at the top of this case arm.
+        bind_hotkeys
+        apply_border_format
+        total="$(backend_pane_count)"
         echo "saturday-cockpit: added $# pane(s), $total total."
         exit 0
         ;;
 esac
 
-if [ -n "${TMUX:-}" ]; then
-    echo "saturday-cockpit: already inside tmux. Open a fresh terminal." >&2
-    exit 1
-fi
-if ! command -v tmux >/dev/null 2>&1; then
-    echo "saturday-cockpit: tmux not installed (apt install tmux)." >&2
-    exit 1
-fi
+backend_check_not_nested
 
 # Reattach an existing cockpit rather than rebuild it.
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    exec tmux attach-session -t "$SESSION"
+if backend_has_session; then
+    backend_attach
 fi
 
 # --resume/--resume-picker/--dangerously-skip-permissions apply to CLAUDE_CMD
@@ -667,7 +604,24 @@ if [ "$rc" -eq 1 ]; then
     CLAUDE_CMD="$CLAUDE_CMD --remote-control"
 fi
 
+# --boot (Steel Battalion) is built entirely on respawn-pane, remain-on-exit
+# + #{pane_dead} polling, and a custom-pane-option sync latch — none of
+# which exist in ttmux (see ~/.claude/plans/wobbly-honking-valley.md).
+# Refuse cleanly here, before any of boot's raw tmux calls below run,
+# rather than attempting a silently-degraded version.
+if [ "$boot" -eq 1 ] && [ "$COCKPIT_BACKEND" = ttmux ]; then
+    echo "saturday-cockpit: --boot needs the tmux backend (COCKPIT_BACKEND=tmux) — not supported under ttmux." >&2
+    exit 2
+fi
+
 if [ "$#" -lt 1 ]; then
+    # No dirs given. If a session is already up, reattach — same idiom
+    # saturday-stack uses for its own bare invocation — rather than making
+    # "how do I get back in" require remembering a dir list or a raw tmux
+    # command.
+    if backend_has_session; then
+        backend_attach
+    fi
     echo "usage: saturday-cockpit [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit add [--pellicle] [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
@@ -716,8 +670,7 @@ if [ "$boot" -eq 1 ]; then
         "cd '$first' && exec $(stub_cmd_for "$first" main "" "$prim_delay")")"
     tmux set-option -t "$SESSION" remain-on-exit on
 else
-    tmux new-session -d -s "$SESSION" -n "cockpit" \
-        "cd '$first' && exec $firstcmd"
+    backend_new_session "$first" "$firstcmd"
 fi
 bind_hotkeys
 
@@ -739,7 +692,7 @@ bind_hotkeys
 # the respawn-stagger loop, where the real settle-wait protection is still
 # very much needed and still applied (with a shorter timeout).
 if [ "$boot" -eq 0 ] && [ "$#" -gt 0 ]; then
-    firstpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+    firstpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
     wait_pane_settled "$firstpane" 10 ||
         echo "saturday-cockpit: warning: $first's pane didn't settle within 10s, continuing anyway" >&2
 fi
@@ -764,7 +717,7 @@ for d in "$@"; do
     else
         add_pane "$d" "$(resolved_cmd_for "$d")"
         if [ "$i" -lt "$n" ]; then
-            newpane="$(tmux list-panes -t "$SESSION" -F '#{pane_id}' | tail -1)"
+            newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
             wait_pane_settled "$newpane" 10 ||
                 echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
         fi
@@ -776,9 +729,18 @@ done
 # marker has a home. --boot keeps its hero-ring geometry through the reveal
 # (the working layout returns after the addressed pane's respawn below); the
 # normal path balances immediately, as always.
+if [ "$boot" -eq 0 ]; then
+    # Same reason as `add`'s own extra rebind: tmux's bind_hotkeys is a
+    # static, idempotent re-bind regardless of when it runs, but the one
+    # call before this loop (right after the first pane's creation) is
+    # already stale for ttmux by the time later dirs have their own panes —
+    # its bindings are concrete pane ids computed at call time, not
+    # resolved live at keypress time.
+    bind_hotkeys
+fi
 apply_border_format
 if [ "$boot" -eq 0 ]; then
-    tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null
+    backend_select_layout
 fi
 
 # --boot's reveal: layout is already settled above, so nothing resizes during
@@ -837,7 +799,7 @@ echo "  Alt+1..9 jump-and-zoom to a pane (press again to un-zoom), Alt+0 forces 
 echo "  stage drives zoom/tile on inject when mayor runs with --stage-zoom / --stage-tile."
 
 if [ -t 1 ]; then
-    exec tmux attach-session -t "$SESSION"
+    backend_attach
 else
-    echo "  (no TTY — attach with: tmux attach -t $SESSION)"
+    echo "  (no TTY — attach with: $COCKPIT_BACKEND attach -t $SESSION)"
 fi

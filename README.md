@@ -196,6 +196,15 @@ setup — skip both for the core mic-to-tmux-pane loop:
 - **Rented-GPU voice mode** (`saturday-voice`) talks to a `moshi-server`
   STT/TTS pod (Runpod, Modal, etc.) instead of the local Whisper/Kokoro
   sidecar. See [`saturday-voice/README.md`](saturday-voice/README.md).
+- **ttmux backend for `saturday-cockpit`** (`COCKPIT_BACKEND=ttmux`) drives
+  [statico/ttmux](https://github.com/statico/ttmux) instead of tmux — a
+  ground-up multiplexer with native per-pane agent-state marks and
+  free-floating, drag-resizable panes. Install with
+  `cargo install --git https://github.com/statico/ttmux`; still beta, so
+  this is personal-dogfood territory and off by default — tmux stays the
+  supported path. `--boot` (the Steel Battalion launch ritual) is tmux-only
+  either way; `bin/cockpit-backend-ttmux.sh`'s header lists everything
+  else that doesn't map 1:1.
 
 ## Run
 
@@ -325,3 +334,7 @@ work.
 
 [MIT](LICENSE). Security disclosures: [SECURITY.md](SECURITY.md)
 (`justin@justinstimatze.com`).
+
+Third-party: `saturday-cockpit`'s optional ttmux backend drives
+[statico/ttmux](https://github.com/statico/ttmux) (MIT), used unmodified
+via its own scripting API.
