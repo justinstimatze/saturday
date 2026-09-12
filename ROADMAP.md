@@ -37,6 +37,66 @@ rank 7) → callsigns half-2 (tier B rank 5). Everything else in tiers
 B/C/D keeps its prior rank; this is a cross-cut of interest, not a
 readiness change for anything not named above.
 
+**Interest re-rank, 2026-08-26 (second pass, later same day) — the pull
+above resolved fast; tier A is empty again.** Steel Battalion shipped in
+full: v1 (`afdea24`) → v3 hero-ring per-role-instrument redesign
+(`60e63a5`) → the addressed-respawn flatten fix (`14da778`). Register
+tuning's infra half landed too (`6515eaf`/`b26df3f`/`8cc9b27` — vocabulary
+awareness + post-generation cope-gate scoring, both wired at the single
+`Mayor.speak()` seam); its prose-tweaking half stays genuinely blocked,
+not just nominally tier-D — `~/.local/state/saturday/cope-violations.jsonl`
+doesn't exist yet, so there's no live-usage evidence to tune from.
+
+Top pull, by explicit user pick over FUI Go TUI spin-out and
+multicockpit: the voice stack. **Correction caught while writing this
+in** — the specific item picked, Pipecat-style token-level streaming
+TTS, already shipped (`dfc98ad`, 2026-08-25 20:36): `RunAskStreaming`
+decodes Anthropic's SSE tool-input stream incrementally, and a new
+`SpeakStream`/`wordBatcher` in `orchestrator` batches it into
+clause-sized chunks for TTS instead of blocking on the full reply. A
+second item the same stale memory called still-open (a test seam for
+`saturday-voice`'s dial/reconnect/control-message layer) also shipped
+first, same day (`6311142`, 17:08) — real fixture-driven coverage of the
+stuck-"connecting" regression, dial-failure retry, and reconnect-with-
+backoff. Both post-date the project memory this rerank was drafted from;
+caught by checking `git log` against the memory's claims rather than
+trusting the memory's own "still open" framing, mid-edit.
+
+What's genuinely still open in the voice stack, per the same memory's
+last-written status (all three pre-date `6311142`/`dfc98ad`, unconfirmed
+whether either shipped commit touches them): barge-in (interrupting
+mid-reply), a mid-conversation WebSocket-drop reconnect (`6311142` added
+test coverage for the reconnect *path*, not necessarily a live WAN-drop
+case), and **multi-session routing + cockpit-tile-resize with 2+ live
+sessions** — tonight's test conversations were all single-turn asks
+against one session.
+
+**Rerank, third pass — multi-session routing wins the tie, not a coin
+flip.** The other two are hardening items (make an existing single-
+session path more robust); multi-session routing is the feature the
+user named as the actual point of building this over just using Claude's
+consumer voice mode: *"I want a fast banter back and forth with the
+mayor that's aware of all the other sessions and is watching them
+also"* — and `saturday-voice`'s own `orchestrator` already carries the
+ask/route/inject/completion core built for exactly this in
+`saturday-mayor`'s local-mic path (`llm.RunRoute`,
+`llmcore/router.go:56`); `saturday-voice` constructing one
+`Orchestrator` per connected client (not shared) means the routing logic
+itself is already there and simply hasn't been exercised with 2+
+sessions live end-to-end through the WebSocket client, only through
+mayor's stdin path. Barge-in and the WAN reconnect stay next in line,
+not dropped.
+
+This whole build — `saturday-voice`/`moshiclient`/`orchestrator`
+packages, self-hosted Moshi on Modal, Phase 0 through streaming TTS —
+isn't tracked in this file's tiers at all; it happened in
+`~/.claude/plans/wobbly-honking-valley.md` and project memory, outside
+this roadmap's structure. The "Roaming voice" line under
+Speculative/later below (a BT-headset plan, correctly marked descoped)
+predates all of it and no longer describes the current build. Folding
+the real voice-stack status into this file's structure is its own pass,
+not done here — flagging the gap so it doesn't get lost.
+
 ### A. Bounded, high-leverage, no waiting for a signal
 
 **A1 (`saturday-stack doctor` hook/pidfile check) and A2 (onboarding
@@ -94,6 +154,8 @@ Tier A has no open items as of this ship.
 | 13 | FUI Go TUI library spin-out | Creative work, not blocking |
 | 14 | lucida terminal-mode pane trigger | A CC session triggers lucida to open a transient viz pane via `saturday-cockpit`/`saturday-stage`'s pane machinery, pause, then auto-close. Blocked on lucida's own terminal-only mode existing (see `~/Documents/lucida/idea.md`) and on this roadmap's tile-scaling item landing (the pane open/close primitive this would ride on). |
 | 15 | Multicockpit (one cockpit per monitor) | A `saturday-cockpit` per physical monitor, window placement left to the WM — no auto-layout/geometry logic needed. Session-per-monitor is already free: `saturday-cockpit` takes its tmux session name from `$COCKPIT` (`bin/saturday-cockpit:92`), `saturday-stage` already takes `--sock` per instance. The one real gap: `saturday-mayor` is a single daemon with one `StageSock` string (`saturday-mayor/main.go:635`, `:683`) used for every focus/restore call regardless of which cockpit a pane lives in — breaks the moment a second cockpit exists. Fix stays small and mayor stays one brain: `StageSock` becomes a map keyed by pane/session, filled in at add-time by whichever `saturday-cockpit add` created the pane (it already knows its own socket). No registry daemon, no WM-geometry query — most of Saturday doesn't care what cockpit a pane is in, so none of this needs to. No near-term trigger; design is scoped whenever a second monitor pair is worth building for. |
+| 16 | Disk-persist `saturday-voice`'s quick-ack pool | Small, ready now, no trigger needed — listed here for lack of a better tier. The 5 ack phrases (`ackpool.go`) are pre-synthesized once per process at startup, in-memory only; fine under a long-lived host, but Modal's `scaledown_window=300` (the hosting this session switched to, 2026-09-08) means the TTS container scales to zero after 5 min idle, so every `saturday-voice` restart now re-pays a cold-synthesis tax that used to be a one-time cost under the old Runpod pod. Persist the synthesized PCM to disk once (keyed by phrase text + `--voice`), reload on subsequent startups, re-synthesize only on a cache miss. Doesn't touch live in-session ack latency, already instant from memory. |
+| 17 | Migrate `saturday-cockpit` off tmux onto `statico/ttmux` | statico shipped a scripting API (`v0.3.0`/`v0.3.1`, both 2026-09-12) in response to Justin's ask — `API.md`, near-1:1 tmux-CLI compat (`send-keys`, `split-window` returning the new pane id, `capture-pane`, `resize-pane`, `list-panes --json` or `-F '#{pane_id}'`, `rename-pane`, `select-layout`, `set-option`). No fork needed; this is now a straight migration call, not a contribution one. Two real gaps found reading `src/script.rs`/`src/config.rs` live: (1) no per-pane arbitrary tag store — ttmux's pane JSON is only `id`/`window`/`title`/`active`, so `@cockpit_slot`'s free auto-GC-on-pane-death (`bin/saturday-cockpit:172-174`) has no equivalent; would need an external sidecar file keyed by pane id, pruned against `list-panes --json` on each `next_free_slot` call — `@cockpit_title` maps cleanly to `rename-pane` though. (2) no per-keypress shell-out — `keys.<chord>` binds to a fixed scripting-command string parsed at config-load, not a command computed at press time, so the Alt+N jump-to-slot hotkeys (server-global-vs-session-scoped bug fixed in `7f8cefc`) would need to become "rebind `keys.altN` via `set-option` on every topology change" instead of "resolve dynamically on keypress" — workable, but a real mechanism swap, not a port. (3) no `respawn-pane`, `remain-on-exit`, or pane-lifecycle hooks at all — confirmed absent from `src/script.rs` and actively opposed by `src/app.rs`, which reaps a pane the instant its child exits. `--boot` (the Steel Battalion sequence) is built entirely on this trio (`respawn-pane -k`, `#{pane_dead}` polling, a `@boot_main_done` sync latch) and stays tmux-only rather than inventing a replacement sync primitive; also means a `claude` pane that crashes or `/exit`s on its own won't auto-retile under the ttmux backend, only a cockpit-driven close does. **Desires for a future ttmux release, if upstream ever wants them:** a per-pane arbitrary-metadata store (makes gap 1's sidecar file unnecessary), a live/dynamic keybinding-resolution mode (makes gap 2's rebind-on-topology-change workaround unnecessary), and a `respawn-pane`/`remain-on-exit`-equivalent lifecycle primitive (would let `--boot` migrate off tmux too). None filed upstream yet. **Status 2026-09-12: migration shipped** — `COCKPIT_BACKEND` env var (default `tmux`), `bin/cockpit-backend-tmux.sh` (behavior-preserving) and `bin/cockpit-backend-ttmux.sh` (slot-sidecar + rebind-on-change) both landed, `--boot` refuses cleanly under `COCKPIT_BACKEND=ttmux`. Repo still says beta / config format may change before 1.0. |
 
 ### D. Speculative
 
