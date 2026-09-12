@@ -75,6 +75,29 @@ SATURDAY_VOICE_PORT="${SATURDAY_VOICE_PORT:-8080}"
 VOICE_LOG="$XDG_STATE_HOME_RESOLVED/saturday/voice.log"
 VOICE_PIDFILE="${TMPDIR:-/tmp}/saturday-stack-voice.pid"
 
+# already_running — true if pidfile names a PID that's still alive.
+#
+# saturday-stack's own idempotency guard ("tmux has-session → attach
+# instead of relaunch", near the bottom of this script) only protects
+# against a duplicate tmux SESSION. watcher/stage/backend are detached
+# background processes, not tmux panes — they can survive a killed or
+# crashed tmux session, so a later saturday-stack run that reaches the
+# launch block below would otherwise start a second instance of each,
+# right alongside the orphaned first one. Confirmed live 2026-09-08: an
+# orphaned saturday-backend from a prior session kept polling Drive
+# every 5s in parallel with a freshly-launched one — both individually
+# honoring --poll-interval correctly, but the combined log/API traffic
+# looked from outside exactly like the interval wasn't being honored at
+# all (~35 req/s sustained, 90MB/hour of log growth on an already-96%-
+# full root filesystem).
+already_running() {
+    local pidfile="$1"
+    [ -f "$pidfile" ] || return 1
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
 # check_audio_venv — verify saturday-audio/.venv is usable. Two failure
 # modes have bitten us in practice:
 #
@@ -314,25 +337,37 @@ done
 # layout sizes the left pane wider via main-pane-width.
 
 # Headless watcher first — mayor needs the watcher socket up to route.
-mkdir -p "$(dirname "$WATCHER_LOG")"
-~/go/bin/saturday-watcher >> "$WATCHER_LOG" 2>&1 &
-echo $! > "$WATCHER_PIDFILE"
-echo "saturday-stack: watcher running headless (pid $(cat "$WATCHER_PIDFILE")), log → $WATCHER_LOG"
+# already_running guards against an orphaned instance from a prior,
+# separately-killed tmux session — see already_running's own doc comment.
+if already_running "$WATCHER_PIDFILE"; then
+    echo "saturday-stack: watcher already running (pid $(cat "$WATCHER_PIDFILE")), not starting a second instance"
+else
+    mkdir -p "$(dirname "$WATCHER_LOG")"
+    ~/go/bin/saturday-watcher >> "$WATCHER_LOG" 2>&1 &
+    echo $! > "$WATCHER_PIDFILE"
+    echo "saturday-stack: watcher running headless (pid $(cat "$WATCHER_PIDFILE")), log → $WATCHER_LOG"
+fi
 
 # Headless stage — window choreography sidecar. No ordering dependency on
 # mayor (runStageClient reconnects with backoff regardless), but launched
 # alongside watcher so "headless services first" stays one visible block.
-mkdir -p "$(dirname "$STAGE_LOG")"
-~/go/bin/saturday-stage --sock "$STAGE_SOCK" >> "$STAGE_LOG" 2>&1 &
-echo $! > "$STAGE_PIDFILE"
-echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log → $STAGE_LOG"
+if already_running "$STAGE_PIDFILE"; then
+    echo "saturday-stack: stage already running (pid $(cat "$STAGE_PIDFILE")), not starting a second instance"
+else
+    mkdir -p "$(dirname "$STAGE_LOG")"
+    ~/go/bin/saturday-stage --sock "$STAGE_SOCK" >> "$STAGE_LOG" 2>&1 &
+    echo $! > "$STAGE_PIDFILE"
+    echo "saturday-stack: stage running headless (pid $(cat "$STAGE_PIDFILE")), log → $STAGE_LOG"
+fi
 
 # Headless backend — phone-voice Drive relay. Same "headless services first"
 # block as watcher/stage; only needs the watcher socket, no ordering
 # dependency on mayor. Opt-in, same as saturday-voice below: skip with a
 # log line when DRIVE_FOLDER_ID is unset, don't block the rest of the stack.
 if [ -n "$DRIVE_FOLDER_ID" ]; then
-    if ! command -v saturday-backend >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/saturday-backend" ]; then
+    if already_running "$BACKEND_PIDFILE"; then
+        echo "saturday-stack: backend already running (pid $(cat "$BACKEND_PIDFILE")), not starting a second instance"
+    elif ! command -v saturday-backend >/dev/null 2>&1 && [ ! -x "$HOME/go/bin/saturday-backend" ]; then
         echo "saturday-stack: DRIVE_FOLDER_ID set but saturday-backend not found on PATH or in ~/go/bin — backend leg skipped" >&2
     else
         mkdir -p "$(dirname "$BACKEND_LOG")"
