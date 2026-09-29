@@ -19,6 +19,20 @@ modules=(eval eval/router llmcore saturday-hook saturday-mayor saturday-thinking
 step() { printf '\033[1m▸ %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# This repo is public. A path under $HOME or the account name is true on one
+# machine only and stays in history past any later edit. The pattern is built
+# from the environment, so nothing personal is written here.
+step "local-path leak scan"
+me=$(id -un)
+leak_re="${HOME//./\\.}/|/home/${me}\\b|/Users/${me}\\b|-home-${me}-|~/Documents/"  # leakguard:allow (the pattern itself)
+leaks=$(git diff --cached --no-color --no-ext-diff -U0 -- . ':!notes/' |
+  awk '/^\+\+\+ /{f=substr($0,7); next} /^\+/{print f ": " substr($0,2)}' |
+  grep -E -- "$leak_re" | grep -v 'leakguard:allow' || true)
+if [[ -n "$leaks" ]]; then
+  printf '%s\n' "$leaks"
+  fail "staged lines carry a local path or account name — use a repo-relative path or a neutral example"
+fi
+
 step "gofmt"
 drift=$(gofmt -l .)
 if [[ -n "$drift" ]]; then

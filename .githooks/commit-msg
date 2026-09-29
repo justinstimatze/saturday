@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Saturday commit-msg hook: the message half of pre-commit's local-path leak
+# scan. This repo is public and a message outlives any later fix to the tree.
+# Comment lines (git's own template) are skipped.
+
+set -euo pipefail
+
+me=$(id -un)
+leak_re="${HOME//./\\.}/|/home/${me}\\b|/Users/${me}\\b|-home-${me}-|~/Documents/"  # leakguard:allow (the pattern itself)
+leaks=$(grep -v '^#' "$1" | grep -nE -- "$leak_re" | grep -v 'leakguard:allow' || true)
+if [[ -n "$leaks" ]]; then
+  printf '%s\n' "$leaks" >&2
+  printf '\033[1;31m✗ %s\033[0m\n' "commit message carries a local path or account name" >&2
+  exit 1
+fi
