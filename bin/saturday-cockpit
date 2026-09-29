@@ -509,6 +509,40 @@ restart_pane() {
     fi
 }
 
+# add_watch_pane <name> <dir> <new-window 0|1> <cmd> puts a non-claude
+# command (a log tail, a live viz) into the cockpit without moving anyone's
+# focus: split-window/new-window both select the new pane unless given -d,
+# and a raw `tmux new-window` into cc-cockpit yanked the user off a live
+# grid more than once (notes/COCKPIT-NONCLAUDE-LAUNCH-STEALS-FOCUS.md). It
+# splits into the cockpit's first window like `add` does, unless asked for
+# a window of its own or that window already holds COCKPIT_WATCH_MAX_PANES
+# (default 9) panes. A zoomed window is re-zoomed on the same pane, since a
+# split un-zooms it. The pane gets a slot (Alt+N reaches it) and a
+# manifest row, so `--resume` brings it back and `restart` re-runs it.
+# stage never mistakes it for a project's pane: mayor finds panes by the
+# claude pid in their process tree (inject.FindTmuxPane), not by cwd.
+add_watch_pane() {
+    local name="$1" dir="$2" own_window="$3" cmd="$4" win count zoomed active pane where
+    win="$SESSION:^"
+    count="$(tmux list-panes -t "$win" | wc -l)"
+    if [ "$own_window" -eq 1 ] || [ "$count" -ge "${COCKPIT_WATCH_MAX_PANES:-9}" ]; then
+        pane="$(tmux new-window -d -t "$SESSION" -n "$name" -c "$dir" -P -F '#{pane_id}' "$cmd")"
+        where="its own window '$name'"
+        [ "$own_window" -eq 1 ] || where="$where (the cockpit window already has $count panes)"
+    else
+        zoomed="$(tmux display-message -p -t "$win" '#{window_zoomed_flag}')"
+        active="$(tmux display-message -p -t "$win" '#{pane_id}')"
+        pane="$(tmux split-window -d -t "$win" -c "$dir" -P -F '#{pane_id}' "$cmd")"
+        tmux select-layout -t "$win" "$LAYOUT" >/dev/null
+        [ "$zoomed" = "1" ] && tmux resize-pane -Z -t "$active"
+        where="the cockpit window"
+    fi
+    backend_set_slot "$pane" "$(next_free_slot)"
+    backend_set_title "$pane" "$name"
+    remember_pane "$pane" watch "$dir" "$name" "$cmd"
+    echo "saturday-cockpit: watching '$name' in $where, slot $(backend_get_slot "$pane") ($pane). Focus unchanged."
+}
+
 # pane_state prints what a pane is doing, for status: dead (exited, held by
 # remain-on-exit), suspended (ctrl+z — claude handles SIGTSTP itself and
 # stays in state S, so only its on-screen notice gives it away; `wake`
@@ -761,6 +795,40 @@ case "${1:-}" in
         fi
         exit 0
         ;;
+    watch)
+        shift
+        require_tmux_backend watch
+        if ! backend_has_session; then
+            echo "saturday-cockpit: no session running." >&2
+            exit 1
+        fi
+        wname=""; own_window=0; wdir="$PWD"
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --name) wname="${2:?--name needs a value}"; shift 2 ;;
+                --window) own_window=1; shift ;;
+                --dir) wdir="${2:?--dir needs a value}"; shift 2 ;;
+                --) shift; break ;;
+                --*) echo "saturday-cockpit: unknown flag: $1" >&2; exit 2 ;;
+                *) break ;;
+            esac
+        done
+        if [ "$#" -lt 1 ]; then
+            echo "usage: saturday-cockpit watch [--name <name>] [--window] [--dir <dir>] [--] <cmd> [<arg> ...]" >&2
+            exit 2
+        fi
+        if ! wdir="$(abs_dir "$wdir")"; then
+            echo "saturday-cockpit: not a directory: $wdir" >&2
+            exit 1
+        fi
+        wname="${wname:-$(basename "$1")}"
+        wcmd="$(printf '%q ' "$@")"
+        manifest_refresh
+        add_watch_pane "$wname" "$wdir" "$own_window" "${wcmd% }"
+        bind_hotkeys
+        manifest_refresh
+        exit 0
+        ;;
     add)
         shift
         if ! backend_has_session; then
@@ -872,6 +940,7 @@ fi
 resume=0
 resume_picker=0
 allow_fresh=0
+restore_watch=()
 yolo=0
 rc=0
 boot=0
@@ -939,6 +1008,7 @@ if [ "$#" -lt 1 ]; then
     # Pellicle pairs come back as plain panes (the initial launch has no
     # pellicle path; see --pellicle below).
     if [ "$resume" -eq 1 ]; then
+        mapfile -t restore_watch < <(manifest_rows | awk -F'\t' '$2 == "watch"')
         mapfile -t restore_dirs < <(manifest_rows | awk -F'\t' '$2 == "claude" || $2 == "pellicle" { print $3 }')
         if [ "${#restore_dirs[@]}" -gt 0 ]; then
             echo "saturday-cockpit: restoring ${#restore_dirs[@]} pane(s) from $(manifest_path)"
@@ -1125,6 +1195,10 @@ echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
 echo "  Alt+1..9 jump-and-zoom to a pane (press again to un-zoom), Alt+0 forces the overview."
 echo "  stage drives zoom/tile on inject when mayor runs with --stage-zoom / --stage-tile."
 print_launch_summary
+for row in "${restore_watch[@]}"; do
+    IFS=$'\t' read -r _ _ wdir wname _ wcmd _ <<< "$row"
+    add_watch_pane "$(undash "$wname")" "$wdir" 0 "$(undash "$wcmd")"
+done
 manifest_refresh
 
 if [ -t 1 ]; then
