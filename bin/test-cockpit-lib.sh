@@ -95,6 +95,11 @@ SESSION=cc-test XDG_STATE_HOME="$fixture/state"
 printf '3\tclaude\t/w/b\t-\tB\tclaude\ts3\n1\tclaude\t/w/a\tAlpha\t-\tclaude --rc\ts1\n' | manifest_write
 same "manifest sorted by slot" "$(manifest_rows | cut -f1 | tr '\n' ' ')" "1 3 "
 same "manifest row for slot"   "$(manifest_row_for_slot 3 | cut -f3)" "/w/b"
+same "name matches a session name"  "$(manifest_slots_matching b)" "3"
+same "name matches a title"         "$(manifest_slots_matching ALPHA)" "1"
+same "name matches a dir basename"  "$(manifest_slots_matching a)" "1"
+same "unknown name matches nothing" "$(manifest_slots_matching zed)" ""
+same "manifest_names"               "$(manifest_names)" "Alpha, B"
 same "dash/undash round trip"  "$(undash "$(dash '')")|$(undash "$(dash 'a	b')")" "|a b"
 
 if [ "$fails" -gt 0 ]; then

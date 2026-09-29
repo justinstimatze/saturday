@@ -158,6 +158,24 @@ manifest_write() {
     } >"$tmp" && mv "$tmp" "$p"
 }
 
+# manifest_slots_matching prints the slot of every row whose title, Claude
+# session name, or dir basename equals $1, ignoring case — the names status
+# shows, so "docs" finds the pane whose session was renamed Docs even
+# though its dir is example.org.
+manifest_slots_matching() {
+    manifest_rows | awk -F'\t' -v w="$1" '
+        function base(p) { sub(/.*\//, "", p); return p }
+        BEGIN { w = tolower(w) }
+        tolower($4) == w || tolower($5) == w || tolower(base($3)) == w { print $1 }'
+}
+
+# manifest_names lists every name a row answers to, for error messages.
+manifest_names() {
+    manifest_rows | awk -F'\t' '
+        { n = ($4 != "-") ? $4 : ($5 != "-") ? $5 : $3; sub(/.*\//, "", n); printf "%s%s", sep, n; sep = ", " }
+        END { if (sep) print "" }'
+}
+
 # dash / undash convert between an empty value and the manifest's "-".
 # dash also flattens tabs, the one character a field can't hold.
 dash() {

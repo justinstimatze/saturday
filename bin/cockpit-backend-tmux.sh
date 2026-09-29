@@ -68,6 +68,11 @@ backend_split_strip() {
 
 backend_capture() { tmux capture-pane -t "$1" -p 2>/dev/null; }
 
+# backend_respawn swaps a pane's running command in place: same pane id,
+# position and pane options (@cockpit_slot, @cockpit_title), new process.
+backend_respawn() { tmux respawn-pane -k -t "$1" "$2"; }
+backend_pane_dead() { [ "$(tmux display-message -p -t "$1" '#{pane_dead}' 2>/dev/null)" = "1" ]; }
+
 backend_select_layout() { tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null; }
 backend_select_pane() { tmux select-pane -t "$1"; }
 
@@ -88,14 +93,21 @@ backend_set_dir() { :; }
 # session name can't hijack another session's keys, ##{} deferral so
 # list-panes' own per-row format isn't collapsed early by run-shell,
 # -s + select-window-before-select-pane for the multi-window edge case.
+# The jump also sends SIGCONT to the target pane's process: a claude
+# suspended with ctrl+z can't take `fg` (its pane has no shell under it,
+# by design), so the key already pressed to reach it is what wakes it. A
+# no-op on a process that isn't suspended.
+_tmux_jump_cmd() {
+    printf '%s' "p=\$(tmux list-panes -s -t '#{session_name}' -f '##{==:##{@cockpit_slot},$1}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && { kill -CONT \"\$(tmux display-message -p -t \"\$p\" '##{pane_pid}')\" 2>/dev/null; tmux select-window -t \"\$p\" && tmux select-pane -t \"\$p\"; }; tmux resize-pane -Z"
+}
 backend_bind_hotkeys() {
     tmux set-option -g pane-base-index 1
     for n in 1 2 3 4 5 6 7 8 9; do
-        tmux bind-key -n "M-$n" run-shell "p=\$(tmux list-panes -s -t '#{session_name}' -f '##{==:##{@cockpit_slot},$n}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-window -t \"\$p\" && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
+        tmux bind-key -n "M-$n" run-shell "$(_tmux_jump_cmd "$n")"
     done
     local pane=10
     for l in "${COCKPIT_HOTKEY_LETTERS[@]}"; do
-        tmux bind-key -n "M-$l" run-shell "p=\$(tmux list-panes -s -t '#{session_name}' -f '##{==:##{@cockpit_slot},$pane}' -F '##{pane_id}' | head -1); [ -n \"\$p\" ] && tmux select-window -t \"\$p\" && tmux select-pane -t \"\$p\"; tmux resize-pane -Z"
+        tmux bind-key -n "M-$l" run-shell "$(_tmux_jump_cmd "$pane")"
         pane=$((pane + 1))
     done
     tmux bind-key -n M-0 run-shell "tmux if-shell -F '##{window_zoomed_flag}' 'resize-pane -Z' ; tmux select-layout -t '#{session_name}' $LAYOUT"

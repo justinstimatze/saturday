@@ -339,6 +339,130 @@ manifest_refresh() {
     done < <(backend_pane_details) | manifest_write
 }
 
+# require_tmux_backend refuses a subcommand ttmux can't support: it has no
+# respawn-pane, no pane pid and no detached split (see
+# cockpit-backend-ttmux.sh's header).
+require_tmux_backend() {
+    if [ "$COCKPIT_BACKEND" != tmux ]; then
+        echo "saturday-cockpit: $1 needs the tmux backend (COCKPIT_BACKEND=tmux) — not supported under $COCKPIT_BACKEND." >&2
+        exit 2
+    fi
+}
+
+# resolve_target prints the pane id an argument names: nothing means the
+# pane this runs in ($TMUX_PANE); %N is a pane id; a number is a slot (the
+# Alt+N number); anything else is a name, matched like status shows it —
+# title, Claude session name, or dir basename, ignoring case. Fails with a
+# message naming the known panes. Call after manifest_refresh.
+resolve_target() {
+    local arg="$1" pane="" slot="" slots
+    case "$arg" in
+        "")
+            if [ -z "${TMUX_PANE:-}" ]; then
+                echo "saturday-cockpit: name a pane (slot, name or %id) — not running inside one" >&2
+                return 1
+            fi
+            pane="$TMUX_PANE" ;;
+        %*) pane="$arg" ;;
+        *[!0-9]*)
+            slots="$(manifest_slots_matching "$arg")"
+            if [ -z "$slots" ]; then
+                echo "saturday-cockpit: no pane named '$arg' (known: $(manifest_names))" >&2
+                return 1
+            fi
+            if [ "$(printf '%s\n' "$slots" | wc -l)" -gt 1 ]; then
+                echo "saturday-cockpit: '$arg' matches slots $(printf '%s' "$slots" | tr '\n' ' ')— use the slot number" >&2
+                return 1
+            fi
+            slot="$slots" ;;
+        *) slot="$arg" ;;
+    esac
+    if [ -n "$slot" ]; then
+        pane="$(backend_pane_details | awk -F'\t' -v s="$slot" '$2 == s { print $1; exit }')"
+        if [ -z "$pane" ]; then
+            echo "saturday-cockpit: no live pane in slot $slot" >&2
+            return 1
+        fi
+    fi
+    if ! backend_pane_details | cut -f1 | grep -qxF -- "$pane"; then
+        echo "saturday-cockpit: $pane isn't a pane in '$SESSION'" >&2
+        return 1
+    fi
+    printf '%s\n' "$pane"
+}
+
+# pane_detail <pane_id> prints that pane's backend_pane_details row.
+pane_detail() {
+    backend_pane_details | awk -F'\t' -v p="$1" '$1 == p { print; exit }'
+}
+
+# restart_pane respawns a pane's claude in place, resuming the session it
+# holds right now, with the flags it was launched with. The session id
+# comes from the pane's own Claude Code record (exact), then the manifest,
+# then the newest transcript for its dir (a guess, and said so). A pane
+# restarting itself can't wait for its own respawn — the respawn kills the
+# process asking for it — so that case is handed to a detached shell that
+# waits COCKPIT_RESTART_DELAY seconds (default 5) for the current turn to
+# finish first.
+restart_pane() {
+    local pane="$1" detail pid dead start slot row kind dir title name cmd sid res full
+    detail="$(pane_detail "$pane")"
+    IFS=$'\t' read -r _ slot pid dead start _ _ <<< "$detail"
+    row="$(manifest_row_for_slot "$slot")"
+    if [ -z "$row" ]; then
+        echo "saturday-cockpit: $pane has no manifest row (not a cockpit pane?)" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
+    dir="$(undash "$dir")"; cmd="$(undash "$cmd")"; sid="$(undash "$sid")"
+    if [ -z "$dir" ] || [ -z "$cmd" ]; then
+        echo "saturday-cockpit: don't know how $pane was launched (dir '$dir', cmd '$cmd')" >&2
+        return 1
+    fi
+    local run="$cmd"
+    if [ "$kind" != watch ]; then
+        if [ "$pid" != "-" ] && res="$(session_field "$pid" sessionId)" && [ -n "$res" ]; then
+            sid="$res"
+        elif [ -z "$sid" ] && res="$(resolve_last_session "$dir")"; then
+            sid="${res%%$'\t'*}"
+            echo "saturday-cockpit: $pane has no live session record; guessing the newest transcript for $dir ($sid)" >&2
+        fi
+        if [ -z "$sid" ]; then
+            echo "saturday-cockpit: no session to resume for $pane ($dir) — refusing to restart it as a fresh one" >&2
+            return 1
+        fi
+        run="$cmd --resume $sid"
+    fi
+    full="cd '$dir' && exec $run"
+    remember_pane "$pane" "$kind" "$dir" "$(undash "$title")" "$run"
+
+    if [ "$pane" = "${TMUX_PANE:-}" ]; then
+        local statedir log script
+        statedir="$(dirname "$(manifest_path)")"
+        mkdir -p "$statedir"
+        log="$statedir/restart-${pane#%}.log"
+        script="$statedir/restart-${pane#%}.sh"
+        printf 'sleep %q\ntmux respawn-pane -k -t %q %q\n' \
+            "${COCKPIT_RESTART_DELAY:-5}" "$pane" "$full" > "$script"
+        manifest_refresh
+        setsid nohup bash "$script" > "$log" 2>&1 < /dev/null &
+        echo "saturday-cockpit: this pane ($pane) restarts in ${COCKPIT_RESTART_DELAY:-5}s, resuming $sid. If it doesn't come back, see $log."
+    else
+        backend_respawn "$pane" "$full"
+        wait_pane_settled "$pane" 10 ||
+            echo "saturday-cockpit: warning: $pane didn't settle within 10s" >&2
+        if backend_pane_dead "$pane"; then
+            echo "saturday-cockpit: $pane died right after restart — its command was: $full" >&2
+            return 1
+        fi
+        manifest_refresh
+        echo "saturday-cockpit: restarted slot $slot ($pane)${sid:+, resuming $sid}."
+    fi
+    if [ "$kind" != watch ]; then
+        echo "  Background tasks and Monitor watches from before the restart are gone; re-arm any that matter."
+    fi
+}
+
 # pane_state prints what a pane is doing, for status: dead (exited, held by
 # remain-on-exit), suspended (ctrl+z — claude handles SIGTSTP itself and
 # stays in state S, so only its on-screen notice gives it away; `wake`
@@ -564,6 +688,30 @@ case "${1:-}" in
         else
             echo "saturday-cockpit: not running."
             exit 1
+        fi
+        exit 0
+        ;;
+    restart|wake)
+        sub="$1"; shift
+        require_tmux_backend "$sub"
+        if ! backend_has_session; then
+            echo "saturday-cockpit: no session running." >&2
+            exit 1
+        fi
+        if [ "$#" -gt 1 ]; then
+            echo "usage: saturday-cockpit $sub [<slot> | <name> | <%pane>]   (default: the pane this runs in)" >&2
+            exit 2
+        fi
+        manifest_refresh
+        pane="$(resolve_target "${1:-}")" || exit 1
+        if [ "$sub" = restart ]; then
+            restart_pane "$pane" || exit 1
+        else
+            # ctrl+z in a cockpit pane: claude prints "Run `fg`", but the
+            # pane has no shell to run it in. SIGCONT is what fg would send.
+            IFS=$'\t' read -r _ slot pid _ _ _ _ <<< "$(pane_detail "$pane")"
+            kill -CONT "$pid"
+            echo "saturday-cockpit: sent SIGCONT to slot $slot ($pane, pid $pid)."
         fi
         exit 0
         ;;
