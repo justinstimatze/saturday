@@ -45,7 +45,7 @@ vet:
 
 # saturday-cockpit is bash, not Go, so none of the Go gates see it.
 shell-check:
-	@shellcheck -x -P SCRIPTDIR -S warning bin/saturday-cockpit bin/cockpit-*.sh bin/test-cockpit-lib.sh
+	@shellcheck -x -P SCRIPTDIR -S warning bin/saturday-cockpit bin/saturday-cockpit-term bin/cockpit-*.sh bin/test-cockpit-lib.sh
 	@bin/test-cockpit-lib.sh >/dev/null || bin/test-cockpit-lib.sh
 
 lint:

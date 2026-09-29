@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# saturday-cockpit-term — open the cockpit in a terminal window of its own.
+#
+#   saturday-cockpit-term [saturday-cockpit args ...]
+#   saturday-cockpit-term --resume docs api frontend
+#
+# For callers with no terminal of their own (a Claude Code Bash call, a
+# script). The obvious one-liner, `terminator -x bash -lc '<cockpit ...>'`,
+# silently loses every argument after the first word: terminator -x rejoins
+# the rest of its argv with plain spaces and re-splits it, so the quoting
+# that held the bash -c string together is gone before bash sees it
+# (notes/COCKPIT-TERMINATOR-X-DROPS-ARGS-WHEN-WRAPPED-IN-BASH-LC.md). Here
+# the arguments go into a wrapper script instead, quoted once with printf
+# %q, and the terminal gets that script's path as its only argument, which
+# survives any re-split.
+#
+# Env:
+#   COCKPIT_TERM  terminal to open (default terminator). It must run the
+#                 argument after -x as a command, as terminator and
+#                 xfce4-terminal do.
+#   COCKPIT       session name, also used as the window title.
+
+set -euo pipefail
+
+term="${COCKPIT_TERM:-terminator}"
+if ! command -v "$term" >/dev/null 2>&1; then
+    echo "saturday-cockpit-term: $term not found (set COCKPIT_TERM)" >&2
+    exit 1
+fi
+
+cockpit="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/saturday-cockpit"
+dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/saturday-cockpit"
+mkdir -p "$dir" && chmod 0700 "$dir"
+wrapper="$dir/term-$$.sh"
+
+{
+    echo '#!/usr/bin/env bash'
+    echo 'rm -f -- "$0"'
+    echo 'source ~/.bashrc 2>/dev/null || true'
+    printf 'cd %q\n' "$PWD"
+    printf '%q' "$cockpit"
+    printf ' %q' "$@"
+    echo
+    echo 'echo; echo "[saturday-cockpit exited ($?), dropping to a shell]"'
+    echo 'exec bash'
+} > "$wrapper"
+chmod 0700 "$wrapper"
+
+setsid "$term" -T "${COCKPIT:-cc-cockpit}" -x "$wrapper" > /dev/null 2>&1 < /dev/null &
+echo "saturday-cockpit-term: opened $term running: saturday-cockpit $*"
