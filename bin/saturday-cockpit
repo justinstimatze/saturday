@@ -238,6 +238,7 @@ add_pane() {
     backend_set_dir "$pane_id" "$dir"
     [ -n "$title" ] && backend_set_title "$pane_id" "$title"
     backend_set_slot "$pane_id" "$(next_free_slot)"
+    remember_pane "$pane_id" claude "$dir" "$title" "$cmd"
     backend_select_layout
 }
 
@@ -289,6 +290,96 @@ print_launch_summary() {
     for idx in "${!LAUNCH_DIRS[@]}"; do
         printf '  %s: %s\n' "${LAUNCH_DIRS[$idx]}" "${LAUNCH_NOTES[$idx]}"
     done
+}
+
+# remember_pane <pane_id> <kind> <dir> <title> <cmd> records what this run
+# launched into a pane, so the next manifest_refresh writes a fresh row for
+# it instead of inheriting whatever an earlier pane in the same slot left.
+declare -A NEW_PANE_META=()
+remember_pane() {
+    NEW_PANE_META[$1]="$(dash "$2")"$'\t'"$(dash "$3")"$'\t'"$(dash "$4")"$'\t'"$(dash "$(strip_resume "$5")")"$'\t'"$(dash "$(resume_id "$5")")"
+}
+
+# manifest_refresh rewrites the manifest (cockpit-lib.sh) from the live
+# panes. Per slotted pane, the row comes from, in order: remember_pane for a
+# pane this run created; the existing row for that slot; or, for a pane no
+# manifest has seen (a cockpit started before the manifest existed), its
+# own start command and @cockpit_title. The session id and name are then
+# refreshed from the pane's Claude Code session record when it has one.
+manifest_refresh() {
+    local pane slot pid dead start cwd ptitle meta row kind dir title name cmd sid v
+    while IFS=$'\t' read -r pane slot pid dead start cwd ptitle; do
+        [ "$slot" = "-" ] && continue
+        meta="${NEW_PANE_META[$pane]:-}"
+        row="$(manifest_row_for_slot "$slot")"
+        if [ -n "$meta" ]; then
+            IFS=$'\t' read -r kind dir title cmd sid <<< "$meta"
+            name=-
+        elif [ -n "$row" ]; then
+            IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
+        else
+            kind=claude; name=-
+            sid="$(dash "$(resume_id "$(start_cmd_cmd "$start")")")"
+            title="$ptitle"
+            # older cockpits baked relative dirs into start commands, so
+            # only trust an absolute one; else the session's own cwd
+            dir="$(start_cmd_dir "$start")"
+            if [[ "$dir" != /* ]]; then
+                dir="$( [ "$pid" != "-" ] && session_field "$pid" cwd)" || dir=""
+                [[ "$dir" == /* ]] || dir="$(undash "$cwd")"
+            fi
+            dir="$(dash "$dir")"
+            cmd="$(dash "$(strip_resume "$(start_cmd_cmd "$start")")")"
+        fi
+        if [ "$pid" != "-" ]; then
+            if v="$(session_field "$pid" sessionId)" && [ -n "$v" ]; then sid="$v"; fi
+            if v="$(session_field "$pid" name)" && [ -n "$v" ]; then name="$(dash "$v")"; fi
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "$kind" "$dir" "$title" "$name" "$cmd" "$sid"
+    done < <(backend_pane_details) | manifest_write
+}
+
+# pane_state prints what a pane is doing, for status: dead (exited, held by
+# remain-on-exit), suspended (ctrl+z — claude handles SIGTSTP itself and
+# stays in state S, so only its on-screen notice gives it away; `wake`
+# clears it), watch for a watch pane, else the session record's own status
+# (busy, idle, ...), else "-".
+pane_state() {
+    local pane="$1" pid="$2" dead="$3" kind="$4" v
+    if [ "$dead" = "1" ]; then echo dead; return; fi
+    if backend_capture "$pane" | grep -v '^[[:space:]]*$' | tail -3 |
+        grep -q 'Claude Code has been suspended'; then
+        echo suspended; return
+    fi
+    if [ "$kind" = "watch" ]; then echo watch; return; fi
+    if [ "$pid" != "-" ] && v="$(session_field "$pid" status)" && [ -n "$v" ]; then
+        echo "$v"; return
+    fi
+    echo "-"
+}
+
+# cockpit_status: one line per pane, slot first and sorted by it — the slot
+# is the number Alt+N jumps to, and the number a person means by "pane 4".
+# tmux's own pane index is unrelated to it and deliberately not shown.
+cockpit_status() {
+    manifest_refresh
+    local pane slot pid dead start cwd ptitle row kind dir title name cmd sid label
+    {
+        printf 'SLOT\tNAME\tSTATE\tDIR\tSESSION\tPANE\n'
+        while IFS=$'\t' read -r pane slot pid dead start cwd ptitle; do
+            kind=-; dir=-; title=-; name=-; sid=-
+            if [ "$slot" != "-" ] && row="$(manifest_row_for_slot "$slot")" && [ -n "$row" ]; then
+                IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
+            fi
+            [ "$dir" = "-" ] && dir="$cwd"
+            label="$(undash "$title")"
+            [ -z "$label" ] && label="$(undash "$name")"
+            [ -z "$label" ] && [ "$dir" != "-" ] && label="$(basename "$dir")"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "${label:--}" \
+                "$(pane_state "$pane" "$pid" "$dead" "$kind")" "${dir/#$HOME/\~}" "${sid:0:8}" "$pane"
+        done < <(backend_pane_details | awk -F'\t' '$2 != "-"' | sort -t$'\t' -k2,2n
+                 backend_pane_details | awk -F'\t' '$2 == "-"')
+    } | column -t -s $'\t'
 }
 
 # stub_cmd_for <dir> <role> <inst> <delay_ms> prints the placeholder command
@@ -417,6 +508,7 @@ add_pane_pellicle() {
     backend_set_dir "$claude_pane_id" "$dir"
     [ -n "$title" ] && backend_set_title "$claude_pane_id" "$title"
     backend_set_slot "$claude_pane_id" "$(next_free_slot)"
+    remember_pane "$claude_pane_id" pellicle "$dir" "$title" "$cmd"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
@@ -454,6 +546,9 @@ apply_border_format() {
 case "${1:-}" in
     stop|down|kill)
         if backend_has_session; then
+            # last look at the live panes (session ids, names) before
+            # they're gone, so a later --resume can restore them
+            manifest_refresh
             backend_kill_session
             echo "saturday-cockpit: session killed."
         else
@@ -463,9 +558,9 @@ case "${1:-}" in
         ;;
     status)
         if backend_has_session; then
-            # ttmux backend: reduced columns (id + title, no pid/cwd — its
-            # list-panes exposes neither). See cockpit-backend-ttmux.sh.
-            backend_list_panes_status
+            # ttmux backend: no pid or cwd, so STATE and SESSION are thinner
+            # there. See backend_pane_details in cockpit-backend-ttmux.sh.
+            cockpit_status
         else
             echo "saturday-cockpit: not running."
             exit 1
@@ -557,6 +652,7 @@ case "${1:-}" in
         bind_hotkeys
         apply_border_format
         total="$(backend_pane_count)"
+        manifest_refresh
         echo "saturday-cockpit: added $# pane(s), $total total."
         print_launch_summary
         exit 0
@@ -687,7 +783,9 @@ if [ "$boot" -eq 1 ]; then
     tmux set-option -t "$SESSION" remain-on-exit on
 else
     backend_new_session "$first" "$firstcmd"
+    firstpane="$(backend_list_pane_ids "$SESSION" | head -1)"
 fi
+remember_pane "$firstpane" claude "$first" "" "$firstcmd"
 bind_hotkeys
 
 # Remaining dirs → one split each. Re-balance after every split so tmux always
@@ -729,6 +827,7 @@ for d in "$@"; do
         boot_dirs+=("$d")
         boot_cmds+=("${LAUNCH_CMDS[$i]}")
         boot_pane_ids+=("$newpane")
+        remember_pane "$newpane" claude "$d" "" "${LAUNCH_CMDS[$i]}"
         if [ "$i" -lt "$n" ]; then sleep 0.35; fi   # panel-by-panel stagger
     else
         add_pane "$d" "${LAUNCH_CMDS[$i]}"
@@ -814,6 +913,7 @@ echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
 echo "  Alt+1..9 jump-and-zoom to a pane (press again to un-zoom), Alt+0 forces the overview."
 echo "  stage drives zoom/tile on inject when mayor runs with --stage-zoom / --stage-tile."
 print_launch_summary
+manifest_refresh
 
 if [ -t 1 ]; then
     backend_attach

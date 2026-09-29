@@ -102,8 +102,12 @@ backend_list_pane_ids() {
 
 # Reduced columns vs. tmux (id pid cwd) — ttmux's list-panes has no pid or
 # cwd field at all. See file header.
-backend_list_panes_status() {
-    ttmux list-panes --json | jq -r '.panes[] | "\(.id) \(.title)"'
+# backend_pane_details: same columns as the tmux backend's, from the slot
+# sidecar. ttmux exposes no pid, dead flag, start command or cwd, so those
+# come back as "-"/0 and the cockpit's status shows less under this backend.
+backend_pane_details() {
+    _ttmux_sidecar_load_pruned | jq -r 'to_entries[] |
+        [.key, (.value.slot // "-"), "-", "0", "-", (.value.dir // "-"), (.value.title // "-")] | @tsv'
 }
 
 backend_pane_count() { ttmux list-panes --json | jq '.panes | length'; }

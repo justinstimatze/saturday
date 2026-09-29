@@ -49,3 +49,119 @@ resolve_last_session() {
         sort -rn | cut -d' ' -f2-)
     return 1
 }
+
+# strip_resume drops `--resume [<id>]` and `--resume-last` from a command
+# string, leaving the launch flags a pane should keep across a resume or
+# restart (--model, --remote-control, --dangerously-skip-permissions).
+strip_resume() {
+    local words=() out=() skip=0 w
+    read -ra words <<< "$1"
+    for w in "${words[@]}"; do
+        if [ "$skip" -eq 1 ]; then
+            skip=0
+            [[ "$w" == -* ]] || continue
+        fi
+        case "$w" in
+            --resume) skip=1; continue ;;
+            --resume-last) continue ;;
+        esac
+        out+=("$w")
+    done
+    printf '%s\n' "${out[*]}"
+}
+
+# resume_id prints the session id after `--resume` in a command string, if
+# there is one.
+resume_id() {
+    local words=() w prev=""
+    read -ra words <<< "$1"
+    for w in "${words[@]}"; do
+        if [ "$prev" = "--resume" ] && [[ "$w" != -* ]]; then
+            printf '%s\n' "$w"
+            return 0
+        fi
+        prev="$w"
+    done
+}
+
+# start_cmd_dir / start_cmd_cmd split a pane start command of the shape this
+# script launches, `cd '<dir>' && exec <cmd>`, into its two halves. tmux's
+# #{pane_start_command} wraps the whole thing in double quotes; both forms
+# are accepted. Anything else prints nothing.
+start_cmd_dir() {
+    local s="${1#\"}"
+    s="${s%\"}"
+    [[ "$s" == "cd '"*"' && exec "* ]] || return 0
+    s="${s#cd \'}"
+    printf '%s\n' "${s%%\' && exec *}"
+}
+start_cmd_cmd() {
+    local s="${1#\"}"
+    s="${s%\"}"
+    [[ "$s" == *" && exec "* ]] || return 0
+    printf '%s\n' "${s#* && exec }"
+}
+
+# session_field prints one string field from Claude Code's per-process
+# record, ~/.claude/sessions/<pid>.json (sessionId, name, cwd, status).
+# Every cockpit pane execs claude, so a pane's pid is that process. The
+# record is undocumented and is deleted when the process exits, so every
+# caller treats a miss as "unknown", never as an error.
+session_field() {
+    local f="$HOME/.claude/sessions/$1.json" v
+    [ -f "$f" ] || return 1
+    v="$(grep -o "\"$2\":\"[^\"]*\"" "$f" 2>/dev/null)" || return 1
+    v="${v%%$'\n'*}"
+    v="${v#*\":\"}"
+    printf '%s\n' "${v%\"}"
+}
+
+# ---- pane manifest ----------------------------------------------------------
+#
+# One row per slotted pane, so a cockpit can be restored, restarted or
+# addressed by name after its panes (and their session records) are gone:
+#   slot kind dir title name cmd last_sid
+# kind is claude, pellicle or watch; title is an explicit --title; name is
+# the session's own name from Claude Code (/rename); cmd is the launch
+# command minus any --resume. Tab-separated, "-" for an empty field (bash's
+# read collapses consecutive tabs, so an empty field would shift the rest).
+# Rewritten from the live panes on launch, add, status and stop, which also
+# means a pane closed on its own drops out at the next refresh. After a
+# crash or reboot the file holds whatever the last refresh saw.
+
+manifest_path() {
+    printf '%s/saturday-cockpit/%s.tsv\n' "${XDG_STATE_HOME:-$HOME/.local/state}" "$SESSION"
+}
+
+# manifest_rows prints the data rows (no header), or nothing.
+manifest_rows() {
+    local p
+    p="$(manifest_path)"
+    [ -f "$p" ] || return 0
+    grep -v '^#' "$p" || true
+}
+
+manifest_row_for_slot() {
+    manifest_rows | awk -F'\t' -v s="$1" '$1 == s { print; exit }'
+}
+
+# manifest_write replaces the manifest with the rows on stdin, sorted by
+# slot, via a temp file so a reader never sees half a file.
+manifest_write() {
+    local p tmp
+    p="$(manifest_path)"
+    mkdir -p "$(dirname "$p")"
+    tmp="$p.tmp.$$"
+    {
+        printf '# slot\tkind\tdir\ttitle\tname\tcmd\tlast_sid  (saturday-cockpit pane manifest)\n'
+        sort -t$'\t' -k1,1n
+    } >"$tmp" && mv "$tmp" "$p"
+}
+
+# dash / undash convert between an empty value and the manifest's "-".
+# dash also flattens tabs, the one character a field can't hold.
+dash() {
+    local v="${1//$'\t'/ }"
+    printf '%s\n' "${v:--}"
+}
+undash() { [ "$1" = "-" ] && return 0; printf '%s\n' "$1"; }

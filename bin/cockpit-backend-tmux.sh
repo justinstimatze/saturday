@@ -42,11 +42,15 @@ backend_list_pane_ids() {
     tmux list-panes -s -t "$target" -F '#{pane_id}'
 }
 
-backend_list_panes_status() {
-    tmux list-panes -t "$SESSION" -F '#{pane_id} #{pane_pid} #{pane_current_path}'
+# backend_pane_details: one tab-separated row per pane in the session, every
+# window (-s), empty values as "-" (see the manifest note in cockpit-lib.sh):
+#   pane_id slot pid dead start_command cwd title
+backend_pane_details() {
+    tmux list-panes -s -t "$SESSION" -F \
+        "#{pane_id}	#{?@cockpit_slot,#{@cockpit_slot},-}	#{pane_pid}	#{pane_dead}	#{?pane_start_command,#{pane_start_command},-}	#{pane_current_path}	#{?@cockpit_title,#{@cockpit_title},-}"
 }
 
-backend_pane_count() { tmux list-panes -t "$SESSION" | wc -l; }
+backend_pane_count() { tmux list-panes -s -t "$SESSION" | wc -l; }
 
 backend_split() {
     local target="$1" dir="$2" cmd="$3"

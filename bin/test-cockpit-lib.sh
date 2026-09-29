@@ -61,6 +61,42 @@ rm "$HOME/.claude/projects/$(claude_encode "$work/x_y")/sess-underscore.jsonl"
 transcript "$work/x_y" sess-elsewhere "$work/x.y" 10
 expect "cwd mismatch is a miss"               "$work/x_y"   ""
 
+same() { # same <name> <got> <want>
+    if [ "$2" = "$3" ]; then
+        echo "ok   $1"
+    else
+        echo "FAIL $1: got '$2', want '$3'"
+        fails=$((fails + 1))
+    fi
+}
+
+same "strip_resume drops --resume <id>" \
+    "$(strip_resume 'claude --model m --resume 3f2a-9 --remote-control')" "claude --model m --remote-control"
+same "strip_resume drops a bare --resume" \
+    "$(strip_resume 'claude --resume --dangerously-skip-permissions')" "claude --dangerously-skip-permissions"
+same "strip_resume drops --resume-last" "$(strip_resume 'claude --resume-last')" "claude"
+
+same "resume_id finds the id" "$(resume_id 'claude --resume 3f2a-9 --rc')" "3f2a-9"
+same "resume_id, bare --resume" "$(resume_id 'claude --resume --rc')" ""
+
+start="\"cd '/home/u/src/example.org' && exec claude --model m --resume 396903b6\""
+same "start_cmd_dir"                "$(start_cmd_dir "$start")" "/home/u/src/example.org"
+same "start_cmd_cmd"                "$(start_cmd_cmd "$start")" "claude --model m --resume 396903b6"
+same "start_cmd_dir, unknown shape" "$(start_cmd_dir "bash")" ""
+
+mkdir -p "$HOME/.claude/sessions"
+printf '{"pid":4242,"sessionId":"ceddea17","cwd":"/w/notes","name":"Notes","status":"busy"}' \
+    > "$HOME/.claude/sessions/4242.json"
+same "session_field sessionId" "$(session_field 4242 sessionId)" "ceddea17"
+same "session_field name"      "$(session_field 4242 name)"      "Notes"
+same "session_field, no record" "$(session_field 4243 name || echo miss)" "miss"
+
+SESSION=cc-test XDG_STATE_HOME="$fixture/state"
+printf '3\tclaude\t/w/b\t-\tB\tclaude\ts3\n1\tclaude\t/w/a\tAlpha\t-\tclaude --rc\ts1\n' | manifest_write
+same "manifest sorted by slot" "$(manifest_rows | cut -f1 | tr '\n' ' ')" "1 3 "
+same "manifest row for slot"   "$(manifest_row_for_slot 3 | cut -f3)" "/w/b"
+same "dash/undash round trip"  "$(undash "$(dash '')")|$(undash "$(dash 'a	b')")" "|a b"
+
 if [ "$fails" -gt 0 ]; then
     echo "$fails failure(s)"
     exit 1
