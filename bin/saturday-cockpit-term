@@ -41,7 +41,7 @@ wrapper="$dir/term-$$.sh"
     printf '%q' "$cockpit"
     printf ' %q' "$@"
     echo
-    echo 'echo; echo "[saturday-cockpit exited ($?), dropping to a shell]"'
+    echo 'rc=$?; echo; echo "[saturday-cockpit exited ($rc), dropping to a shell]"'
     echo 'exec bash'
 } > "$wrapper"
 chmod 0700 "$wrapper"
