@@ -100,6 +100,10 @@ same "name matches a title"         "$(manifest_slots_matching ALPHA)" "1"
 same "name matches a dir basename"  "$(manifest_slots_matching a)" "1"
 same "unknown name matches nothing" "$(manifest_slots_matching zed)" ""
 same "manifest_names"               "$(manifest_names)" "Alpha, B"
+same "manifest_row_for_dir"         "$(manifest_row_for_dir /w/a | cut -f1)" "1"
+same "manifest_row_for_dir, none"   "$(manifest_row_for_dir /w/zz)" ""
+same "transcript_exists"            "$(transcript_exists "$work/a.b" sess-ab-dot && echo y)" "y"
+same "transcript_exists, gone"      "$(transcript_exists "$work/a.b" nope || echo n)" "n"
 same "dash/undash round trip"  "$(undash "$(dash '')")|$(undash "$(dash 'a	b')")" "|a b"
 
 if [ "$fails" -gt 0 ]; then

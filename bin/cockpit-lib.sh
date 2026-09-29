@@ -169,6 +169,18 @@ manifest_slots_matching() {
         tolower($4) == w || tolower($5) == w || tolower(base($3)) == w { print $1 }'
 }
 
+# manifest_row_for_dir prints the row for an absolute dir (the last one, if
+# the same dir holds more than one pane).
+manifest_row_for_dir() {
+    manifest_rows | awk -F'\t' -v d="$1" '$3 == d { row = $0 } END { if (row != "") print row }'
+}
+
+# transcript_exists <abs-dir> <session-id>: that session's transcript is
+# still on disk, so --resume <id> will find it.
+transcript_exists() {
+    [ -f "$HOME/.claude/projects/$(encode_project_dir "$1")/$2.jsonl" ]
+}
+
 # manifest_names lists every name a row answers to, for error messages.
 manifest_names() {
     manifest_rows | awk -F'\t' '

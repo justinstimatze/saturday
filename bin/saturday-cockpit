@@ -127,6 +127,9 @@
 set -euo pipefail
 
 SESSION="${COCKPIT:-cc-cockpit}"
+# an explicit CLAUDE_CMD always wins over a pane's remembered command
+CLAUDE_CMD_EXPLICIT=0
+[ -n "${CLAUDE_CMD:-}" ] && CLAUDE_CMD_EXPLICIT=1
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
 LAYOUT="${COCKPIT_TILE:-tiled}"
 COCKPIT_BACKEND="${COCKPIT_BACKEND:-tmux}"
@@ -242,30 +245,68 @@ add_pane() {
     backend_select_layout
 }
 
-# plan_launches resolves every dir argument before a single pane exists:
-# its absolute path (see abs_dir in cockpit-lib.sh), and under --resume the
-# exact session to resume (resolve_last_session). Fills LAUNCH_DIRS,
-# LAUNCH_CMDS and LAUNCH_NOTES, index-aligned with the arguments. A dir that
-# isn't one, or a --resume with no prior session to find, stops the whole
-# batch here with nothing built. The resume miss used to fall back to a
-# fresh session with one stderr line, which left a pane the user asked to
-# resume looking healthy under the right label while holding an empty
-# session. --allow-fresh ($allow_fresh) brings that fallback back on
-# purpose, for a dir that has genuinely never had a session.
+# plan_launches resolves every argument before a single pane exists. An
+# argument is a dir, or the name of a pane in the manifest (status's NAME
+# column: title, Claude session name, or dir basename), so `--resume docs`
+# finds ~/src/example.org when its session was renamed Docs. For each it settles:
+#   - the absolute dir (abs_dir in cockpit-lib.sh);
+#   - the command: the pane's remembered one (keeping --model,
+#     --remote-control and the like across a cold restart) unless this
+#     call passed claude flags or set CLAUDE_CMD ($reuse_flags);
+#   - the title: its remembered --title or chosen session name;
+#   - under --resume, the session: the pane's own last session if its
+#     transcript still exists, else the newest one started in that dir.
+# Fills LAUNCH_DIRS, LAUNCH_CMDS, LAUNCH_TITLES and LAUNCH_NOTES,
+# index-aligned with the arguments. Any unknown name, non-dir, or --resume
+# with no session to find stops the whole batch with nothing built. The
+# resume miss used to fall back to a fresh session with one stderr line,
+# leaving a pane the user asked to resume looking healthy under the right
+# label while holding an empty session. --allow-fresh ($allow_fresh) brings
+# the fallback back on purpose, for a dir that has never had a session.
 plan_launches() {
-    LAUNCH_DIRS=(); LAUNCH_CMDS=(); LAUNCH_NOTES=()
-    local d abs res sid misses=()
+    LAUNCH_DIRS=(); LAUNCH_CMDS=(); LAUNCH_TITLES=(); LAUNCH_NOTES=()
+    local d abs row slots res sid base title kind rtitle rname rcmd rsid
+    local misses=() bad=0
     for d in "$@"; do
         if ! abs="$(abs_dir "$d")"; then
-            echo "saturday-cockpit: not a directory: $d" >&2
-            exit 1
+            slots="$(manifest_slots_matching "$d")"
+            if [ -z "$slots" ]; then
+                local known
+                known="$(manifest_names)"
+                echo "saturday-cockpit: not a directory or a known pane name: $d${known:+ (known: $known)}" >&2
+                bad=1; continue
+            fi
+            if [ "$(printf '%s\n' "$slots" | wc -l)" -gt 1 ]; then
+                echo "saturday-cockpit: '$d' names more than one pane — pass its dir instead" >&2
+                bad=1; continue
+            fi
+            abs="$(manifest_row_for_slot "$slots" | cut -f3)"
+            if ! abs="$(abs_dir "$abs")"; then
+                echo "saturday-cockpit: '$d' was $(manifest_row_for_slot "$slots" | cut -f3), which is no longer a directory" >&2
+                bad=1; continue
+            fi
+        fi
+        base="$CLAUDE_CMD"; title=""; rsid=""
+        row="$(manifest_row_for_dir "$abs")"
+        if [ -n "$row" ]; then
+            IFS=$'\t' read -r _ kind _ rtitle rname rcmd rsid <<< "$row"
+            rcmd="$(undash "$rcmd")"; rsid="$(undash "$rsid")"
+            if [ "$reuse_flags" -eq 1 ] && [ "$kind" != watch ] && [ -n "$rcmd" ]; then base="$rcmd"; fi
+            title="$(undash "$rtitle")"
+            [ -z "$title" ] && title="$(undash "$rname")"
         fi
         LAUNCH_DIRS+=("$abs")
+        LAUNCH_TITLES+=("$title")
         if [ "$resume" -eq 1 ]; then
+            if [ -n "$rsid" ] && transcript_exists "$abs" "$rsid"; then
+                LAUNCH_CMDS+=("$base --resume $rsid")
+                LAUNCH_NOTES+=("resume $rsid (this pane's last session)")
+                continue
+            fi
             if res="$(resolve_last_session "$abs")"; then
                 sid="${res%%$'\t'*}"
-                LAUNCH_CMDS+=("$CLAUDE_CMD --resume $sid")
-                LAUNCH_NOTES+=("resume $sid (last written ${res#*$'\t'})")
+                LAUNCH_CMDS+=("$base --resume $sid")
+                LAUNCH_NOTES+=("resume $sid (newest in dir, last written ${res#*$'\t'})")
                 continue
             fi
             misses+=("$abs")
@@ -273,8 +314,9 @@ plan_launches() {
         else
             LAUNCH_NOTES+=("fresh session")
         fi
-        LAUNCH_CMDS+=("$CLAUDE_CMD")
+        LAUNCH_CMDS+=("$base")
     done
+    [ "$bad" -eq 1 ] && exit 1
     if [ "${#misses[@]}" -gt 0 ] && [ "$allow_fresh" -eq 0 ]; then
         echo "saturday-cockpit: --resume found no prior session for:" >&2
         printf '  %s\n' "${misses[@]}" >&2
@@ -333,7 +375,11 @@ manifest_refresh() {
         fi
         if [ "$pid" != "-" ]; then
             if v="$(session_field "$pid" sessionId)" && [ -n "$v" ]; then sid="$v"; fi
-            if v="$(session_field "$pid" name)" && [ -n "$v" ]; then name="$(dash "$v")"; fi
+            # only names someone chose (/rename), not generated ones
+            if [ "$(session_field "$pid" nameSource)" = user ] &&
+                v="$(session_field "$pid" name)" && [ -n "$v" ]; then
+                name="$(dash "$v")"
+            fi
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "$kind" "$dir" "$title" "$name" "$cmd" "$sid"
     done < <(backend_pane_details) | manifest_write
@@ -765,6 +811,7 @@ case "${1:-}" in
         if [ "$rc" -eq 1 ]; then
             CLAUDE_CMD="$CLAUDE_CMD --remote-control"
         fi
+        reuse_flags=$(( yolo == 0 && rc == 0 && resume_picker == 0 && CLAUDE_CMD_EXPLICIT == 0 ))
         if [ "$#" -lt 1 ]; then
             echo "usage: saturday-cockpit add [--pellicle] [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
             exit 2
@@ -773,15 +820,17 @@ case "${1:-}" in
             echo "saturday-cockpit: --title only applies to a single <dir> — add panes one at a time to title each" >&2
             exit 2
         fi
+        manifest_refresh
         plan_launches "$@"
         n="$#"; i=0
         for idx in "${!LAUNCH_DIRS[@]}"; do
             i=$((i + 1))
             d="${LAUNCH_DIRS[$idx]}"; dcmd="${LAUNCH_CMDS[$idx]}"
+            dtitle="${title:-${LAUNCH_TITLES[$idx]}}"
             if [ "$pellicle" -eq 1 ]; then
-                add_pane_pellicle "$d" "$dcmd" "$title"
+                add_pane_pellicle "$d" "$dcmd" "$dtitle"
             else
-                add_pane "$d" "$dcmd" "$title"
+                add_pane "$d" "$dcmd" "$dtitle"
             fi
             # Only wait between launches, not after the last one — see
             # wait_pane_settled's comment for why this matters.
@@ -865,6 +914,7 @@ fi
 if [ "$rc" -eq 1 ]; then
     CLAUDE_CMD="$CLAUDE_CMD --remote-control"
 fi
+reuse_flags=$(( yolo == 0 && rc == 0 && resume_picker == 0 && CLAUDE_CMD_EXPLICIT == 0 ))
 
 # --boot (Steel Battalion) is built entirely on respawn-pane, remain-on-exit
 # + #{pane_dead} polling, and a custom-pane-option sync latch — none of
@@ -884,6 +934,19 @@ if [ "$#" -lt 1 ]; then
     if backend_has_session; then
         backend_attach
     fi
+    # `--resume` alone restores the last cockpit from its manifest, in slot
+    # order: every claude pane with its own last session, flags and title.
+    # Pellicle pairs come back as plain panes (the initial launch has no
+    # pellicle path; see --pellicle below).
+    if [ "$resume" -eq 1 ]; then
+        mapfile -t restore_dirs < <(manifest_rows | awk -F'\t' '$2 == "claude" || $2 == "pellicle" { print $3 }')
+        if [ "${#restore_dirs[@]}" -gt 0 ]; then
+            echo "saturday-cockpit: restoring ${#restore_dirs[@]} pane(s) from $(manifest_path)"
+            set -- "${restore_dirs[@]}"
+        fi
+    fi
+fi
+if [ "$#" -lt 1 ]; then
     echo "usage: saturday-cockpit [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit add [--pellicle] [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
@@ -933,7 +996,8 @@ else
     backend_new_session "$first" "$firstcmd"
     firstpane="$(backend_list_pane_ids "$SESSION" | head -1)"
 fi
-remember_pane "$firstpane" claude "$first" "" "$firstcmd"
+if [ -n "${LAUNCH_TITLES[0]}" ]; then backend_set_title "$firstpane" "${LAUNCH_TITLES[0]}"; fi
+remember_pane "$firstpane" claude "$first" "${LAUNCH_TITLES[0]}" "$firstcmd"
 bind_hotkeys
 
 # Remaining dirs → one split each. Re-balance after every split so tmux always
@@ -978,7 +1042,7 @@ for d in "$@"; do
         remember_pane "$newpane" claude "$d" "" "${LAUNCH_CMDS[$i]}"
         if [ "$i" -lt "$n" ]; then sleep 0.35; fi   # panel-by-panel stagger
     else
-        add_pane "$d" "${LAUNCH_CMDS[$i]}"
+        add_pane "$d" "${LAUNCH_CMDS[$i]}" "${LAUNCH_TITLES[$i]}"
         if [ "$i" -lt "$n" ]; then
             newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
             wait_pane_settled "$newpane" 10 ||
