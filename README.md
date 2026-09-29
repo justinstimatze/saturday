@@ -204,7 +204,8 @@ setup — skip both for the core mic-to-tmux-pane loop:
   [statico/ttmux](https://github.com/statico/ttmux) instead of tmux — a
   ground-up multiplexer with native per-pane agent-state marks and
   free-floating, drag-resizable panes. Install with
-  `cargo install --git https://github.com/statico/ttmux`; still beta, so
+  `cargo install --locked --git https://github.com/statico/ttmux --tag v0.6.4`
+  (the release the backend was last checked against); still beta, so
   this is personal-dogfood territory and off by default — tmux stays the
   supported path. `--boot` (the Steel Battalion launch ritual) is tmux-only
   either way; `bin/cockpit-backend-ttmux.sh`'s header lists everything

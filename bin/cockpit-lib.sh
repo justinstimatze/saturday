@@ -19,9 +19,30 @@ abs_dir() {
 # ~/.cache becomes --cache. The encoding is lossy (a.b and a-b share a
 # name), so resolve_last_session checks each transcript's recorded cwd
 # rather than trusting the name alone.
+#
+# Claude Code does this with a JavaScript regex over the path string, so it
+# counts UTF-16 code units: é is one '-', an emoji (outside the BMP) is two.
+# An ASCII path takes the fast path; anything else is walked per character
+# under a UTF-8 locale. If no UTF-8 locale is installed the walk degrades
+# to per-byte, which only misencodes non-ASCII dirs.
 encode_project_dir() {
     local LC_ALL=C
-    printf '%s\n' "${1//[^A-Za-z0-9-]/-}"
+    if [[ "$1" != *[^[:print:]]* ]]; then   # C locale: any byte >= 0x80 is non-print
+        printf '%s\n' "${1//[^A-Za-z0-9-]/-}"
+        return
+    fi
+    LC_ALL=C.UTF-8
+    local out="" ch i cp
+    for ((i = 0; i < ${#1}; i++)); do
+        ch="${1:i:1}"
+        if [[ "$ch" == [A-Za-z0-9-] ]]; then
+            out+="$ch"
+        else
+            printf -v cp '%d' "'$ch"
+            if ((cp > 0xFFFF)); then out+="--"; else out+="-"; fi
+        fi
+    done
+    printf '%s\n' "$out"
 }
 
 # transcript_cwd prints the first "cwd" a transcript records — the dir its
@@ -34,16 +55,21 @@ transcript_cwd() {
     printf '%s\n' "${cwd%\"}"
 }
 
-# resolve_last_session prints "<session-id><TAB><last-written>" for the
-# newest transcript that was started in $1, or fails if there is none.
+# resolve_last_session <dir> [<taken-id> ...] prints
+# "<session-id><TAB><last-written>" for the newest transcript that was
+# started in <dir> and isn't one of the taken ids (sessions another pane
+# already holds), or fails if there is none.
 resolve_last_session() {
-    local abs projdir f
+    local abs projdir f sid
     abs="$(abs_dir "$1")" || return 1
+    shift
     projdir="$HOME/.claude/projects/$(encode_project_dir "$abs")"
     [ -d "$projdir" ] || return 1
     while IFS= read -r f; do
+        sid="$(basename "$f" .jsonl)"
+        [[ " $* " == *" $sid "* ]] && continue
         [ "$(transcript_cwd "$f")" = "$abs" ] || continue
-        printf '%s\t%s\n' "$(basename "$f" .jsonl)" "$(date -r "$f" '+%F %H:%M')"
+        printf '%s\t%s\n' "$sid" "$(date -r "$f" '+%F %H:%M')"
         return 0
     done < <(find "$projdir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null |
         sort -rn | cut -d' ' -f2-)
@@ -125,9 +151,11 @@ session_field() {
 # the session's own name from Claude Code (/rename); cmd is the launch
 # command minus any --resume. Tab-separated, "-" for an empty field (bash's
 # read collapses consecutive tabs, so an empty field would shift the rest).
-# Rewritten from the live panes on launch, add, status and stop, which also
-# means a pane closed on its own drops out at the next refresh. After a
-# crash or reboot the file holds whatever the last refresh saw.
+# A snapshot of the live panes' own tags (tag_pane in bin/saturday-cockpit),
+# retaken on launch, add, watch, restart, status and stop, so a pane closed
+# on its own drops out at the next refresh. After a crash or reboot the file
+# holds whatever the last refresh saw. kind strip (a pellicle render strip)
+# never gets a row.
 
 manifest_path() {
     printf '%s/saturday-cockpit/%s.tsv\n' "${XDG_STATE_HOME:-$HOME/.local/state}" "$SESSION"
@@ -146,7 +174,8 @@ manifest_row_for_slot() {
 }
 
 # manifest_write replaces the manifest with the rows on stdin, sorted by
-# slot, via a temp file so a reader never sees half a file.
+# slot, via a temp file so a reader never sees half a file. An unchanged
+# snapshot leaves the file (and its mtime) alone.
 manifest_write() {
     local p tmp
     p="$(manifest_path)"
@@ -155,7 +184,8 @@ manifest_write() {
     {
         printf '# slot\tkind\tdir\ttitle\tname\tcmd\tlast_sid  (saturday-cockpit pane manifest)\n'
         sort -t$'\t' -k1,1n
-    } >"$tmp" && mv "$tmp" "$p"
+    } >"$tmp" || { rm -f "$tmp"; return 1; }
+    if cmp -s "$tmp" "$p"; then rm -f "$tmp"; else mv "$tmp" "$p"; fi
 }
 
 # manifest_slots_matching prints the slot of every row whose title, Claude
@@ -169,10 +199,12 @@ manifest_slots_matching() {
         tolower($4) == w || tolower($5) == w || tolower(base($3)) == w { print $1 }'
 }
 
-# manifest_row_for_dir prints the row for an absolute dir (the last one, if
-# the same dir holds more than one pane).
+# manifest_row_for_dir prints the claude or pellicle row for an absolute
+# dir (the last one, if the same dir holds more than one). A watch pane in
+# the same dir never answers: its command and title aren't a claude's.
 manifest_row_for_dir() {
-    manifest_rows | awk -F'\t' -v d="$1" '$3 == d { row = $0 } END { if (row != "") print row }'
+    manifest_rows | awk -F'\t' -v d="$1" '$3 == d && ($2 == "claude" || $2 == "pellicle") { row = $0 }
+        END { if (row != "") print row }'
 }
 
 # transcript_exists <abs-dir> <session-id>: that session's transcript is

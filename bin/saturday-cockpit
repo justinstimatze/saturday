@@ -187,6 +187,8 @@ CLAUDE_CMD_EXPLICIT=0
 [ -n "${CLAUDE_CMD:-}" ] && CLAUDE_CMD_EXPLICIT=1
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
 LAYOUT="${COCKPIT_TILE:-tiled}"
+LAST_PANE=""    # set by add_pane / add_pane_pellicle
+PLAN_SLOTS=()   # per-argument manifest slot for plan_launches (bare --resume)
 COCKPIT_BACKEND="${COCKPIT_BACKEND:-tmux}"
 
 case "$COCKPIT_BACKEND" in
@@ -279,6 +281,8 @@ ensure_pane_slots() {
         [ -z "$pane_id" ] && continue
         existing="$(backend_get_slot "$pane_id")"
         [ -n "$existing" ] && continue
+        # a pellicle render strip belongs to the claude pane under it
+        [ "$(backend_get_meta "$pane_id" kind)" = strip ] && continue
         backend_set_slot "$pane_id" "$(next_free_slot)"
     done < <(backend_list_pane_ids "$SESSION")
 }
@@ -289,6 +293,9 @@ ensure_pane_slots() {
 # responsible for wait_pane_settled-ing between calls (see wait_pane_settled
 # above for why) — add_pane itself stays a single, fast, unconditional split
 # so callers that only ever add one pane at a time pay no extra latency.
+# Sets LAST_PANE to the new pane's id: pane-listing order isn't creation
+# order once a second window (a watch pane) exists, so callers must not
+# re-derive it with list-panes | tail.
 add_pane() {
     local dir="$1" cmd="${2:-$CLAUDE_CMD}" title="${3:-}"
     local pane_id
@@ -296,8 +303,9 @@ add_pane() {
     backend_set_dir "$pane_id" "$dir"
     [ -n "$title" ] && backend_set_title "$pane_id" "$title"
     backend_set_slot "$pane_id" "$(next_free_slot)"
-    remember_pane "$pane_id" claude "$dir" "$title" "$cmd"
+    tag_pane "$pane_id" claude "$dir" "$cmd"
     backend_select_layout
+    LAST_PANE="$pane_id"
 }
 
 # plan_launches resolves every argument before a single pane exists. An
@@ -310,7 +318,12 @@ add_pane() {
 #     call passed claude flags or set CLAUDE_CMD ($reuse_flags);
 #   - the title: its remembered --title or chosen session name;
 #   - under --resume, the session: the pane's own last session if its
-#     transcript still exists, else the newest one started in that dir.
+#     transcript still exists, else the newest one started in that dir
+#     that no live pane and no earlier argument already holds (two claudes
+#     on one session would write over each other's transcript).
+# The remembered row is the named pane's own (by slot) when the argument is
+# a name or a restore (PLAN_SLOTS[k], set by bare --resume); for a plain dir
+# it's the last claude or pellicle row in that dir, never a watch pane's.
 # Fills LAUNCH_DIRS, LAUNCH_CMDS, LAUNCH_TITLES and LAUNCH_NOTES,
 # index-aligned with the arguments. Any unknown name, non-dir, or --resume
 # with no session to find stops the whole batch with nothing built. The
@@ -320,10 +333,27 @@ add_pane() {
 # the fallback back on purpose, for a dir that has never had a session.
 plan_launches() {
     LAUNCH_DIRS=(); LAUNCH_CMDS=(); LAUNCH_TITLES=(); LAUNCH_NOTES=()
-    local d abs row slots res sid base title kind rtitle rname rcmd rsid
-    local misses=() bad=0
+    local d abs row slots slot res sid base title kind rtitle rname rcmd rsid k=-1
+    local misses=() bad=0 taken=()
+    # sessions live panes hold (the manifest is live while a session runs)
+    if backend_has_session; then
+        mapfile -t taken < <(manifest_rows | awk -F'\t' '$7 != "-" { print $7 }')
+    fi
+    # a restore's own sessions are spoken for before any pane falls back
+    local reserved=() rs
+    for rs in "${PLAN_SLOTS[@]}"; do
+        rs="$(manifest_row_for_slot "$rs" | cut -f7)"
+        [ -n "$rs" ] && [ "$rs" != "-" ] && reserved+=("$rs")
+    done
     for d in "$@"; do
-        if ! abs="$(abs_dir "$d")"; then
+        k=$((k + 1))
+        slot="${PLAN_SLOTS[$k]:-}"
+        if [ -n "$slot" ]; then
+            if ! abs="$(abs_dir "$d")"; then
+                echo "saturday-cockpit: slot $slot's dir $d is no longer a directory" >&2
+                bad=1; continue
+            fi
+        elif ! abs="$(abs_dir "$d")"; then
             slots="$(manifest_slots_matching "$d")"
             if [ -z "$slots" ]; then
                 local known
@@ -335,14 +365,19 @@ plan_launches() {
                 echo "saturday-cockpit: '$d' names more than one pane — pass its dir instead" >&2
                 bad=1; continue
             fi
-            abs="$(manifest_row_for_slot "$slots" | cut -f3)"
+            slot="$slots"
+            abs="$(manifest_row_for_slot "$slot" | cut -f3)"
             if ! abs="$(abs_dir "$abs")"; then
-                echo "saturday-cockpit: '$d' was $(manifest_row_for_slot "$slots" | cut -f3), which is no longer a directory" >&2
+                echo "saturday-cockpit: '$d' was $(manifest_row_for_slot "$slot" | cut -f3), which is no longer a directory" >&2
                 bad=1; continue
             fi
         fi
         base="$CLAUDE_CMD"; title=""; rsid=""
-        row="$(manifest_row_for_dir "$abs")"
+        if [ -n "$slot" ]; then
+            row="$(manifest_row_for_slot "$slot")"
+        else
+            row="$(manifest_row_for_dir "$abs")"
+        fi
         if [ -n "$row" ]; then
             IFS=$'\t' read -r _ kind _ rtitle rname rcmd rsid <<< "$row"
             rcmd="$(undash "$rcmd")"; rsid="$(undash "$rsid")"
@@ -353,13 +388,16 @@ plan_launches() {
         LAUNCH_DIRS+=("$abs")
         LAUNCH_TITLES+=("$title")
         if [ "$resume" -eq 1 ]; then
-            if [ -n "$rsid" ] && transcript_exists "$abs" "$rsid"; then
+            if [ -n "$rsid" ] && transcript_exists "$abs" "$rsid" &&
+                [[ " ${taken[*]} " != *" $rsid "* ]]; then
+                taken+=("$rsid")
                 LAUNCH_CMDS+=("$base --resume $rsid")
                 LAUNCH_NOTES+=("resume $rsid (this pane's last session)")
                 continue
             fi
-            if res="$(resolve_last_session "$abs")"; then
+            if res="$(resolve_last_session "$abs" "${taken[@]}" "${reserved[@]}")"; then
                 sid="${res%%$'\t'*}"
+                taken+=("$sid")
                 LAUNCH_CMDS+=("$base --resume $sid")
                 LAUNCH_NOTES+=("resume $sid (newest in dir, last written ${res#*$'\t'})")
                 continue
@@ -389,35 +427,33 @@ print_launch_summary() {
     done
 }
 
-# remember_pane <pane_id> <kind> <dir> <title> <cmd> records what this run
-# launched into a pane, so the next manifest_refresh writes a fresh row for
-# it instead of inheriting whatever an earlier pane in the same slot left.
-declare -A NEW_PANE_META=()
-remember_pane() {
-    NEW_PANE_META[$1]="$(dash "$2")"$'\t'"$(dash "$3")"$'\t'"$(dash "$4")"$'\t'"$(dash "$(strip_resume "$5")")"$'\t'"$(dash "$(resume_id "$5")")"
+# tag_pane <pane_id> <kind> <dir> <cmd> records on the pane itself what the
+# cockpit launched into it: kind (claude, pellicle, watch, or strip for a
+# pellicle render strip), dir, the command minus any --resume, and the
+# session id it resumed. Stored as pane options (a sidecar under ttmux), so
+# it lives and dies with the pane and no other pane can inherit it. The
+# title is set separately (backend_set_title), only when there is one.
+tag_pane() {
+    backend_set_meta "$1" kind "$2"
+    backend_set_meta "$1" dir "$3"
+    backend_set_meta "$1" cmd "$(strip_resume "$4")"
+    backend_set_meta "$1" sid "$(resume_id "$4")"
 }
 
-# manifest_refresh rewrites the manifest (cockpit-lib.sh) from the live
-# panes. Per slotted pane, the row comes from, in order: remember_pane for a
-# pane this run created; the existing row for that slot; or, for a pane no
-# manifest has seen (a cockpit started before the manifest existed), its
-# own start command and @cockpit_title. The session id and name are then
-# refreshed from the pane's Claude Code session record when it has one.
+# manifest_refresh rewrites the manifest (cockpit-lib.sh) as a snapshot of
+# the live slotted panes, from each pane's own tags. The session id and name
+# are refreshed from the pane's Claude Code session record when it has one;
+# a name with no live record is kept from that slot's previous row if it
+# was the same dir. A pane with no tags (started by a cockpit from before
+# tagging) is adopted once, from its start command and session record, and
+# tagged, so it never needs guessing again.
 manifest_refresh() {
-    local pane slot pid dead start cwd ptitle meta row kind dir title name cmd sid v
-    while IFS=$'\t' read -r pane slot pid dead start cwd ptitle; do
+    local pane slot pid dead start cwd title kind dir cmd sid name v prev
+    while IFS=$'\t' read -r pane slot pid dead start cwd title kind dir cmd sid; do
         [ "$slot" = "-" ] && continue
-        meta="${NEW_PANE_META[$pane]:-}"
-        row="$(manifest_row_for_slot "$slot")"
-        if [ -n "$meta" ]; then
-            IFS=$'\t' read -r kind dir title cmd sid <<< "$meta"
-            name=-
-        elif [ -n "$row" ]; then
-            IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
-        else
-            kind=claude; name=-
-            sid="$(dash "$(resume_id "$(start_cmd_cmd "$start")")")"
-            title="$ptitle"
+        [ "$kind" = strip ] && continue
+        if [ "$kind" = "-" ]; then
+            kind=claude
             # older cockpits baked relative dirs into start commands, so
             # only trust an absolute one; else the session's own cwd
             dir="$(start_cmd_dir "$start")"
@@ -425,9 +461,13 @@ manifest_refresh() {
                 dir="$( [ "$pid" != "-" ] && session_field "$pid" cwd)" || dir=""
                 [[ "$dir" == /* ]] || dir="$(undash "$cwd")"
             fi
+            v="$(start_cmd_cmd "$start")"
+            tag_pane "$pane" "$kind" "$dir" "$v"
             dir="$(dash "$dir")"
-            cmd="$(dash "$(strip_resume "$(start_cmd_cmd "$start")")")"
+            cmd="$(dash "$(strip_resume "$v")")"
+            sid="$(dash "$(resume_id "$v")")"
         fi
+        name=-
         if [ "$pid" != "-" ]; then
             if v="$(session_field "$pid" sessionId)" && [ -n "$v" ]; then sid="$v"; fi
             # only names someone chose (/rename), not generated ones
@@ -435,6 +475,10 @@ manifest_refresh() {
                 v="$(session_field "$pid" name)" && [ -n "$v" ]; then
                 name="$(dash "$v")"
             fi
+        fi
+        if [ "$name" = "-" ] && prev="$(manifest_row_for_slot "$slot")" && [ -n "$prev" ] &&
+            [ "$(cut -f3 <<< "$prev")" = "$dir" ]; then
+            name="$(cut -f5 <<< "$prev")"
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "$kind" "$dir" "$title" "$name" "$cmd" "$sid"
     done < <(backend_pane_details) | manifest_write
@@ -506,15 +550,13 @@ pane_detail() {
 # waits COCKPIT_RESTART_DELAY seconds (default 5) for the current turn to
 # finish first.
 restart_pane() {
-    local pane="$1" detail pid dead start slot row kind dir title name cmd sid res full
-    detail="$(pane_detail "$pane")"
-    IFS=$'\t' read -r _ slot pid dead start _ _ <<< "$detail"
-    row="$(manifest_row_for_slot "$slot")"
-    if [ -z "$row" ]; then
-        echo "saturday-cockpit: $pane has no manifest row (not a cockpit pane?)" >&2
+    local pane="$1" slot pid kind dir cmd sid res full
+    # manifest_refresh (run by the caller) has tagged every slotted pane
+    IFS=$'\t' read -r _ slot pid _ _ _ _ kind dir cmd sid <<< "$(pane_detail "$pane")"
+    if [ "$slot" = "-" ] || [ "$kind" = "-" ] || [ "$kind" = strip ]; then
+        echo "saturday-cockpit: $pane isn't a cockpit pane (no slot or launch record)" >&2
         return 1
     fi
-    IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
     dir="$(undash "$dir")"; cmd="$(undash "$cmd")"; sid="$(undash "$sid")"
     if [ -z "$dir" ] || [ -z "$cmd" ]; then
         echo "saturday-cockpit: don't know how $pane was launched (dir '$dir', cmd '$cmd')" >&2
@@ -535,7 +577,7 @@ restart_pane() {
         run="$cmd --resume $sid"
     fi
     full="cd '$dir' && exec $run"
-    remember_pane "$pane" "$kind" "$dir" "$(undash "$title")" "$run"
+    tag_pane "$pane" "$kind" "$dir" "$run"
 
     if [ "$pane" = "${TMUX_PANE:-}" ]; then
         local statedir log script
@@ -594,7 +636,7 @@ add_watch_pane() {
     fi
     backend_set_slot "$pane" "$(next_free_slot)"
     backend_set_title "$pane" "$name"
-    remember_pane "$pane" watch "$dir" "$name" "$cmd"
+    tag_pane "$pane" watch "$dir" "$cmd"
     echo "saturday-cockpit: watching '$name' in $where, slot $(backend_get_slot "$pane") ($pane). Focus unchanged."
 }
 
@@ -622,22 +664,25 @@ pane_state() {
 # tmux's own pane index is unrelated to it and deliberately not shown.
 cockpit_status() {
     manifest_refresh
-    local pane slot pid dead start cwd ptitle row kind dir title name cmd sid label
+    local pane slot pid dead start cwd title kind dir cmd sid name label details
+    local -A names=() sids=()
+    while IFS=$'\t' read -r slot _ _ _ name _ sid; do
+        names[$slot]="$name"; sids[$slot]="$sid"
+    done < <(manifest_rows)
+    details="$(backend_pane_details)"
     {
         printf 'SLOT\tNAME\tSTATE\tDIR\tSESSION\tPANE\n'
-        while IFS=$'\t' read -r pane slot pid dead start cwd ptitle; do
-            kind=-; dir=-; title=-; name=-; sid=-
-            if [ "$slot" != "-" ] && row="$(manifest_row_for_slot "$slot")" && [ -n "$row" ]; then
-                IFS=$'\t' read -r _ kind dir title name cmd sid <<< "$row"
-            fi
+        while IFS=$'\t' read -r pane slot pid dead start cwd title kind dir cmd sid; do
             [ "$dir" = "-" ] && dir="$cwd"
+            # the manifest's sid is the live session record's, fresher than the tag
+            sid="$(undash "${sids[$slot]:-$sid}")"
             label="$(undash "$title")"
-            [ -z "$label" ] && label="$(undash "$name")"
+            [ -z "$label" ] && label="$(undash "${names[$slot]:-}")"
             [ -z "$label" ] && [ "$dir" != "-" ] && label="$(basename "$dir")"
             printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "${label:--}" \
                 "$(pane_state "$pane" "$pid" "$dead" "$kind")" "${dir/#$HOME/\~}" "${sid:0:8}" "$pane"
-        done < <(backend_pane_details | awk -F'\t' '$2 != "-"' | sort -t$'\t' -k2,2n
-                 backend_pane_details | awk -F'\t' '$2 == "-"')
+        done < <(awk -F'\t' '$2 != "-"' <<< "$details" | sort -t$'\t' -k2,2n
+                 awk -F'\t' '$2 == "-"' <<< "$details")
     } | column -t -s $'\t'
 }
 
@@ -767,17 +812,20 @@ add_pane_pellicle() {
     backend_set_dir "$claude_pane_id" "$dir"
     [ -n "$title" ] && backend_set_title "$claude_pane_id" "$title"
     backend_set_slot "$claude_pane_id" "$(next_free_slot)"
-    remember_pane "$claude_pane_id" pellicle "$dir" "$title" "$cmd"
+    tag_pane "$claude_pane_id" pellicle "$dir" "$cmd"
 
     local watch_cmd
     watch_cmd="watch -n 1 --no-title $(printf '%q' "$pellicle_dir/pellicle-pane-render.sh") $(printf '%q' "$dir")"
 
     local render_pane_id
     render_pane_id="$(backend_split_strip "$claude_pane_id" "$dir" "$watch_cmd" 3)"
+    # no slot and no manifest row: it's part of the pair, restored with it
+    backend_set_meta "$render_pane_id" kind strip
     echo "$render_pane_id" > "$dir/.pellicle-pane"
 
     backend_select_pane "$claude_pane_id"
     backend_select_layout
+    LAST_PANE="$claude_pane_id"
 }
 
 # Alt+1..9: jump straight to the pane holding slot N, zoomed full-screen —
@@ -844,7 +892,7 @@ case "${1:-}" in
         else
             # ctrl+z in a cockpit pane: claude prints "Run `fg`", but the
             # pane has no shell to run it in. SIGCONT is what fg would send.
-            IFS=$'\t' read -r _ slot pid _ _ _ _ <<< "$(pane_detail "$pane")"
+            IFS=$'\t' read -r _ slot pid _ <<< "$(pane_detail "$pane")"
             kill -CONT "$pid"
             echo "saturday-cockpit: sent SIGCONT to slot $slot ($pane, pid $pid)."
         fi
@@ -958,8 +1006,7 @@ case "${1:-}" in
             # Only wait between launches, not after the last one — see
             # wait_pane_settled's comment for why this matters.
             if [ "$i" -lt "$n" ]; then
-                newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
-                wait_pane_settled "$newpane" 10 ||
+                wait_pane_settled "$LAST_PANE" 10 ||
                     echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
             fi
         done
@@ -1059,15 +1106,22 @@ if [ "$#" -lt 1 ]; then
         backend_attach
     fi
     # `--resume` alone restores the last cockpit from its manifest, in slot
-    # order: every claude pane with its own last session, flags and title.
-    # Pellicle pairs come back as plain panes (the initial launch has no
-    # pellicle path; see --pellicle below).
+    # order: every claude pane with its own last session, flags and title
+    # (PLAN_SLOTS pins each to its own row, so two panes in one dir stay
+    # two sessions). Pellicle pairs come back as plain panes (the initial
+    # launch has no pellicle path; see --pellicle below). Watch panes come
+    # back after the build, under tmux only.
     if [ "$resume" -eq 1 ]; then
         mapfile -t restore_watch < <(manifest_rows | awk -F'\t' '$2 == "watch"')
         mapfile -t restore_dirs < <(manifest_rows | awk -F'\t' '$2 == "claude" || $2 == "pellicle" { print $3 }')
+        mapfile -t PLAN_SLOTS < <(manifest_rows | awk -F'\t' '$2 == "claude" || $2 == "pellicle" { print $1 }')
         if [ "${#restore_dirs[@]}" -gt 0 ]; then
             echo "saturday-cockpit: restoring ${#restore_dirs[@]} pane(s) from $(manifest_path)"
             set -- "${restore_dirs[@]}"
+        fi
+        if [ "${#restore_watch[@]}" -gt 0 ] && [ "$COCKPIT_BACKEND" != tmux ]; then
+            echo "saturday-cockpit: skipping ${#restore_watch[@]} watch pane(s) — watch needs the tmux backend" >&2
+            restore_watch=()
         fi
     fi
 fi
@@ -1118,11 +1172,10 @@ if [ "$boot" -eq 1 ]; then
         "cd '$first' && exec $(stub_cmd_for "$first" main "" "$prim_delay")")"
     tmux set-option -t "$SESSION" remain-on-exit on
 else
-    backend_new_session "$first" "$firstcmd"
-    firstpane="$(backend_list_pane_ids "$SESSION" | head -1)"
+    firstpane="$(backend_new_session "$first" "$firstcmd")"
 fi
 if [ -n "${LAUNCH_TITLES[0]}" ]; then backend_set_title "$firstpane" "${LAUNCH_TITLES[0]}"; fi
-remember_pane "$firstpane" claude "$first" "${LAUNCH_TITLES[0]}" "$firstcmd"
+tag_pane "$firstpane" claude "$first" "$firstcmd"
 bind_hotkeys
 
 # Remaining dirs → one split each. Re-balance after every split so tmux always
@@ -1139,11 +1192,10 @@ bind_hotkeys
 # can't occur — instrument panels instead assemble on their own ~350ms
 # stagger (boot_edge_split + the sleep below), which is the ritual's
 # panel-by-panel beat, not a settle-wait. Real commands were already
-# resolved above/below via resolved_cmd_for and are only exec'd later, in
+# resolved by plan_launches (LAUNCH_CMDS) and are only exec'd later, in
 # the respawn-stagger loop, where the real settle-wait protection is still
 # very much needed and still applied (with a shorter timeout).
 if [ "$boot" -eq 0 ] && [ "$#" -gt 0 ]; then
-    firstpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
     wait_pane_settled "$firstpane" 10 ||
         echo "saturday-cockpit: warning: $first's pane didn't settle within 10s, continuing anyway" >&2
 fi
@@ -1164,13 +1216,13 @@ for d in "$@"; do
         boot_dirs+=("$d")
         boot_cmds+=("${LAUNCH_CMDS[$i]}")
         boot_pane_ids+=("$newpane")
-        remember_pane "$newpane" claude "$d" "" "${LAUNCH_CMDS[$i]}"
+        if [ -n "${LAUNCH_TITLES[$i]}" ]; then backend_set_title "$newpane" "${LAUNCH_TITLES[$i]}"; fi
+        tag_pane "$newpane" claude "$d" "${LAUNCH_CMDS[$i]}"
         if [ "$i" -lt "$n" ]; then sleep 0.35; fi   # panel-by-panel stagger
     else
         add_pane "$d" "${LAUNCH_CMDS[$i]}" "${LAUNCH_TITLES[$i]}"
         if [ "$i" -lt "$n" ]; then
-            newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
-            wait_pane_settled "$newpane" 10 ||
+            wait_pane_settled "$LAST_PANE" 10 ||
                 echo "saturday-cockpit: warning: $d's pane didn't settle within 10s, continuing anyway" >&2
         fi
     fi

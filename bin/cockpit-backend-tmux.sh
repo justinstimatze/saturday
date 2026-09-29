@@ -31,9 +31,10 @@ backend_has_session() { tmux has-session -t "$SESSION" 2>/dev/null; }
 backend_kill_session() { tmux kill-session -t "$SESSION"; }
 backend_attach() { exec tmux attach-session -t "$SESSION"; }
 
+# backend_new_session prints the first pane's id.
 backend_new_session() {
     local dir="$1" cmd="$2"
-    tmux new-session -d -s "$SESSION" -n "cockpit" "cd '$dir' && exec $cmd"
+    tmux new-session -d -s "$SESSION" -n "cockpit" -P -F '#{pane_id}' "cd '$dir' && exec $cmd"
 }
 
 backend_list_pane_ids() {
@@ -43,16 +44,23 @@ backend_list_pane_ids() {
 
 # backend_pane_details: one tab-separated row per pane in the session, every
 # window (-s), empty values as "-" (see the manifest note in cockpit-lib.sh):
-#   pane_id slot pid dead start_command cwd title
+#   pane_id slot pid dead start_command cwd title kind dir cmd sid
+# kind/dir/cmd/sid are what the cockpit launched into the pane (tag_pane in
+# bin/saturday-cockpit); a pane from an older cockpit has none until
+# manifest_refresh adopts it.
 backend_pane_details() {
-    tmux list-panes -s -t "$SESSION" -F \
-        "#{pane_id}	#{?@cockpit_slot,#{@cockpit_slot},-}	#{pane_pid}	#{pane_dead}	#{?pane_start_command,#{pane_start_command},-}	#{pane_current_path}	#{?@cockpit_title,#{@cockpit_title},-}"
+    local f='#{pane_id}	#{?@cockpit_slot,#{@cockpit_slot},-}	#{pane_pid}	#{pane_dead}	#{?pane_start_command,#{pane_start_command},-}	#{pane_current_path}	#{?@cockpit_title,#{@cockpit_title},-}' k
+    for k in kind dir cmd sid; do f+="	#{?@cockpit_$k,#{@cockpit_$k},-}"; done
+    tmux list-panes -s -t "$SESSION" -F "$f"
 }
 
 backend_pane_count() { tmux list-panes -s -t "$SESSION" | wc -l; }
 
+# A session target means the cockpit's first window (^), not whichever
+# window is active: a watch pane may have one of its own.
 backend_split() {
     local target="$1" dir="$2" cmd="$3"
+    [ "$target" = "$SESSION" ] && target="$SESSION:^"
     tmux split-window -t "$target" -P -F '#{pane_id}' "cd '$dir' && exec $cmd"
 }
 
@@ -72,7 +80,7 @@ backend_capture() { tmux capture-pane -t "$1" -p 2>/dev/null; }
 backend_respawn() { tmux respawn-pane -k -t "$1" "$2"; }
 backend_pane_dead() { [ "$(tmux display-message -p -t "$1" '#{pane_dead}' 2>/dev/null)" = "1" ]; }
 
-backend_select_layout() { tmux select-layout -t "$SESSION" "$LAYOUT" >/dev/null; }
+backend_select_layout() { tmux select-layout -t "$SESSION:^" "$LAYOUT" >/dev/null; }
 backend_select_pane() { tmux select-pane -t "$1"; }
 
 backend_used_slots() {
@@ -81,6 +89,10 @@ backend_used_slots() {
 backend_get_slot() { tmux show-options -pqv -t "$1" @cockpit_slot 2>/dev/null || true; }
 backend_set_slot() { tmux set-option -p -t "$1" @cockpit_slot "$2"; }
 backend_set_title() { tmux set-option -p -t "$1" @cockpit_title "$2"; }
+# backend_set_meta / backend_get_meta <pane> <key> [<value>]: the pane's
+# @cockpit_<key> option (kind, dir, cmd, sid). Dropped with the pane.
+backend_set_meta() { tmux set-option -p -t "$1" "@cockpit_$2" "$3"; }
+backend_get_meta() { tmux show-options -pqv -t "$1" "@cockpit_$2" 2>/dev/null || true; }
 # ttmux backend needs this (no cwd exposed via its list-panes); tmux's own
 # live #{b:pane_current_path} ternary already covers the fallback case, so
 # there's nothing for this backend to store.

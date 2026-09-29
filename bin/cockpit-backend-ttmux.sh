@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cockpit-backend-ttmux.sh — ttmux (https://github.com/statico/ttmux) backend
-# for bin/saturday-cockpit. Beta software as of v0.3.1 (2026-09-12) — this
+# for bin/saturday-cockpit. Beta software as of v0.6.4 (2026-09-20) — this
 # backend is opt-in (COCKPIT_BACKEND=ttmux) and not the default for exactly
 # that reason.
 #
@@ -32,10 +32,10 @@
 #     same way tmux behaves *without* that hook — what's missing is only
 #     the snap-back-to-even step, not space reclamation itself. Accepted
 #     limitation, not solved here.
-#   - `status`'s columns are reduced: ttmux's list-panes exposes
+#   - `status` shows less: ttmux's list-panes exposes
 #     id/title/width/height/active/window, no pid and no cwd, so
-#     backend_list_panes_status prints "id title" instead of tmux's
-#     "id pid cwd".
+#     backend_pane_details fills those from the sidecar or leaves them "-",
+#     and STATE can't read a pane's Claude Code session record.
 #
 # --boot is not implemented here at all — the Steel Battalion ritual is
 # built on respawn-pane, remain-on-exit + #{pane_dead} polling, and a
@@ -43,8 +43,9 @@
 # in bin/saturday-cockpit's --boot branch refuses before any backend call
 # happens, so nothing below needs to handle it.
 #
-# Verified live against a real build (ttmux 0.3.1, cargo install --git)
-# this session: list-sessions/list-panes JSON shape, split-window's return
+# First verified live against ttmux 0.3.1; re-run against 0.6.4 (launch,
+# add --title, status, the watch/restart refusals, stop) with no changes
+# needed. Checked originally: list-sessions/list-panes JSON shape, split-window's return
 # value and COMMAND-string form, rename-pane's effect on list-panes' title
 # field, select-layout, set-option on a keys.* binding and reading it back,
 # resize-pane -Z, and the has-session-via-exit-code substitute (list-panes
@@ -56,7 +57,7 @@
 
 backend_require() {
     if ! command -v ttmux >/dev/null 2>&1; then
-        echo "saturday-cockpit: ttmux not installed (cargo install --git https://github.com/statico/ttmux)." >&2
+        echo "saturday-cockpit: ttmux not installed (cargo install --locked --git https://github.com/statico/ttmux --tag v0.6.4)." >&2
         exit 1
     fi
     export TTMUX_SESSION="$SESSION"
@@ -89,6 +90,7 @@ backend_new_session() {
     # add_pane/add_pane_pellicle call backend_set_dir themselves — this pane
     # is created directly, bypassing both, so nothing else will.
     backend_set_dir "$first" "$dir"
+    echo "$first"
 }
 
 # $1 is accepted-but-ignored — ttmux has no cross-session listing; the
@@ -100,14 +102,14 @@ backend_list_pane_ids() {
     ttmux list-panes --json | jq -r '.panes[].id'
 }
 
-# Reduced columns vs. tmux (id pid cwd) — ttmux's list-panes has no pid or
-# cwd field at all. See file header.
 # backend_pane_details: same columns as the tmux backend's, from the slot
-# sidecar. ttmux exposes no pid, dead flag, start command or cwd, so those
-# come back as "-"/0 and the cockpit's status shows less under this backend.
+# sidecar. ttmux exposes no pid, dead flag or start command, so those come
+# back as "-"/0, and cwd is the dir the pane was launched in.
 backend_pane_details() {
     _ttmux_sidecar_load_pruned | jq -r 'to_entries[] |
-        [.key, (.value.slot // "-"), "-", "0", "-", (.value.dir // "-"), (.value.title // "-")] | @tsv'
+        [.key, (.value.slot // "-"), "-", "0", "-", (.value.dir // "-"), (.value.title // "-"),
+         (.value.kind // "-"), (.value.dir // "-"), (.value.cmd // "-"), (.value.sid // "-")]
+        | map(if . == "" then "-" else . end) | @tsv'
 }
 
 backend_pane_count() { ttmux list-panes --json | jq '.panes | length'; }
@@ -225,6 +227,8 @@ backend_set_title() { _ttmux_sidecar_set_field "$1" title "$2"; }
 # basename instead of ttmux's own process-title default ("bash", a shell
 # prompt string, ...).
 backend_set_dir() { _ttmux_sidecar_set_field "$1" dir "$2"; }
+backend_set_meta() { _ttmux_sidecar_set_field "$1" "$2" "$3"; }
+backend_get_meta() { _ttmux_sidecar_load_pruned | jq -r --arg p "$1" --arg k "$2" '.[$p][$k] // empty'; }
 
 # ---- hotkeys / border labels ---------------------------------------------
 #

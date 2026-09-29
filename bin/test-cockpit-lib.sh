@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-cockpit-lib.sh — fixture tests for bin/cockpit-lib.sh. Builds a fake
 # $HOME with ~/.claude/projects/ entries shaped like Claude Code's own, so
-# no real transcripts are read. Run via `make test`, or directly.
+# no real transcripts are read. Run via `make shell-check`, or directly.
 # COCKPIT_LIB overrides which lib is sourced (for checking a candidate fix).
 
 set -uo pipefail
@@ -14,11 +14,16 @@ fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 HOME="$fixture/home"
 work="$(cd "$fixture" && pwd -P)/work"
-mkdir -p "$HOME/.claude/projects" "$work/a.b" "$work/a-b" "$work/x_y" "$work/plain" "$work/never"
+mkdir -p "$HOME/.claude/projects" "$work/a.b" "$work/a-b" "$work/x_y" "$work/plain" "$work/never" \
+    "$work/café" "$work/🎉"
 
-# Claude Code's own project-dir encoding, written independently of the lib's
-# encode_project_dir so a wrong lib can't build fixtures that agree with it.
-claude_encode() { printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g'; }
+# Claude Code's own project-dir encoding (a JS regex, so per UTF-16 code
+# unit), written independently of the lib's encode_project_dir so a wrong
+# lib can't build fixtures that agree with it.
+claude_encode() {
+    python3 -c 'import sys; print("".join(c if c.isascii() and (c.isalnum() or c == "-")
+        else "-" * (2 if ord(c) > 0xFFFF else 1) for c in sys.argv[1]))' "$1"
+}
 
 # transcript <dir> <session-id> <recorded-cwd> <age-seconds>
 transcript() {
@@ -35,6 +40,8 @@ transcript "$work/a-b" sess-ab-dash "$work/a-b" 100
 transcript "$work/x_y" sess-underscore "$work/x_y" 100
 transcript "$work/plain" sess-plain-old "$work/plain" 500
 transcript "$work/plain" sess-plain-new "$work/plain" 50
+transcript "$work/café" sess-accent "$work/café" 100
+transcript "$work/🎉" sess-emoji "$work/🎉" 100
 
 fails=0
 expect() { # expect <name> <dir> <want-session-id or empty for a miss>
@@ -55,6 +62,8 @@ expect "newest transcript wins"               "$work/plain" sess-plain-new
 expect "relative path resolves"               "$(realpath --relative-to="$PWD" "$work/plain")" sess-plain-new
 expect "dir with no project is a miss"        "$work/never" ""
 expect "missing dir is a miss"                "$work/gone"  ""
+expect "accented dir resolves"                "$work/café"  sess-accent
+expect "astral-plane dir resolves"            "$work/🎉"    sess-emoji
 
 # a project dir whose transcripts were all started somewhere else is a miss
 rm "$HOME/.claude/projects/$(claude_encode "$work/x_y")/sess-underscore.jsonl"
@@ -70,6 +79,8 @@ same() { # same <name> <got> <want>
     fi
 }
 
+same "newest skips a taken session" "$(resolve_last_session "$work/plain" sess-plain-new | cut -f1)" "sess-plain-old"
+same "all taken is a miss" "$(resolve_last_session "$work/plain" sess-plain-new sess-plain-old || echo miss)" "miss"
 same "strip_resume drops --resume <id>" \
     "$(strip_resume 'claude --model m --resume 3f2a-9 --remote-control')" "claude --model m --remote-control"
 same "strip_resume drops a bare --resume" \
@@ -102,6 +113,11 @@ same "unknown name matches nothing" "$(manifest_slots_matching zed)" ""
 same "manifest_names"               "$(manifest_names)" "Alpha, B"
 same "manifest_row_for_dir"         "$(manifest_row_for_dir /w/a | cut -f1)" "1"
 same "manifest_row_for_dir, none"   "$(manifest_row_for_dir /w/zz)" ""
+printf '1\tclaude\t/w/a\t-\t-\tclaude\ts1\n2\twatch\t/w/a\tlogs\t-\ttail -f x\t-\n' | manifest_write
+same "manifest_row_for_dir skips a watch pane in the same dir" "$(manifest_row_for_dir /w/a | cut -f1)" "1"
+touch -d '2001-01-01' "$(manifest_path)"
+printf '1\tclaude\t/w/a\t-\t-\tclaude\ts1\n2\twatch\t/w/a\tlogs\t-\ttail -f x\t-\n' | manifest_write
+same "unchanged manifest isn't rewritten" "$(date -r "$(manifest_path)" +%Y)" "2001"
 same "transcript_exists"            "$(transcript_exists "$work/a.b" sess-ab-dot && echo y)" "y"
 same "transcript_exists, gone"      "$(transcript_exists "$work/a.b" nope || echo n)" "n"
 same "dash/undash round trip"  "$(undash "$(dash '')")|$(undash "$(dash 'a	b')")" "|a b"
