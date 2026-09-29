@@ -10,7 +10,7 @@
 #
 # Usage:
 #   saturday-cockpit ~/Documents/lucida ~/Documents/saturday ~/src/groupchat
-#   saturday-cockpit [--resume] [--dangerously-skip-permissions] [--remote-control] <dir> [<dir> ...]
+#   saturday-cockpit [--resume [--allow-fresh]] [--dangerously-skip-permissions] [--remote-control] <dir|name> ...
 #                                   # --resume is non-interactive by default
 #                                   # (see add --resume below); --resume-picker
 #                                   # opts into claude's own interactive picker.
@@ -18,6 +18,15 @@
 #                                   # pane in this initial batch (see below —
 #                                   # same flags, same meaning, as on `add`).
 #                                   # --pellicle is add-only; see below.
+#                                   # A <name> is any NAME `status` has shown
+#                                   # for a pane (its --title, its /rename'd
+#                                   # Claude session name, or its dir
+#                                   # basename), looked up in the pane
+#                                   # manifest (see Manifest below).
+#   saturday-cockpit --resume       # no dirs: restore the last cockpit from
+#                                   # its manifest, slot order, each pane on
+#                                   # its own last session with its own flags
+#                                   # and title, watch panes included.
 #   saturday-cockpit --boot [fast] <dir> [<dir> ...]
 #                                   # opt-in Steel Battalion boot ritual:
 #                                   # the addressed pane (first dir) holds a
@@ -46,15 +55,22 @@
 #                                   # via new-session, not split-window, so it
 #                                   # has no pellicle path of its own yet.
 #   saturday-cockpit add --resume <dir> [<dir> ...]
-#                                   # non-interactive: resolve each dir's
-#                                   # most-recently-modified session file
-#                                   # under ~/.claude/projects/<encoded-dir>/
-#                                   # and pass it straight through as
+#                                   # non-interactive: resume the pane's own
+#                                   # last session (from the manifest) if its
+#                                   # transcript still exists, else the newest
+#                                   # transcript started in that dir, as
 #                                   # `claude --resume <id>` — no picker, so
 #                                   # no pane sits stuck waiting on a human
-#                                   # in an otherwise-scriptable cockpit. A
-#                                   # dir with no prior session starts fresh
-#                                   # instead of failing the batch.
+#                                   # in an otherwise-scriptable cockpit.
+#                                   # Every dir is resolved before any pane is
+#                                   # built; a dir with no session to resume
+#                                   # stops the batch unless --allow-fresh,
+#                                   # which starts those dirs fresh instead.
+#                                   # A dir with a manifest row keeps its
+#                                   # remembered flags (--model, --rc, ...)
+#                                   # unless this call passes claude flags or
+#                                   # sets CLAUDE_CMD. The summary names the
+#                                   # session each pane got.
 #                                   # --resume-last is a recognized synonym.
 #                                   # Mutually exclusive with --resume-picker.
 #   saturday-cockpit add --resume-picker <dir> [<dir> ...]
@@ -85,13 +101,48 @@
 #                                   # session is. Single-dir only (one title
 #                                   # can't label a whole batch); add panes
 #                                   # one at a time to title each.
+#   saturday-cockpit restart [<slot>|<name>|<%pane>]
+#                                   # respawn a pane's claude in place,
+#                                   # resuming the exact session it holds
+#                                   # (from ~/.claude/sessions/<pid>.json)
+#                                   # with the flags it was launched with —
+#                                   # e.g. to pick up a newly installed MCP
+#                                   # server without losing the conversation.
+#                                   # No argument inside the cockpit: restart
+#                                   # this pane, after COCKPIT_RESTART_DELAY
+#                                   # so the current turn can finish.
+#                                   # Background tasks don't survive it.
+#   saturday-cockpit wake [<slot>|<name>|<%pane>]
+#                                   # SIGCONT a pane suspended with ctrl+z.
+#                                   # claude says "run fg", but a cockpit
+#                                   # pane has no shell to run it in (claude
+#                                   # is exec'd). Alt+N does this too.
+#   saturday-cockpit watch [--name N] [--window] [--dir D] -- <cmd> ...
+#                                   # a non-claude pane (log tail, live viz)
+#                                   # split in detached: focus never moves.
+#                                   # Gets a slot and a manifest row.
 #   saturday-cockpit stop          # kill the cockpit window/session
-#   saturday-cockpit status        # list panes (pane_id, pid, cwd)
+#   saturday-cockpit status        # SLOT NAME STATE DIR SESSION PANE, by
+#                                   # slot (the Alt+N number, not tmux's
+#                                   # pane index). STATE: busy/idle/... from
+#                                   # Claude's session record, suspended,
+#                                   # dead, or watch.
+#   restart, wake and watch are tmux-only (ttmux has no respawn, pane pid
+#   or detached split). bin/saturday-cockpit-term opens the cockpit in a
+#   terminal window of its own, for callers without one.
 #
 # Hotkeys (no prefix, work anywhere in tmux once a cockpit has run once):
 #   Alt+1..9   jump to pane N, zoomed full-screen; press the same number
-#              again to toggle back to the tiled overview
+#              again to toggle back to the tiled overview. Also wakes the
+#              pane if it's suspended.
 #   Alt+0      force the tiled overview regardless of zoom state
+#
+# Manifest: ~/.local/state/saturday-cockpit/<session>.tsv, one row per
+# slotted pane (dir, kind, title, chosen session name, launch command, last
+# session id), rewritten from the live panes on launch, add, watch,
+# restart, status and stop. It's what names, remembered flags, restart and
+# bare --resume read. A cockpit started before it existed adopts itself on
+# the first `status`.
 #
 # Env:
 #   CLAUDE_CMD   command run in each pane (default: claude). Each pane cd's into
@@ -117,8 +168,12 @@
 #                personal-dogfood territory while it's still beta: no
 #                --boot support under it (refuses cleanly), and its own
 #                cockpit-backend-ttmux.sh header documents the mechanisms
-#                that don't map 1:1 from tmux. See
-#                ~/.claude/plans/wobbly-honking-valley.md for the design.
+#                that don't map 1:1 from tmux (and ROADMAP.md rank 17 what
+#                ttmux would need to close them).
+#   COCKPIT_RESTART_DELAY  seconds a self-restart waits before respawning
+#                (default 5), so the turn that asked for it can end.
+#   COCKPIT_WATCH_MAX_PANES  cockpit-window pane count at which `watch`
+#                opens a detached window of its own instead (default 9).
 #
 # Pair with stage zoom/tile on mayor:
 #   saturday-mayor ... --stage-sock /tmp/saturday-stage.sock --stage-zoom
@@ -987,7 +1042,7 @@ reuse_flags=$(( yolo == 0 && rc == 0 && resume_picker == 0 && CLAUDE_CMD_EXPLICI
 
 # --boot (Steel Battalion) is built entirely on respawn-pane, remain-on-exit
 # + #{pane_dead} polling, and a custom-pane-option sync latch — none of
-# which exist in ttmux (see ~/.claude/plans/wobbly-honking-valley.md).
+# which exist in ttmux (see cockpit-backend-ttmux.sh's header).
 # Refuse cleanly here, before any of boot's raw tmux calls below run,
 # rather than attempting a silently-degraded version.
 if [ "$boot" -eq 1 ] && [ "$COCKPIT_BACKEND" = ttmux ]; then

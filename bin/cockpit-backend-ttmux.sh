@@ -6,8 +6,8 @@
 #
 # ttmux has no per-pane arbitrary tag store, no per-keypress shell-out, no
 # respawn-pane, no remain-on-exit, and no pane-lifecycle hooks. See
-# ~/.claude/plans/wobbly-honking-valley.md for the full comparison against
-# tmux this was designed from; short version of each gap and its fix:
+# ROADMAP.md rank 17 for what a future ttmux release would need to close
+# them; short version of each gap and its fix here:
 #
 #   - Slot/title tracking moves from a tmux pane user-option to the sidecar
 #     JSON file _ttmux_sidecar_path prints, pruned against a live

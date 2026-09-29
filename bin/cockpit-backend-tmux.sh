@@ -3,9 +3,8 @@
 #
 # Behavior-preserving: every function here is the same tmux invocation
 # bin/saturday-cockpit made directly before the backend split existed, just
-# named and moved. See bin/cockpit-backend-ttmux.sh for the other backend
-# and ~/.claude/plans/wobbly-honking-valley.md for why the two diverge
-# where they do.
+# named and moved. See bin/cockpit-backend-ttmux.sh for the other backend,
+# whose header covers why the two diverge where they do.
 #
 # Not used by --boot: the Steel Battalion ritual's edge-splits, growth
 # animation, and respawn-based reveal stay inline in bin/saturday-cockpit

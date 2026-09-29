@@ -157,11 +157,15 @@ sudo apt install libportaudio2 tmux jq
 make install
 
 # Helper launchers (bash scripts, ship separately from the Go build).
-cp bin/saturday-stack bin/saturday-claude bin/saturday-cockpit bin/saturday-cockpit-boot-stub "$(go env GOPATH)/bin"
+# saturday-cockpit sources its cockpit-*.sh siblings from its own
+# directory, so they travel with it.
+cp bin/saturday-stack bin/saturday-claude bin/saturday-cockpit bin/saturday-cockpit-boot-stub \
+   bin/saturday-cockpit-term bin/cockpit-*.sh "$(go env GOPATH)/bin"
 chmod +x "$(go env GOPATH)/bin/saturday-stack" \
          "$(go env GOPATH)/bin/saturday-claude" \
          "$(go env GOPATH)/bin/saturday-cockpit" \
-         "$(go env GOPATH)/bin/saturday-cockpit-boot-stub"
+         "$(go env GOPATH)/bin/saturday-cockpit-boot-stub" \
+         "$(go env GOPATH)/bin/saturday-cockpit-term"
 
 # Python audio sidecar.
 python -m venv saturday-audio/.venv
