@@ -10,7 +10,7 @@ LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 GOBIN   := $(shell go env GOPATH)/bin
 BINDIR  := bin
 
-.PHONY: all build install test vet lint tidy hooks ci version clean
+.PHONY: all build install test vet lint tidy hooks ci version clean shell-check
 
 all: build
 
@@ -43,6 +43,11 @@ test:
 vet:
 	@go vet ./...
 
+# saturday-cockpit is bash, not Go, so none of the Go gates see it.
+shell-check:
+	@shellcheck -x -P SCRIPTDIR -S warning bin/saturday-cockpit bin/cockpit-*.sh bin/test-cockpit-lib.sh
+	@bin/test-cockpit-lib.sh >/dev/null || bin/test-cockpit-lib.sh
+
 lint:
 	@golangci-lint run ./...
 
@@ -66,6 +71,7 @@ ci:
 	@for d in eval eval/router llmcore saturday-hook saturday-mayor saturday-stage saturday-thinking sync watcher inject settle watcherclient stageclient orchestrator moshiclient saturday-backend saturday-voice; do \
 		(cd $$d && go test -race ./...) || exit 1; \
 	done
+	@$(MAKE) shell-check
 	@$(MAKE) build >/dev/null
 	@echo "ci ✓"
 

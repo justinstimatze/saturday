@@ -140,6 +140,8 @@ case "$COCKPIT_BACKEND" in
 esac
 # shellcheck source=cockpit-backend-tmux.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/cockpit-backend-${COCKPIT_BACKEND}.sh"
+# shellcheck source=cockpit-lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/cockpit-lib.sh"
 backend_require
 
 # Alt+letter pane-jump keys for panes 10+ (Alt+1..9 covers panes 1-9, Alt+0
@@ -150,6 +152,7 @@ backend_require
 # root-table, global-to-server binds, not just Saturday's. One array feeds
 # both bind_hotkeys (the actual keybinding) and the pane-border label below
 # it, so the two can't drift apart.
+# shellcheck disable=SC2034  # read by the sourced backend file
 COCKPIT_HOTKEY_LETTERS=(z s x a w q v e)
 
 # wait_pane_settled polls a pane's rendered content until it stops changing
@@ -238,41 +241,54 @@ add_pane() {
     backend_select_layout
 }
 
-# resolve_last_session prints the session id (jsonl basename) of the
-# most-recently-modified transcript for $1's project dir, or nothing (exit 1)
-# if the dir has no ~/.claude/projects/ entry or no session files yet.
-# Encoding matches watcher/main.go's encodedHomePrefix exactly: absolute
-# path, leading slash stripped, every remaining '/' turned into '-', whole
-# thing prefixed with '-' (verified against this host's own live
-# ~/.claude/projects/-home-gas6amus-Documents-saturday).
-resolve_last_session() {
-    local dir="$1" abs encoded projdir latest
-    abs="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
-    encoded="-${abs#/}"
-    encoded="${encoded//\//-}"
-    projdir="$HOME/.claude/projects/$encoded"
-    [ -d "$projdir" ] || return 1
-    latest="$(find "$projdir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | head -1 | cut -d' ' -f2-)"
-    [ -n "$latest" ] || return 1
-    basename "$latest" .jsonl
+# plan_launches resolves every dir argument before a single pane exists:
+# its absolute path (see abs_dir in cockpit-lib.sh), and under --resume the
+# exact session to resume (resolve_last_session). Fills LAUNCH_DIRS,
+# LAUNCH_CMDS and LAUNCH_NOTES, index-aligned with the arguments. A dir that
+# isn't one, or a --resume with no prior session to find, stops the whole
+# batch here with nothing built. The resume miss used to fall back to a
+# fresh session with one stderr line, which left a pane the user asked to
+# resume looking healthy under the right label while holding an empty
+# session. --allow-fresh ($allow_fresh) brings that fallback back on
+# purpose, for a dir that has genuinely never had a session.
+plan_launches() {
+    LAUNCH_DIRS=(); LAUNCH_CMDS=(); LAUNCH_NOTES=()
+    local d abs res sid misses=()
+    for d in "$@"; do
+        if ! abs="$(abs_dir "$d")"; then
+            echo "saturday-cockpit: not a directory: $d" >&2
+            exit 1
+        fi
+        LAUNCH_DIRS+=("$abs")
+        if [ "$resume" -eq 1 ]; then
+            if res="$(resolve_last_session "$abs")"; then
+                sid="${res%%$'\t'*}"
+                LAUNCH_CMDS+=("$CLAUDE_CMD --resume $sid")
+                LAUNCH_NOTES+=("resume $sid (last written ${res#*$'\t'})")
+                continue
+            fi
+            misses+=("$abs")
+            LAUNCH_NOTES+=("fresh session (no prior session found)")
+        else
+            LAUNCH_NOTES+=("fresh session")
+        fi
+        LAUNCH_CMDS+=("$CLAUDE_CMD")
+    done
+    if [ "${#misses[@]}" -gt 0 ] && [ "$allow_fresh" -eq 0 ]; then
+        echo "saturday-cockpit: --resume found no prior session for:" >&2
+        printf '  %s\n' "${misses[@]}" >&2
+        echo "Nothing was started. Pass --allow-fresh to start those as fresh sessions instead." >&2
+        exit 1
+    fi
 }
 
-# resolved_cmd_for prints the command to launch for $1, given the caller's
-# already-parsed $resume flag and (possibly yolo-suffixed) $CLAUDE_CMD.
-# A dir with no resolvable prior session warns and falls back to a fresh
-# session rather than failing the whole batch — matches wait_pane_settled's
-# own warn-and-continue convention above.
-resolved_cmd_for() {
-    local dir="$1" sid
-    if [ "$resume" -eq 1 ]; then
-        if sid="$(resolve_last_session "$dir")" && [ -n "$sid" ]; then
-            echo "$CLAUDE_CMD --resume $sid"
-            return
-        fi
-        echo "saturday-cockpit: no prior session found for $dir, starting fresh" >&2
-    fi
-    echo "$CLAUDE_CMD"
+# print_launch_summary lists what each dir from the last plan_launches is
+# running, so a wrong resume pick is catchable at a glance.
+print_launch_summary() {
+    local idx
+    for idx in "${!LAUNCH_DIRS[@]}"; do
+        printf '  %s: %s\n' "${LAUNCH_DIRS[$idx]}" "${LAUNCH_NOTES[$idx]}"
+    done
 }
 
 # stub_cmd_for <dir> <role> <inst> <delay_ms> prints the placeholder command
@@ -300,7 +316,9 @@ stub_cmd_for() {
             stub="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/saturday-cockpit-boot-stub"
         fi
     fi
-    local cmd="'$stub' '$(basename "$dir")' --role $role --delay $delay"
+    local cmd label
+    label="$(basename "$dir")"
+    cmd="'$stub' '$label' --role $role --delay $delay"
     if [ -n "$instname" ]; then cmd="$cmd --inst $instname"; fi
     if [ "$boot_fast" -eq 1 ]; then cmd="$cmd --fast"; fi
     echo "$cmd"
@@ -465,6 +483,7 @@ case "${1:-}" in
         pellicle=0
         resume=0
         resume_picker=0
+        allow_fresh=0
         yolo=0
         rc=0
         title=""
@@ -472,6 +491,7 @@ case "${1:-}" in
             case "$1" in
                 --pellicle) pellicle=1; shift ;;
                 --resume|--resume-last) resume=1; shift ;;
+                --allow-fresh) allow_fresh=1; shift ;;
                 --resume-picker) resume_picker=1; shift ;;
                 --dangerously-skip-permissions) yolo=1; shift ;;
                 --remote-control|--rc) rc=1; shift ;;
@@ -503,23 +523,18 @@ case "${1:-}" in
             CLAUDE_CMD="$CLAUDE_CMD --remote-control"
         fi
         if [ "$#" -lt 1 ]; then
-            echo "usage: saturday-cockpit add [--pellicle] [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
+            echo "usage: saturday-cockpit add [--pellicle] [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] [--title <name>] <dir> [<dir> ...]" >&2
             exit 2
         fi
         if [ -n "$title" ] && [ "$#" -gt 1 ]; then
             echo "saturday-cockpit: --title only applies to a single <dir> — add panes one at a time to title each" >&2
             exit 2
         fi
-        for d in "$@"; do
-            if [ ! -d "$d" ]; then
-                echo "saturday-cockpit: not a directory: $d" >&2
-                exit 1
-            fi
-        done
+        plan_launches "$@"
         n="$#"; i=0
-        for d in "$@"; do
+        for idx in "${!LAUNCH_DIRS[@]}"; do
             i=$((i + 1))
-            dcmd="$(resolved_cmd_for "$d")"
+            d="${LAUNCH_DIRS[$idx]}"; dcmd="${LAUNCH_CMDS[$idx]}"
             if [ "$pellicle" -eq 1 ]; then
                 add_pane_pellicle "$d" "$dcmd" "$title"
             else
@@ -543,6 +558,7 @@ case "${1:-}" in
         apply_border_format
         total="$(backend_pane_count)"
         echo "saturday-cockpit: added $# pane(s), $total total."
+        print_launch_summary
         exit 0
         ;;
 esac
@@ -562,6 +578,7 @@ fi
 # `add --pellicle` once the session is up.
 resume=0
 resume_picker=0
+allow_fresh=0
 yolo=0
 rc=0
 boot=0
@@ -569,6 +586,7 @@ boot_fast=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --resume|--resume-last) resume=1; shift ;;
+        --allow-fresh) allow_fresh=1; shift ;;
         --resume-picker) resume_picker=1; shift ;;
         --dangerously-skip-permissions) yolo=1; shift ;;
         --remote-control|--rc) rc=1; shift ;;
@@ -622,25 +640,23 @@ if [ "$#" -lt 1 ]; then
     if backend_has_session; then
         backend_attach
     fi
-    echo "usage: saturday-cockpit [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
-    echo "       saturday-cockpit add [--pellicle] [--resume | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
+    echo "usage: saturday-cockpit [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
+    echo "       saturday-cockpit add [--pellicle] [--resume [--allow-fresh] | --resume-picker] [--dangerously-skip-permissions] [--remote-control|--rc] <dir> [<dir> ...]" >&2
     echo "       saturday-cockpit stop|status" >&2
     exit 2
 fi
 
-# Validate dirs up front so we don't build a half-cockpit.
-for d in "$@"; do
-    if [ ! -d "$d" ]; then
-        echo "saturday-cockpit: not a directory: $d" >&2
-        exit 1
-    fi
-done
+# Resolve every dir (and every --resume) up front so we don't build a
+# half-cockpit. From here on "$@" holds the absolute dirs, and
+# LAUNCH_CMDS[k] is the command for the k-th of them.
+plan_launches "$@"
+set -- "${LAUNCH_DIRS[@]}"
 
 # First pane = first dir. This is also the "addressed" pane in --boot mode —
 # the only existing signal for primary in this script (structurally distinct
 # via new-session, tmux's default-focused pane after it).
 first="$1"; shift
-firstcmd="$(resolved_cmd_for "$first")"
+firstcmd="${LAUNCH_CMDS[0]}"
 
 if [ "$boot" -eq 1 ]; then
     # remain-on-exit must be set BEFORE the first placeholder exists, not
@@ -711,11 +727,11 @@ for d in "$@"; do
         newpane="$(boot_edge_split "$d" \
             "$(stub_cmd_for "$d" "$brole" "$binst" "$(( 450 + (idx % 3) * 130 ))")" "$idx")"
         boot_dirs+=("$d")
-        boot_cmds+=("$(resolved_cmd_for "$d")")
+        boot_cmds+=("${LAUNCH_CMDS[$i]}")
         boot_pane_ids+=("$newpane")
         if [ "$i" -lt "$n" ]; then sleep 0.35; fi   # panel-by-panel stagger
     else
-        add_pane "$d" "$(resolved_cmd_for "$d")"
+        add_pane "$d" "${LAUNCH_CMDS[$i]}"
         if [ "$i" -lt "$n" ]; then
             newpane="$(backend_list_pane_ids "$SESSION" | tail -1)"
             wait_pane_settled "$newpane" 10 ||
@@ -797,6 +813,7 @@ fi
 echo "saturday-cockpit: '$SESSION' up with $(($# + 1)) panes ($LAYOUT)."
 echo "  Alt+1..9 jump-and-zoom to a pane (press again to un-zoom), Alt+0 forces the overview."
 echo "  stage drives zoom/tile on inject when mayor runs with --stage-zoom / --stage-tile."
+print_launch_summary
 
 if [ -t 1 ]; then
     backend_attach

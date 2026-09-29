@@ -194,7 +194,7 @@ _ttmux_sidecar_load_pruned() {
 _ttmux_sidecar_write() {
     local new="$1" dir path tmp
     dir="$(_ttmux_state_dir)"
-    mkdir -p -m 0700 "$dir"
+    mkdir -p "$dir" && chmod 0700 "$dir"
     path="$(_ttmux_sidecar_path)"
     tmp="${path}.tmp.$$"
     echo "$new" >"$tmp" && mv "$tmp" "$path"

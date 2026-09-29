@@ -36,6 +36,9 @@ for d in "${modules[@]}"; do
   (cd "$d" && go test -race ./...) || fail "test failed in $d"
 done
 
+step "cockpit shell checks"
+make shell-check || fail "shellcheck or bin/test-cockpit-lib.sh failed"
+
 step "make build"
 make build >/dev/null || fail "build failed"
 
